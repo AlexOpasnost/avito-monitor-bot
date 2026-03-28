@@ -1,0 +1,370 @@
+import re
+import logging
+
+from aiogram import Router, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+from database import db
+from config import config
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+AVITO_URL_PATTERN = re.compile(
+    r"https?://(www\.|m\.)?avito\.ru/.+"
+)
+
+
+def _validate_avito_url(text: str) -> str | None:
+    """Extract and validate Avito URL from message text."""
+    text = text.strip()
+    match = AVITO_URL_PATTERN.search(text)
+    if match:
+        return match.group(0)
+    return None
+
+
+AVITO_CATEGORIES = {
+    "kvartiry": "Квартиры",
+    "komnaty": "Комнаты",
+    "doma_dachi_kottedzhi": "Дома, дачи, коттеджи",
+    "zemelnye_uchastki": "Земельные участки",
+    "garazhi_i_mashinomesta": "Гаражи и машиноместа",
+    "kommercheska_nedvizhimost": "Коммерческая недвижимость",
+    "nedvizhimost": "Недвижимость",
+    "avtomobili": "Автомобили",
+    "mototsikly_i_mototehnika": "Мотоциклы и мототехника",
+    "gruzoviki_i_spetstehnika": "Грузовики и спецтехника",
+    "zapchasti_i_aksessuary": "Запчасти и аксессуары",
+    "transport": "Транспорт",
+    "vakansii": "Вакансии",
+    "rezyume": "Резюме",
+    "rabota": "Работа",
+    "telefony": "Телефоны",
+    "kompyutery": "Компьютеры",
+    "noutbuki": "Ноутбуки",
+    "planshety_i_elektronnye_knigi": "Планшеты",
+    "audio_i_video": "Аудио и видео",
+    "igry_pristavki_i_programmy": "Игры, приставки",
+    "foto_i_videokamery": "Фото и видеокамеры",
+    "bytovaya_tehnika": "Бытовая техника",
+    "elektronika": "Электроника",
+    "odezhda_obuv_aksessuary": "Одежда, обувь, аксессуары",
+    "detskaya_odezhda_i_obuv": "Детская одежда и обувь",
+    "tovary_dlya_detey_i_igrushki": "Товары для детей",
+    "krasota_i_zdorove": "Красота и здоровье",
+    "lichnye_veschi": "Личные вещи",
+    "mebel_i_interer": "Мебель и интерьер",
+    "bytovaya_elektronika": "Бытовая электроника",
+    "sport_i_otdyh": "Спорт и отдых",
+    "hobbi_i_otdyh": "Хобби и отдых",
+    "muzykalnye_instrumenty": "Музыкальные инструменты",
+    "knigi_i_zhurnaly": "Книги и журналы",
+    "kollektsionirovanie": "Коллекционирование",
+    "zhivotnye": "Животные",
+    "sobaki": "Собаки",
+    "koshki": "Кошки",
+    "dlya_doma_i_dachi": "Для дома и дачи",
+    "remont_i_stroitelstvo": "Ремонт и строительство",
+    "sad_i_ogorod": "Сад и огород",
+    "produkty_pitaniya": "Продукты питания",
+    "uslugi": "Услуги",
+    "predlozheniya_uslug": "Предложения услуг",
+    "gotoviy_biznes_i_oborudovanie": "Готовый бизнес",
+    # Subcategories
+    "muzhskaya_odezhda": "Мужская одежда",
+    "zhenskaya_odezhda": "Женская одежда",
+    "verhnyaya_odezhda": "Верхняя одежда",
+    "kofty_i_futbolki": "Кофты и футболки",
+    "pidzhaki_i_kostyumy": "Пиджаки и костюмы",
+    "dzhinsy": "Джинсы",
+    "bryuki": "Брюки",
+    "rubashki": "Рубашки",
+    "shorty": "Шорты",
+    "sportivnaya_odezhda": "Спортивная одежда",
+    "nizhneye_belye": "Нижнее бельё",
+    "platya": "Платья",
+    "yubki": "Юбки",
+    "bluzy_i_rubashki": "Блузы и рубашки",
+    "sumki": "Сумки",
+    "obuv": "Обувь",
+    "aksessuary": "Аксессуары",
+    "chasy_i_ukrasheniya": "Часы и украшения",
+    "krossovki": "Кроссовки",
+    "botinki": "Ботинки",
+    "tufli": "Туфли",
+    "sapogi": "Сапоги",
+    "sandalii": "Сандалии",
+    "rasteniya": "Растения",
+    "igrovye_pristavki": "Игровые приставки",
+    "nastolnye_igry": "Настольные игры",
+    "velosipedy": "Велосипеды",
+    "muzykalnye_instrumenty": "Музыкальные инструменты",
+    "posuда": "Посуда",
+    "produkty_pitaniya": "Продукты питания",
+    "avtomobili": "Автомобили",
+    "televizory": "Телевизоры",
+    "stiralnye_mashiny": "Стиральные машины",
+    "holodilniki": "Холодильники",
+    "smartfony": "Смартфоны",
+    "planshety": "Планшеты",
+}
+
+AVITO_CITIES = {
+    "moskva": "Москва",
+    "sankt-peterburg": "Санкт-Петербург",
+    "novosibirsk": "Новосибирск",
+    "ekaterinburg": "Екатеринбург",
+    "kazan": "Казань",
+    "nizhniy_novgorod": "Нижний Новгород",
+    "chelyabinsk": "Челябинск",
+    "samara": "Самара",
+    "omsk": "Омск",
+    "rostov-na-donu": "Ростов-на-Дону",
+    "ufa": "Уфа",
+    "krasnoyarsk": "Красноярск",
+    "voronezh": "Воронеж",
+    "perm": "Пермь",
+    "volgograd": "Волгоград",
+    "krasnodar": "Краснодар",
+    "tyumen": "Тюмень",
+    "saratov": "Саратов",
+    "tolyatti": "Тольятти",
+    "izhevsk": "Ижевск",
+    "barnaul": "Барнаул",
+    "vladivostok": "Владивосток",
+    "irkutsk": "Иркутск",
+    "habarovsk": "Хабаровск",
+    "yaroslavl": "Ярославль",
+    "tomsk": "Томск",
+    "orenburg": "Оренбург",
+    "novokuznetsk": "Новокузнецк",
+    "ryazan": "Рязань",
+    "naberezhnye_chelny": "Набережные Челны",
+    "kirov": "Киров",
+    "sevastopol": "Севастополь",
+    "rossiya": "Россия",
+}
+
+
+def _parse_avito_url_info(url: str) -> dict:
+    """Extract city, category and query from Avito URL for display."""
+    from urllib.parse import urlparse, parse_qs, unquote
+    parsed = urlparse(url)
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+
+    info = {"city": None, "category": None, "query": None}
+
+    if len(path_parts) >= 1:
+        slug = path_parts[0].lower()
+        if slug == "all":
+            info["city"] = "Вся Россия"
+        else:
+            info["city"] = AVITO_CITIES.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+    if len(path_parts) >= 2:
+        cats = []
+        for part in path_parts[1:]:
+            # Skip encoded slugs (ASgB...), item URLs (name_12345), prodam/kupit
+            if re.match(r'^[A-Z][A-Za-z0-9+/=]+$', part):
+                continue
+            slug = part.lower()
+            if re.match(r'^.+_\d{5,}$', slug):
+                continue
+            if slug in ("prodam", "kupit", "sdam", "snimu"):
+                continue
+
+            # Normalize: try both underscore and hyphen variants
+            slug_underscore = slug.replace("-", "_")
+            slug_hyphen = slug.replace("_", "-")
+
+            name = (
+                AVITO_CATEGORIES.get(slug)
+                or AVITO_CATEGORIES.get(slug_underscore)
+                or AVITO_CATEGORIES.get(slug_hyphen)
+            )
+            if name:
+                cats.append(name)
+            # Don't add raw transliterated slugs — they look ugly
+        info["category"] = " → ".join(cats) if cats else None
+
+    # Check for query parameter
+    qs = parse_qs(parsed.query)
+    if "q" in qs:
+        info["query"] = unquote(qs["q"][0])
+
+    return info
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    await message.answer(
+        "👋 Привет! Я мониторю объявления на Авито.\n\n"
+        "📌 Как пользоваться:\n"
+        "1. Открой Авито, настрой поиск (город, категория, цена)\n"
+        "2. Скопируй ссылку на страницу поиска\n"
+        "3. Отправь мне эту ссылку\n\n"
+        f"Можно отслеживать до {config.max_subscriptions} ссылок одновременно.\n\n"
+        "📋 Команды:\n"
+        "/list — активные отслеживания\n"
+        "/delete — удалить отслеживание\n"
+        "/stop — остановить всё",
+    )
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    user_id = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    profile = await db.get_user_profile(user_id)
+    user = profile["user"]
+
+    # Registration date
+    reg_date = user["created_at"].strftime("%d.%m.%Y") if user["created_at"] else "—"
+
+    # Last found item
+    last_found_str = "—"
+    if profile["last_found"]:
+        last_found_str = profile["last_found"]["sent_at"].strftime("%d.%m.%Y %H:%M")
+
+    name = message.from_user.full_name or user["username"] or "Пользователь"
+
+    await message.answer(
+        f"👤 <b>Профиль: {name}</b>\n\n"
+        f"📅 Дата регистрации: <b>{reg_date}</b>\n"
+        f"📊 Всего отслеживаний создано: <b>{profile['total_subs']}</b>\n"
+        f"🟢 Активных сейчас: <b>{profile['active_subs']}</b>\n"
+        f"📨 Объявлений найдено: <b>{profile['total_found']}</b>\n"
+        f"🕐 Последнее найденное: <b>{last_found_str}</b>\n",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("list"))
+async def cmd_list(message: Message):
+    user_id = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    subs = await db.get_user_subscriptions(user_id)
+    active = [s for s in subs if s["is_active"]]
+
+    if not active:
+        await message.answer("У тебя нет активных отслеживаний. Отправь ссылку с Авито чтобы начать.")
+        return
+
+    lines = ["📋 <b>Активные отслеживания:</b>\n"]
+    for i, sub in enumerate(active, 1):
+        checked = sub["last_checked_at"]
+        checked_str = checked.strftime("%d.%m %H:%M") if checked else "ещё не проверялась"
+        errors = f" ⚠️ ошибок: {sub['error_count']}" if sub["error_count"] > 0 else ""
+        lines.append(
+            f"{i}. <a href=\"{sub['url']}\">Ссылка #{sub['id']}</a>\n"
+            f"   Последняя проверка: {checked_str}{errors}"
+        )
+
+    await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+
+@router.message(Command("delete"))
+async def cmd_delete(message: Message):
+    user_id = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    subs = await db.get_user_subscriptions(user_id)
+    active = [s for s in subs if s["is_active"]]
+
+    if not active:
+        await message.answer("Нет активных отслеживаний для удаления.")
+        return
+
+    buttons = []
+    for sub in active:
+        short_url = sub["url"][:50] + "..." if len(sub["url"]) > 50 else sub["url"]
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"❌ #{sub['id']} — {short_url}",
+                callback_data=f"del:{sub['id']}",
+            )
+        ])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("Выбери отслеживание для удаления:", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def callback_delete(callback: CallbackQuery):
+    sub_id = int(callback.data.split(":")[1])
+    await db.deactivate_subscription(sub_id)
+    await callback.message.edit_text(f"✅ Отслеживание #{sub_id} удалено.")
+    await callback.answer()
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message):
+    user_id = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+    await db.deactivate_all(user_id)
+    await message.answer("⏹ Все отслеживания остановлены.")
+
+
+@router.message(F.text)
+async def handle_url(message: Message):
+    url = _validate_avito_url(message.text)
+    if not url:
+        await message.answer(
+            "Отправь мне ссылку на поиск Авито.\n"
+            "Например: https://www.avito.ru/moskva/kvartiry/prodam-ASgBAgICAUSSA8YQ"
+        )
+        return
+
+    user_id = await db.get_or_create_user(
+        message.from_user.id,
+        message.from_user.username,
+    )
+
+    sub_id = await db.add_subscription(user_id, url)
+    if sub_id is None:
+        await message.answer(
+            f"⚠️ Достигнут лимит — максимум {config.max_subscriptions} отслеживаний.\n"
+            "Удали лишние через /delete"
+        )
+        return
+
+    # Try to get page title from Avito (e.g. "Женская одежда")
+    from parser import fetch_page_title, _get_proxy
+    proxy = _get_proxy()
+    page_title = await fetch_page_title(url, proxy)
+
+    info = _parse_avito_url_info(url)
+    details = []
+    if page_title:
+        details.append(f"📂 <b>Категория:</b> {page_title}")
+    if info["city"]:
+        details.append(f"📍 <b>Город:</b> {info['city']}")
+    if info["query"]:
+        details.append(f"🔍 <b>Запрос:</b> {info['query']}")
+    details.append(f"🔗 <a href=\"{url}\">Ваша ссылка на Авито</a>")
+
+    details_text = "\n".join(details)
+
+    await message.answer(
+        f"✅ <b>Отслеживание #{sub_id} добавлено!</b>\n\n"
+        f"{details_text}\n\n"
+        f"⏱ Проверка каждую <b>минуту</b>\n"
+        f"🔔 Как только появится новое объявление — сразу пришлю\n\n"
+        f"📋 /list — все отслеживания\n"
+        f"❌ /delete — удалить",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
