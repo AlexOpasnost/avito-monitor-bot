@@ -341,17 +341,12 @@ async def handle_url(message: Message):
         )
         return
 
-    # Try to get page title from Avito (e.g. "Женская одежда")
-    from parser import fetch_page_title, _get_proxy
-    proxy = _get_proxy()
-    page_title = await fetch_page_title(url, proxy)
-
     info = _parse_avito_url_info(url)
     details = []
-    if page_title:
-        details.append(f"📂 <b>Категория:</b> {page_title}")
     if info["city"]:
         details.append(f"📍 <b>Город:</b> {info['city']}")
+    if info["category"]:
+        details.append(f"📂 <b>Категория:</b> {info['category']}")
     if info["query"]:
         details.append(f"🔍 <b>Запрос:</b> {info['query']}")
     details.append(f"🔗 <a href=\"{url}\">Ваша ссылка на Авито</a>")
