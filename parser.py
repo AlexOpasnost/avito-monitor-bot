@@ -342,11 +342,7 @@ async def _get_browser():
         from playwright.async_api import async_playwright
         _pw_playwright = await async_playwright().start()
 
-        launch_kwargs = {"headless": True}
-        if config.proxy_list:
-            launch_kwargs["proxy"] = _parse_proxy_for_playwright(config.proxy_list[0])
-
-        _pw_browser = await _pw_playwright.chromium.launch(**launch_kwargs)
+        _pw_browser = await _pw_playwright.chromium.launch(headless=True)
         logger.info("Playwright browser launched")
         return _pw_browser
 
@@ -370,18 +366,26 @@ async def enrich_item_playwright(item: AvitoItem) -> AvitoItem:
 
     try:
         browser = await _get_browser()
-        page = await browser.new_page()
-        page.set_default_timeout(5000)  # 5s for selectors
+
+        # Create context with proxy (so each page goes through mobile proxy)
+        context_kwargs = {}
+        if config.proxy_list:
+            context_kwargs["proxy"] = _parse_proxy_for_playwright(config.proxy_list[0])
+        context = await browser.new_context(**context_kwargs)
+        page = await context.new_page()
+        page.set_default_timeout(5000)
 
         try:
             await page.goto(item.url, wait_until="domcontentloaded", timeout=15000)
 
             # Check for captcha / block page
+            title = await page.title()
             content = await page.content()
             content_lower = content.lower()
-            if "captcha" in content_lower or "доступ ограничен" in content_lower:
-                logger.info("Captcha detected for %s, skipping enrich", item.avito_id)
+            if "captcha" in content_lower or "доступ ограничен" in content_lower or "проблема с ip" in content_lower:
+                logger.info("Captcha/block for %s (title: %s)", item.avito_id, title)
                 return item
+            logger.info("Playwright loaded %s (title: %s, size: %d)", item.avito_id, title[:50], len(content))
 
             # Description
             try:
@@ -451,6 +455,7 @@ async def enrich_item_playwright(item: AvitoItem) -> AvitoItem:
 
         finally:
             await page.close()
+            await context.close()
 
     except Exception as e:
         logger.debug("Playwright enrich failed for %s: %s", item.avito_id, e)
