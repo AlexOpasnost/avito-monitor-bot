@@ -93,12 +93,7 @@ async def check_subscription(bot: Bot, sub: dict):
         if already_sent:
             continue
 
-        # Enrich with Playwright (headless browser)
-        try:
-            from parser import enrich_item_playwright
-            item = await enrich_item_playwright(item)
-        except Exception as e:
-            logger.debug("Enrich failed for %s: %s", item.avito_id, e)
+        # No enrichment — Avito blocks all detail requests
 
         # Re-check active right before sending
         still_active2 = await db.is_subscription_active(sub_id)
