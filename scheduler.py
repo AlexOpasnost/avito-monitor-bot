@@ -5,55 +5,30 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from database import db
-from parser import parse_listings, enrich_item, AvitoItem, _get_proxy
+from parser import parse_listings, AvitoItem
 from config import config
 
 logger = logging.getLogger(__name__)
 
 
 def format_notification(item: AvitoItem) -> str:
-    """Format item notification — AvtoRinger style."""
-    lines = []
+    """Format item notification — fixed structure, always the same layout."""
+    # Line 1: Title
+    # Line 2: Price
+    # Line 3: Location (or dash)
+    # Line 4: Link
+    # Line 5: ID
+    # Always 5 lines, always same structure
 
-    # Line 1: Title + Price + Stats
-    line1 = f"<b>{item.title}</b> 💰 <b>{item.price}</b>"
-    stats = []
-    if item.views is not None:
-        stats.append(f"👀 {item.views}")
-    if item.favorites is not None:
-        stats.append(f"❤️ {item.favorites}")
-    if item.seller_rating:
-        r = f"⭐ {item.seller_rating}"
-        if item.seller_reviews:
-            r += f" ({item.seller_reviews})"
-        stats.append(r)
-    if stats:
-        line1 += " " + " ".join(stats)
-    lines.append(line1)
+    loc = item.location or "Россия"
 
-    # Location
-    if item.location:
-        lines.append(f"📍 {item.location}")
-
-    # Link
-    lines.append(f"avito.ru/{item.avito_id}")
-
-    # Description
-    if item.description:
-        lines.append(f"\n<i>{item.description}</i>")
-
-    # Seller
-    if item.seller_name:
-        lines.append(f"\n👤 {item.seller_name}")
-
-    # Date
-    if item.published_date:
-        lines.append(f"📅 {item.published_date}")
-
-    # ID
-    lines.append(f"🆔 <code>{item.avito_id}</code>")
-
-    return "\n".join(lines)
+    return (
+        f"<b>{item.title}</b>\n"
+        f"💰 {item.price}\n"
+        f"📍 {loc}\n"
+        f"🔗 avito.ru/{item.avito_id}\n"
+        f"🆔 <code>{item.avito_id}</code>"
+    )
 
 
 def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
@@ -84,7 +59,6 @@ async def check_subscription(bot: Bot, sub: dict):
 
     await db.reset_errors(sub_id)
 
-    enrich_ok = True  # disable enrich if first attempt fails
     new_count = 0
     for item in items:
         if not item.avito_id:
@@ -100,32 +74,7 @@ async def check_subscription(bot: Bot, sub: dict):
         if already_sent:
             continue
 
-        # Enrich — rotate IP first, then try once
-        if enrich_ok:
-            try:
-                # Rotate IP before enrich (list API already used current IP)
-                if config.proxy_rotate_url:
-                    try:
-                        import aiohttp as _aio
-                        _t = _aio.ClientTimeout(total=10)
-                        async with _aio.ClientSession(timeout=_t) as _s:
-                            async with _s.get(config.proxy_rotate_url) as _r:
-                                pass
-                        await asyncio.sleep(5)
-                    except Exception:
-                        pass
-
-                proxy = _get_proxy()
-                loop = asyncio.get_event_loop()
-                enriched = await loop.run_in_executor(None, lambda: enrich_item(item, proxy))
-                if enriched.description or enriched.seller_name:
-                    item = enriched
-                    logger.info("Enriched item %s with description", item.avito_id)
-                else:
-                    enrich_ok = False
-                    logger.info("Enrich returned no data, disabling for cycle")
-            except Exception:
-                enrich_ok = False
+        # Enrich disabled — mobile API returns 403 consistently
 
         # Re-check active right before sending
         still_active2 = await db.is_subscription_active(sub_id)
