@@ -186,20 +186,23 @@ def _fetch_api(referer: str, params: dict, proxy: str | None) -> list[AvitoItem]
 def enrich_item(item: AvitoItem, proxy: str | None) -> AvitoItem:
     """Enrich item with description, seller, date from mobile API v19."""
     try:
-        s = curl_requests.Session(impersonate="chrome")
-        s.headers.update({
-            "user-agent": "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
-            "accept": "application/json",
-            "accept-language": "ru-RU,ru;q=0.9",
-        })
-        # Get cookies
-        s.get("https://m.avito.ru/", proxy=proxy, timeout=8)
-
-        resp = s.get(
+        # Try direct API call without visiting main page first
+        resp = curl_requests.get(
             f"https://m.avito.ru/api/19/items/{item.avito_id}",
             params={"key": AVITO_MOBILE_KEY},
+            impersonate="chrome",
             proxy=proxy,
+            headers={
+                "user-agent": "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
+                "accept": "application/json",
+                "accept-language": "ru-RU,ru;q=0.9",
+                "referer": "https://m.avito.ru/",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+            },
             timeout=10,
+            allow_redirects=False,
         )
 
         if resp.status_code != 200:
