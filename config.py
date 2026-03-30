@@ -18,6 +18,7 @@ class Config:
     telegram_api_url: str = "https://api.telegram.org"
     proxy_rotate_url: str = ""
     proxy_rotate_every: int = 5  # rotate IP every N requests
+    admin_id: int = 0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -32,6 +33,7 @@ class Config:
             telegram_api_url=os.getenv("TELEGRAM_API_URL", "https://api.telegram.org"),
             proxy_rotate_url=os.getenv("PROXY_ROTATE_URL", ""),
             proxy_rotate_every=int(os.getenv("PROXY_ROTATE_EVERY", "5")),
+            admin_id=int(os.getenv("ADMIN_ID", "0")),
         )
 
 

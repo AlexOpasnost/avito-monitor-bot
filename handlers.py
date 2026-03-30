@@ -247,6 +247,33 @@ async def cmd_profile(message: Message):
     )
 
 
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if config.admin_id == 0 or message.from_user.id != config.admin_id:
+        return
+
+    stats = await db.get_admin_stats()
+
+    last_checked_str = "—"
+    if stats["last_checked"]:
+        from datetime import timezone, timedelta
+        msk = timezone(timedelta(hours=3))
+        last_checked_str = stats["last_checked"].astimezone(msk).strftime("%H:%M %d.%m.%Y")
+
+    await message.answer(
+        f"📊 <b>Админ-панель</b>\n\n"
+        f"👥 Юзеров: <b>{stats['total_users']:,}</b>\n"
+        f"📋 Активных подписок: <b>{stats['active_subs']:,}</b>\n"
+        f"🔗 Уникальных ссылок: <b>{stats['unique_urls']:,}</b>\n"
+        f"📨 Объявлений отправлено: <b>{stats['total_sent']:,}</b>\n"
+        f"⏱ Последняя проверка: <b>{last_checked_str}</b>\n\n"
+        f"📈 <b>За последние 24ч:</b>\n"
+        f"  Новых юзеров: <b>{stats['new_users_24h']:,}</b>\n"
+        f"  Отправлено: <b>{stats['sent_24h']:,}</b>",
+        parse_mode="HTML",
+    )
+
+
 @router.message(Command("list"))
 async def cmd_list(message: Message):
     user_id = await db.get_or_create_user(

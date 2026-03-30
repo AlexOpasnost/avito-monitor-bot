@@ -286,4 +286,35 @@ class Database:
         return await self._execute(_op)
 
 
+    async def get_admin_stats(self) -> dict:
+        async def _op(conn):
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            active_subs = await conn.fetchval(
+                "SELECT COUNT(*) FROM subscriptions WHERE is_active = TRUE"
+            )
+            unique_urls = await conn.fetchval(
+                "SELECT COUNT(DISTINCT url) FROM subscriptions WHERE is_active = TRUE"
+            )
+            total_sent = await conn.fetchval("SELECT COUNT(*) FROM sent_items")
+            last_checked = await conn.fetchval(
+                "SELECT MAX(last_checked_at) FROM subscriptions"
+            )
+            new_users_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE created_at > NOW() - INTERVAL '24 hours'"
+            )
+            sent_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM sent_items WHERE sent_at > NOW() - INTERVAL '24 hours'"
+            )
+            return {
+                "total_users": total_users,
+                "active_subs": active_subs,
+                "unique_urls": unique_urls,
+                "total_sent": total_sent,
+                "last_checked": last_checked,
+                "new_users_24h": new_users_24h,
+                "sent_24h": sent_24h,
+            }
+        return await self._execute(_op)
+
+
 db = Database()

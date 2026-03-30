@@ -57,33 +57,16 @@ def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
     ])
 
 
-async def check_subscription(bot: Bot, sub: dict):
+async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
+    """Send new items to a single subscription."""
     sub_id = sub["id"]
     telegram_id = sub["telegram_id"]
-    url = sub["url"]
-
-    items = await parse_listings(url)
-
-    if items is None:
-        deactivated = await db.increment_error(sub_id, "Parse failed or blocked")
-        if deactivated:
-            try:
-                await bot.send_message(
-                    telegram_id,
-                    f"⚠️ Отслеживание #{sub_id} остановлено — слишком много ошибок.",
-                )
-            except Exception:
-                pass
-        return
-
-    await db.reset_errors(sub_id)
 
     new_count = 0
     for item in items:
         if not item.avito_id:
             continue
 
-        # Check if still active (user may have /delete'd)
         still_active = await db.is_subscription_active(sub_id)
         if not still_active:
             logger.info("Sub #%d deactivated, stopping", sub_id)
@@ -93,9 +76,6 @@ async def check_subscription(bot: Bot, sub: dict):
         if already_sent:
             continue
 
-        # No enrichment — Avito blocks all detail requests
-
-        # Re-check active right before sending
         still_active2 = await db.is_subscription_active(sub_id)
         if not still_active2:
             logger.info("Sub #%d deactivated before send, stopping", sub_id)
@@ -104,7 +84,6 @@ async def check_subscription(bot: Bot, sub: dict):
         text = format_notification(item)
         keyboard = make_item_keyboard(item)
 
-        # Send with retry: photo first, text fallback
         sent = False
         for attempt in range(2):
             try:
@@ -158,14 +137,49 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
 
             subs = await db.get_active_subscriptions()
             if subs:
-                logger.info("Checking %d subscriptions", len(subs))
+                # Deduplicate: group subscriptions by URL, parse each URL once
+                from collections import defaultdict
+                url_groups: dict[str, list[dict]] = defaultdict(list)
                 for sub in subs:
+                    url_groups[sub["url"]].append(sub)
+
+                logger.info(
+                    "Checking %d subscriptions (%d unique URLs)",
+                    len(subs), len(url_groups),
+                )
+
+                for url, group_subs in url_groups.items():
                     if stop_event.is_set():
                         break
-                    try:
-                        await check_subscription(bot, sub)
-                    except Exception as e:
-                        logger.error("Error sub #%d: %s", sub["id"], e)
+
+                    items = await parse_listings(url)
+
+                    if items is None:
+                        for sub in group_subs:
+                            try:
+                                deactivated = await db.increment_error(
+                                    sub["id"], "Parse failed or blocked"
+                                )
+                                if deactivated:
+                                    try:
+                                        await bot.send_message(
+                                            sub["telegram_id"],
+                                            f"⚠️ Отслеживание #{sub['id']} остановлено — слишком много ошибок.",
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                logger.error("Error incrementing error sub #%d: %s", sub["id"], e)
+                        continue
+
+                    for sub in group_subs:
+                        if stop_event.is_set():
+                            break
+                        try:
+                            await db.reset_errors(sub["id"])
+                            await notify_subscription(bot, sub, items)
+                        except Exception as e:
+                            logger.error("Error sub #%d: %s", sub["id"], e)
         except Exception as e:
             logger.error("Scheduler error: %s", e)
 
