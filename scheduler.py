@@ -12,21 +12,42 @@ logger = logging.getLogger(__name__)
 
 
 def format_notification(item: AvitoItem) -> str:
-    """Format item notification — fixed structure, always the same layout."""
+    """Format item notification with enriched data."""
     from datetime import datetime, timezone, timedelta
 
     loc = item.location or "Россия"
     msk = timezone(timedelta(hours=3))
     now = datetime.now(msk).strftime("%H:%M %d.%m.%Y")
 
-    return (
-        f"<b>{item.title}</b>\n"
-        f"💰 {item.price}\n"
-        f"📍 {loc}\n"
-        f"🔗 avito.ru/{item.avito_id}\n"
-        f"📅 {now}\n"
-        f"🆔 <code>{item.avito_id}</code>"
-    )
+    lines = [f"<b>{item.title}</b>"]
+    lines.append(f"💰 {item.price}")
+
+    # Stats line (views + rating)
+    stats = []
+    if item.views:
+        stats.append(f"👀 {item.views}")
+    if item.seller_rating:
+        stats.append(f"⭐ {item.seller_rating}")
+    if stats:
+        lines.append(" ".join(stats))
+
+    lines.append(f"📍 {loc}")
+    lines.append(f"🔗 avito.ru/{item.avito_id}")
+
+    # Description
+    if item.description:
+        lines.append(f"\n<i>{item.description}</i>")
+
+    # Seller
+    if item.seller_name:
+        lines.append(f"\n👤 {item.seller_name}")
+
+    # Date — from Avito or our timestamp
+    date_str = item.published_date or now
+    lines.append(f"📅 {date_str}")
+    lines.append(f"🆔 <code>{item.avito_id}</code>")
+
+    return "\n".join(lines)
 
 
 def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
@@ -72,7 +93,12 @@ async def check_subscription(bot: Bot, sub: dict):
         if already_sent:
             continue
 
-        # Enrich disabled — mobile API returns 403 consistently
+        # Enrich with Playwright (headless browser)
+        try:
+            from parser import enrich_item_playwright
+            item = await enrich_item_playwright(item)
+        except Exception as e:
+            logger.debug("Enrich failed for %s: %s", item.avito_id, e)
 
         # Re-check active right before sending
         still_active2 = await db.is_subscription_active(sub_id)

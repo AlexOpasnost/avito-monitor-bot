@@ -311,6 +311,153 @@ def enrich_item(item: AvitoItem, proxy: str | None) -> AvitoItem:
         return item
 
 
+# ---------------------------------------------------------------------------
+# Playwright browser singleton for enrichment
+# ---------------------------------------------------------------------------
+
+_pw_browser = None
+_pw_playwright = None
+_pw_lock = asyncio.Lock()
+
+
+def _parse_proxy_for_playwright(proxy_str: str) -> dict:
+    """Convert 'http://user:pass@host:port' to Playwright proxy dict."""
+    from urllib.parse import urlparse as _urlparse
+    p = _urlparse(proxy_str)
+    result = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
+    if p.username:
+        result["username"] = p.username
+    if p.password:
+        result["password"] = p.password
+    return result
+
+
+async def _get_browser():
+    """Return a shared Playwright browser instance (singleton)."""
+    global _pw_browser, _pw_playwright
+    async with _pw_lock:
+        if _pw_browser and _pw_browser.is_connected():
+            return _pw_browser
+
+        from playwright.async_api import async_playwright
+        _pw_playwright = await async_playwright().start()
+
+        launch_kwargs = {"headless": True}
+        if config.proxy_list:
+            launch_kwargs["proxy"] = _parse_proxy_for_playwright(config.proxy_list[0])
+
+        _pw_browser = await _pw_playwright.chromium.launch(**launch_kwargs)
+        logger.info("Playwright browser launched")
+        return _pw_browser
+
+
+async def close_playwright():
+    """Shutdown the shared browser (call on bot stop)."""
+    global _pw_browser, _pw_playwright
+    async with _pw_lock:
+        if _pw_browser:
+            await _pw_browser.close()
+            _pw_browser = None
+        if _pw_playwright:
+            await _pw_playwright.stop()
+            _pw_playwright = None
+
+
+async def enrich_item_playwright(item: AvitoItem) -> AvitoItem:
+    """Enrich item with details from Avito page via Playwright."""
+    if not item.url:
+        return item
+
+    try:
+        browser = await _get_browser()
+        page = await browser.new_page()
+        page.set_default_timeout(5000)  # 5s for selectors
+
+        try:
+            await page.goto(item.url, wait_until="domcontentloaded", timeout=15000)
+
+            # Check for captcha / block page
+            content = await page.content()
+            content_lower = content.lower()
+            if "captcha" in content_lower or "доступ ограничен" in content_lower:
+                logger.info("Captcha detected for %s, skipping enrich", item.avito_id)
+                return item
+
+            # Description
+            try:
+                el = await page.wait_for_selector('[data-marker="item-view/item-description"]', timeout=5000)
+                if el:
+                    text = (await el.text_content() or "").strip()
+                    if text:
+                        if len(text) > 300:
+                            text = text[:300] + "..."
+                        item.description = text
+            except Exception:
+                pass
+
+            # Views
+            try:
+                el = await page.query_selector('[data-marker="item-view/total-views"]')
+                if el:
+                    text = (await el.text_content() or "").strip()
+                    if text:
+                        item.views = text
+            except Exception:
+                pass
+
+            # Date
+            try:
+                el = await page.query_selector('[data-marker="item-view/item-date"]')
+                if el:
+                    text = (await el.text_content() or "").strip()
+                    if text:
+                        item.published_date = text
+            except Exception:
+                pass
+
+            # Seller name
+            try:
+                el = await page.query_selector('[data-marker="seller-info/label"]')
+                if el:
+                    text = (await el.text_content() or "").strip()
+                    if text:
+                        item.seller_name = text
+            except Exception:
+                pass
+
+            # Seller rating (text with "отзыв" near seller-info)
+            try:
+                els = await page.query_selector_all('[data-marker^="seller-info"]')
+                for sel_el in els:
+                    text = (await sel_el.text_content() or "").strip()
+                    if "отзыв" in text.lower() or "рейтинг" in text.lower():
+                        # Extract rating number like "4.8" or "4.8 · 123 отзыва"
+                        m = re.search(r"(\d+[.,]\d+)", text)
+                        if m:
+                            item.seller_rating = m.group(1).replace(",", ".")
+                        break
+            except Exception:
+                pass
+
+            # Address (more precise than API)
+            try:
+                el = await page.query_selector('[data-marker="item-view/item-address"]')
+                if el:
+                    text = (await el.text_content() or "").strip()
+                    if text:
+                        item.location = text
+            except Exception:
+                pass
+
+        finally:
+            await page.close()
+
+    except Exception as e:
+        logger.debug("Playwright enrich failed for %s: %s", item.avito_id, e)
+
+    return item
+
+
 async def fetch_page_title(url: str, proxy: str | None) -> str | None:
     """Fetch page title from Avito search page for subscription info."""
     try:
