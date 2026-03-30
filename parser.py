@@ -153,7 +153,7 @@ def _fetch_api(referer: str, params: dict, proxy: str | None) -> list[AvitoItem]
                     or images[0].get("140x140")
                 )
 
-            # Location
+            # Location — from API or from URL path
             loc = item.get("location", "")
             if isinstance(loc, dict):
                 location = loc.get("name", "") or loc.get("formattedAddress", "")
@@ -161,6 +161,34 @@ def _fetch_api(referer: str, params: dict, proxy: str | None) -> list[AvitoItem]
                 location = loc
             else:
                 location = ""
+
+            # Fallback: extract city from urlPath (e.g. /moskva/category/...)
+            if not location and url_path:
+                import re as _re
+                city_match = _re.match(r"/([a-z_-]+)/", url_path)
+                if city_match:
+                    city_slug = city_match.group(1).replace("-", "_")
+                    # Simple transliteration map for common cities
+                    _cities = {
+                        "moskva": "Москва", "sankt_peterburg": "Санкт-Петербург",
+                        "novosibirsk": "Новосибирск", "ekaterinburg": "Екатеринбург",
+                        "kazan": "Казань", "nizhniy_novgorod": "Нижний Новгород",
+                        "chelyabinsk": "Челябинск", "samara": "Самара", "omsk": "Омск",
+                        "rostov_na_donu": "Ростов-на-Дону", "ufa": "Уфа",
+                        "krasnoyarsk": "Красноярск", "voronezh": "Воронеж",
+                        "perm": "Пермь", "volgograd": "Волгоград",
+                        "krasnodar": "Краснодар", "saratov": "Саратов",
+                        "tyumen": "Тюмень", "barnaul": "Барнаул",
+                        "vladivostok": "Владивосток", "irkutsk": "Иркутск",
+                        "habarovsk": "Хабаровск", "yaroslavl": "Ярославль",
+                        "tomsk": "Томск", "orenburg": "Оренбург",
+                        "kaliningrad": "Калининград", "tula": "Тула",
+                        "ryazan": "Рязань", "kirov": "Киров",
+                        "simferopol": "Симферополь", "sevastopol": "Севастополь",
+                        "nizhnekamsk": "Нижнекамск", "podolsk": "Подольск",
+                        "blagoveshchensk": "Благовещенск", "tambov": "Тамбов",
+                    }
+                    location = _cities.get(city_slug, city_slug.replace("_", " ").title())
 
             # Description fallback
             description = item.get("imagesAlt", "")

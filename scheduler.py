@@ -13,20 +13,18 @@ logger = logging.getLogger(__name__)
 
 def format_notification(item: AvitoItem) -> str:
     """Format item notification — fixed structure, always the same layout."""
-    # Line 1: Title
-    # Line 2: Price
-    # Line 3: Location (or dash)
-    # Line 4: Link
-    # Line 5: ID
-    # Always 5 lines, always same structure
+    from datetime import datetime, timezone, timedelta
 
     loc = item.location or "Россия"
+    msk = timezone(timedelta(hours=3))
+    now = datetime.now(msk).strftime("%H:%M %d.%m.%Y")
 
     return (
         f"<b>{item.title}</b>\n"
         f"💰 {item.price}\n"
         f"📍 {loc}\n"
         f"🔗 avito.ru/{item.avito_id}\n"
+        f"📅 {now}\n"
         f"🆔 <code>{item.avito_id}</code>"
     )
 
