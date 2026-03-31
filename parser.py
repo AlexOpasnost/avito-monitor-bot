@@ -43,15 +43,26 @@ def _get_proxy() -> str | None:
 def _extract_search_params(url: str) -> tuple[str, dict]:
     """Extract API path and query params from Avito search URL.
 
-    Returns (api_path, params) where api_path includes the category/location path.
+    Returns (api_url, params) where api_url includes the clean category/location path.
     """
+    import re as _re
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
-    # The path contains category and location info (e.g. /moskva/odezhda/muzhskaya_odezhda)
-    # API uses the same path: /web/1/main/items/moskva/odezhda/muzhskaya_odezhda
-    path = parsed.path.strip("/")
-    api_path = f"https://www.avito.ru/web/1/main/items/{path}" if path else "https://www.avito.ru/web/1/main/items"
+    # Clean path: remove encoded slugs like "ASgBAgICAUSwQ2I_Dc" and item-specific parts
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+    clean_parts = []
+    for part in path_parts:
+        # Skip encoded Avito slugs (start with uppercase, contain mixed case + digits)
+        if _re.match(r'^[A-Z][A-Za-z0-9_+/=-]{5,}$', part):
+            continue
+        # Skip item URLs (end with _12345678)
+        if _re.match(r'^.+_\d{6,}$', part):
+            continue
+        clean_parts.append(part)
+
+    clean_path = "/".join(clean_parts)
+    api_url = f"https://www.avito.ru/web/1/main/items/{clean_path}" if clean_path else "https://www.avito.ru/web/1/main/items"
 
     params = {
         "key": AVITO_API_KEY,
@@ -67,7 +78,7 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
     if "s" not in params:
         params["s"] = "104"
 
-    return api_path, params
+    return api_url, params
 
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
