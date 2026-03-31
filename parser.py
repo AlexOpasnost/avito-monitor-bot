@@ -219,13 +219,13 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, targ
                 continue
 
             # Filter by category
+            item_cat = item.get("category", {})
+            item_cat_id = item_cat.get("id", 0) if isinstance(item_cat, dict) else 0
             if target_category_id:
-                item_cat = item.get("category", {})
-                if isinstance(item_cat, dict):
-                    item_cat_id = item_cat.get("id", 0)
-                else:
-                    item_cat_id = 0
                 if item_cat_id != target_category_id:
+                    # Log first few skipped for debugging
+                    if len(items) == 0:
+                        logger.info("Skipping cat=%d title=%s (want=%d)", item_cat_id, title[:30], target_category_id)
                     continue
 
             title = item.get("title", item.get("name", "Без названия"))
@@ -305,6 +305,16 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, targ
                 location=location or None,
                 description=description if description and description.lower() != title.lower() else None,
             ))
+
+        # Log category distribution for debugging
+        if target_category_id:
+            cat_ids = {}
+            for it in items_data:
+                v = it.get("value", it) if isinstance(it, dict) else {}
+                c = v.get("category", it.get("category", {})) if isinstance(v, dict) else {}
+                cid = c.get("id", 0) if isinstance(c, dict) else 0
+                cat_ids[cid] = cat_ids.get(cid, 0) + 1
+            logger.info("Category distribution in API response: %s (want=%d)", dict(list(cat_ids.items())[:10]), target_category_id)
 
         logger.info("API returned %d items (filter cat=%s)", len(items), target_category_id)
         return items
