@@ -53,19 +53,26 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
-    # Build clean path from URL (only lowercase parts)
+    # Build clean path and extract encoded filter from slug
     path_parts = [p for p in parsed.path.strip("/").split("/") if p]
     clean_parts = []
+    encoded_filter = None
+
     for part in path_parts:
-        # Skip encoded slugs (contain uppercase)
-        if _re.search(r'[A-Z]', part):
-            continue
         # Skip item-specific URLs (name_12345678)
         if _re.match(r'^.+_\d{6,}$', part):
             continue
+
+        # Check for encoded slug: "subcategory-ASgBAgICAUSwQ2I_Dc" or just "ASgBAgICA..."
+        if _re.search(r'[A-Z]', part):
+            # Extract the encoded part (after last hyphen, or whole thing)
+            match = _re.search(r'[A-Z][A-Za-z0-9_+/=]+', part)
+            if match:
+                encoded_filter = match.group(0)
+            continue
+
         clean_parts.append(part)
 
-    # Try with path first, fallback to no path
     clean_path = "/".join(clean_parts)
 
     params = {
@@ -75,18 +82,24 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
         "display": "list",
         "limit": "30",
     }
-    # Pass ALL query params from the original URL (f, context, s, q, etc.)
+    # Pass ALL query params from the original URL
     for key, values in qs.items():
         params[key] = values[0]
 
     if "s" not in params:
         params["s"] = "104"
 
-    # Build API URL — try path-based first
+    # If we found encoded filter in path slug, add as 'f' param
+    if encoded_filter and "f" not in params:
+        params["f"] = encoded_filter
+
+    # Build API URL
     if clean_path:
         api_url = f"https://www.avito.ru/web/1/main/items/{clean_path}"
     else:
         api_url = "https://www.avito.ru/web/1/main/items"
+
+    logger.info("Parsed URL -> API: %s, f=%s", api_url[:80], params.get("f", "none")[:30] if params.get("f") else "none")
 
     return api_url, params
 
@@ -132,21 +145,27 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
             timeout=20,
         )
 
-        # If path-based URL returns 404, fallback to base URL
-        if resp.status_code == 404 and api_url != "https://www.avito.ru/web/1/main/items":
-            logger.info("Path-based API returned 404, trying base URL")
-            resp = curl_requests.get(
-                "https://www.avito.ru/web/1/main/items",
-                params=params,
-                impersonate="chrome",
-                proxy=proxy,
-                headers={
-                    "Referer": referer,
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "ru-RU,ru;q=0.9",
-                },
-                timeout=20,
-            )
+        # If path-based URL returns 404, try removing last path segment
+        if resp.status_code == 404 and "/items/" in api_url:
+            # Try shorter path (e.g. /all/telefony instead of /all/telefony/subcategory)
+            shorter = api_url.rsplit("/", 1)[0]
+            if shorter != api_url and "/items" in shorter:
+                logger.info("404, trying shorter path: %s", shorter[:100])
+                resp = curl_requests.get(
+                    shorter, params=params, impersonate="chrome", proxy=proxy,
+                    headers={"Referer": referer, "Accept": "application/json, text/plain, */*", "Accept-Language": "ru-RU,ru;q=0.9"},
+                    timeout=20,
+                )
+
+            # Still 404? Try base URL with referer (filters come from f/context params)
+            if resp.status_code == 404:
+                logger.info("Still 404, trying base URL")
+                resp = curl_requests.get(
+                    "https://www.avito.ru/web/1/main/items",
+                    params=params, impersonate="chrome", proxy=proxy,
+                    headers={"Referer": referer, "Accept": "application/json, text/plain, */*", "Accept-Language": "ru-RU,ru;q=0.9"},
+                    timeout=20,
+                )
 
         if resp.status_code == 429:
             logger.warning("API 429 (rate limited)")
