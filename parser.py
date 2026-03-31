@@ -49,12 +49,14 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
-    # Clean path: remove encoded slugs like "ASgBAgICAUSwQ2I_Dc" and item-specific parts
+    # Clean path: keep only lowercase slug parts (city, category)
+    # Avito real slugs: all, moskva, odezhda_obuv_aksessuary, muzhskaya_odezhda
+    # Encoded slugs: ASgBAgICAUSwQ2I_Dc, mobile-ASgBAgICAUSwQ2I_Dc, prodam-ASgB...
     path_parts = [p for p in parsed.path.strip("/").split("/") if p]
     clean_parts = []
     for part in path_parts:
-        # Skip encoded Avito slugs (start with uppercase, contain mixed case + digits)
-        if _re.match(r'^[A-Z][A-Za-z0-9_+/=-]{5,}$', part):
+        # Skip anything with uppercase letters (encoded Avito slugs)
+        if _re.search(r'[A-Z]', part):
             continue
         # Skip item URLs (end with _12345678)
         if _re.match(r'^.+_\d{6,}$', part):
