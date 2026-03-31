@@ -4,6 +4,8 @@ import random
 import re
 from dataclasses import dataclass
 
+from playwright_stealth import stealth_async
+
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ def _get_proxy() -> str | None:
 
 _pw_browser = None
 _pw_playwright = None
+_pw_context = None
 _pw_lock = asyncio.Lock()
 
 
@@ -64,15 +67,84 @@ async def _get_browser():
         from playwright.async_api import async_playwright
         _pw_playwright = await async_playwright().start()
 
-        _pw_browser = await _pw_playwright.chromium.launch(headless=True)
-        logger.info("Playwright browser launched")
+        _pw_browser = await _pw_playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-size=412,915",
+                "--disable-extensions",
+            ],
+        )
+        logger.info("Playwright browser launched (anti-detection args)")
         return _pw_browser
+
+
+async def _get_context():
+    """Return a shared Playwright browser context with anti-detection settings."""
+    global _pw_context
+    async with _pw_lock:
+        browser = await _get_browser()
+        if _pw_context:
+            try:
+                # Test if context is still alive
+                _ = _pw_context.pages
+                return _pw_context
+            except Exception:
+                _pw_context = None
+
+        context_kwargs = {
+            "viewport": {"width": 412, "height": 915},
+            "user_agent": (
+                "Mozilla/5.0 (Linux; Android 13; SM-S908B) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
+            ),
+            "locale": "ru-RU",
+            "timezone_id": "Europe/Moscow",
+            "geolocation": {"longitude": 37.6173, "latitude": 55.7558},
+            "permissions": ["geolocation"],
+            "color_scheme": "light",
+            "has_touch": True,
+            "is_mobile": True,
+            "device_scale_factor": 2.625,
+        }
+        if config.proxy_list:
+            context_kwargs["proxy"] = _parse_proxy_for_playwright(config.proxy_list[0])
+
+        context = await browser.new_context(**context_kwargs)
+        _pw_context = context
+
+        # Warm-up: visit main page to establish cookies
+        warmup_page = await context.new_page()
+        await stealth_async(warmup_page)
+        try:
+            await warmup_page.goto(
+                "https://www.avito.ru/",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            await asyncio.sleep(3)
+        except Exception:
+            pass
+        finally:
+            await warmup_page.close()
+
+        logger.info("Playwright context created with anti-detection settings")
+        return context
 
 
 async def close_playwright():
     """Shutdown the shared browser (call on bot stop)."""
-    global _pw_browser, _pw_playwright
+    global _pw_browser, _pw_playwright, _pw_context
     async with _pw_lock:
+        if _pw_context:
+            await _pw_context.close()
+            _pw_context = None
         if _pw_browser:
             await _pw_browser.close()
             _pw_browser = None
@@ -182,22 +254,9 @@ async def _parse_card(card) -> AvitoItem | None:
 async def parse_listings(url: str) -> list[AvitoItem] | None:
     """Fetch listings from Avito via Playwright (real browser rendering)."""
     try:
-        browser = await _get_browser()
-
-        # Create context with proxy
-        context_kwargs = {
-            "user_agent": (
-                "Mozilla/5.0 (Linux; Android 13; SM-S908B) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Mobile Safari/537.36"
-            ),
-            "locale": "ru-RU",
-        }
-        if config.proxy_list:
-            context_kwargs["proxy"] = _parse_proxy_for_playwright(config.proxy_list[0])
-
-        context = await browser.new_context(**context_kwargs)
+        context = await _get_context()
         page = await context.new_page()
+        await stealth_async(page)
 
         try:
             # Random delay before request
@@ -206,7 +265,14 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
-            # Check for captcha / block page
+            # Wait for page to fully render
+            await asyncio.sleep(2)
+
+            # Scroll down slightly (human behavior)
+            await page.evaluate("window.scrollBy(0, 300)")
+            await asyncio.sleep(1)
+
+            # Check for captcha / block page AFTER rendering
             content = await page.content()
             content_lower = content.lower()
             if "captcha" in content_lower or "доступ ограничен" in content_lower or "проблема с ip" in content_lower:
@@ -215,7 +281,7 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
             # Wait for listing cards
             try:
-                await page.wait_for_selector('[data-marker="item"]', timeout=15000)
+                await page.wait_for_selector('[data-marker="item"]', timeout=20000)
             except Exception:
                 logger.info("Playwright: no [data-marker=item] found on %s", url[:60])
                 return []
@@ -233,7 +299,6 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
         finally:
             await page.close()
-            await context.close()
 
     except Exception as e:
         logger.error("Playwright parse error for %s: %s", url[:60], e)
