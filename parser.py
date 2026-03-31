@@ -127,17 +127,17 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
     if "s" not in params:
         params["s"] = "104"
 
-    # Resolve category ID for client-side filtering
-    target_category_id = None
-    if category_slug:
-        target_category_id = CATEGORY_IDS.get(category_slug)
+    # For client-side filtering: use category slug from URL path
+    # Items have urlPath like /moskva/telefony/iphone_15_12345
+    # We match if urlPath contains the category slug
+    target_category_slug = category_slug  # e.g. "telefony", "kvartiry"
 
     api_url = "https://www.avito.ru/web/1/main/items"
 
-    logger.info("Parsed URL -> city=%s, cat=%s (filter_id=%s)",
-        city_slug, category_slug, target_category_id)
+    logger.info("Parsed URL -> city=%s, cat_slug=%s (url filter)",
+        city_slug, target_category_slug)
 
-    return api_url, params, target_category_id
+    return api_url, params, target_category_slug
 
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
@@ -220,13 +220,15 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, targ
 
             title = item.get("title", item.get("name", "Без названия"))
 
-            # Filter by category
-            item_cat = item.get("category", {})
-            item_cat_id = item_cat.get("id", 0) if isinstance(item_cat, dict) else 0
-            if target_category_id:
-                if item_cat_id != target_category_id:
-                    continue
-                logger.info("PASSED filter: cat=%d, title=%s", item_cat_id, title[:40])
+            # Filter by category slug in urlPath
+            url_path = item.get("urlPath", "")
+            if target_category_id and url_path:
+                # target_category_id is actually category slug now (e.g. "telefony")
+                if f"/{target_category_id}/" not in url_path and not url_path.startswith(f"/{target_category_id}/"):
+                    # Also check without leading slash
+                    path_parts = [p for p in url_path.strip("/").split("/") if p]
+                    if len(path_parts) >= 2 and path_parts[1] != target_category_id:
+                        continue
 
             # Price
             price_info = item.get("priceDetailed", {})
@@ -304,17 +306,7 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, targ
                 description=description if description and description.lower() != title.lower() else None,
             ))
 
-        # Log category distribution for debugging
-        if target_category_id:
-            cat_ids = {}
-            for it in items_data:
-                v = it.get("value", it) if isinstance(it, dict) else {}
-                c = v.get("category", it.get("category", {})) if isinstance(v, dict) else {}
-                cid = c.get("id", 0) if isinstance(c, dict) else 0
-                cat_ids[cid] = cat_ids.get(cid, 0) + 1
-            logger.info("Category distribution in API response: %s (want=%d)", dict(list(cat_ids.items())[:10]), target_category_id)
-
-        logger.info("API returned %d items (filter cat=%s)", len(items), target_category_id)
+        logger.info("API returned %d items (filter slug=%s)", len(items), target_category_id)
         return items
 
     except Exception as e:
