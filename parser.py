@@ -1,67 +1,12 @@
 import asyncio
-import json
 import logging
 import random
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs
-
-from curl_cffi import requests as curl_requests
 
 from config import config
 
 logger = logging.getLogger(__name__)
-
-AVITO_API_KEY = "af0deccbgcgidddjgnvljitrat3lbhpb"
-AVITO_MOBILE_KEY = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
-
-# Avito category slug -> categoryId mapping for mobile API
-CATEGORY_IDS = {
-    "telefony": 24, "smartfony": 24,
-    "noutbuki": 4, "kompyutery": 31,
-    "planshety_i_elektronnye_knigi": 137,
-    "audio_i_video": 32, "foto_i_videokamery": 34,
-    "igry_pristavki_i_programmy": 97,
-    "bytovaya_tehnika": 21, "elektronika": 6,
-    "odezhda_obuv_aksessuary": 27,
-    "muzhskaya_odezhda": 108, "zhenskaya_odezhda": 107,
-    "detskaya_odezhda_i_obuv": 109,
-    "kvartiry": 18, "komnaty": 19,
-    "doma_dachi_kottedzhi": 20,
-    "nedvizhimost": 4,
-    "avtomobili": 9, "mototsikly_i_mototehnika": 14,
-    "gruzoviki_i_spetstehnika": 81,
-    "zapchasti_i_aksessuary": 10,
-    "transport": 1,
-    "vakansii": 110, "rezyume": 111, "rabota": 2,
-    "mebel_i_interer": 35,
-    "sport_i_otdyh": 39, "hobbi_i_otdyh": 7,
-    "zhivotnye": 47, "sobaki": 48, "koshki": 49,
-    "dlya_doma_i_dachi": 5,
-    "remont_i_stroitelstvo": 112,
-    "uslugi": 8, "predlozheniya_uslug": 113,
-    "lichnye_veschi": 3, "krasota_i_zdorove": 110,
-    "rasteniya": 106,
-}
-
-# City slug -> locationId mapping
-LOCATION_IDS = {
-    "all": 621540,  # Вся Россия
-    "moskva": 637640, "sankt-peterburg": 653240,
-    "novosibirsk": 648070, "ekaterinburg": 643720,
-    "kazan": 645100, "nizhniy_novgorod": 647540,
-    "chelyabinsk": 655120, "samara": 652500,
-    "omsk": 649100, "rostov-na-donu": 651920,
-    "ufa": 654360, "krasnoyarsk": 646200,
-    "voronezh": 642440, "perm": 649900,
-    "volgograd": 641940, "krasnodar": 645880,
-    "saratov": 653000, "tyumen": 654080,
-    "barnaul": 641400, "vladivostok": 641780,
-    "irkutsk": 644640, "habarovsk": 654520,
-    "yaroslavl": 656060, "tomsk": 654000,
-    "orenburg": 649200, "kaliningrad": 645020,
-    "tula": 654160, "ryazan": 652320,
-}
 
 
 @dataclass
@@ -88,334 +33,8 @@ def _get_proxy() -> str | None:
     return random.choice(config.proxy_list)
 
 
-def _extract_search_params(url: str) -> tuple[str, dict]:
-    """Extract API URL and params. Uses web API with path, falls back to mobile API with categoryId."""
-    import re as _re
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-
-    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-
-    # Extract city and category slugs (lowercase only)
-    city_slug = None
-    category_slug = None
-    for part in path_parts:
-        if _re.search(r'[A-Z]', part):
-            continue
-        if _re.match(r'^.+_\d{6,}$', part):
-            continue
-        if city_slug is None:
-            city_slug = part
-        elif category_slug is None:
-            category_slug = part
-
-    # Web API — categoryId/locationId don't work as params
-    # We'll filter results client-side by category.id
-    params = {
-        "key": AVITO_API_KEY,
-        "sort": "date",
-        "display": "list",
-        "limit": "100",  # Fetch more to have enough after category filtering
-        "page": "1",
-    }
-
-    # Pass query params from URL
-    for key, values in qs.items():
-        if key not in params:
-            params[key] = values[0]
-
-    if "s" not in params:
-        params["s"] = "104"
-
-    # For client-side filtering: use category slug from URL path
-    # Items have urlPath like /moskva/telefony/iphone_15_12345
-    # We match if urlPath contains the category slug
-    target_category_slug = category_slug  # e.g. "telefony", "kvartiry"
-
-    api_url = "https://www.avito.ru/web/1/main/items"
-
-    logger.info("Parsed URL -> city=%s, cat_slug=%s (url filter)",
-        city_slug, target_category_slug)
-
-    return api_url, params, target_category_slug
-
-
-async def parse_listings(url: str) -> list[AvitoItem] | None:
-    """Fetch listings from Avito internal API."""
-    proxy = _get_proxy()
-    api_path, params, target_category_id = _extract_search_params(url)
-
-    delay = random.uniform(config.request_delay_min, config.request_delay_max)
-    await asyncio.sleep(delay)
-
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    if host == "m.avito.ru":
-        referer = url.replace("m.avito.ru", "www.avito.ru")
-    elif host == "avito.ru":
-        referer = url.replace("avito.ru", "www.avito.ru", 1)
-    else:
-        referer = url
-
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: _fetch_api(api_path, referer, params, proxy, target_category_id))
-    except Exception as e:
-        logger.error("Parse error for %s: %s", url, e)
-        return None
-
-
-def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, target_category_id: int | None = None) -> list[AvitoItem] | None:
-    try:
-        logger.info("Fetching API: %s?categoryId=%s&locationId=%s",
-            api_url[:60], params.get("categoryId", "?"), params.get("locationId", "?"))
-        resp = curl_requests.get(
-            api_url,
-            params=params,
-            impersonate="chrome",
-            proxy=proxy,
-            headers={
-                "Referer": referer,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
-            timeout=20,
-        )
-
-        if resp.status_code == 429:
-            logger.warning("API 429 (rate limited)")
-            return None
-        if resp.status_code == 403:
-            logger.warning("API 403 (blocked)")
-            return None
-        if resp.status_code != 200:
-            logger.warning("API status: %d", resp.status_code)
-            return None
-
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
-
-        items_data = data.get("items", [])
-        # Mobile API may wrap in "result"
-        if not items_data and "result" in data:
-            result = data["result"]
-            if isinstance(result, dict):
-                items_data = result.get("items", [])
-        if not items_data:
-            return []
-
-        items = []
-        for item in items_data:
-            if not isinstance(item, dict):
-                continue
-            # Mobile API may nest item data in "value" key
-            if "value" in item and isinstance(item["value"], dict):
-                item = item["value"]
-
-            avito_id = str(item.get("id", item.get("itemId", "")))
-            if not avito_id:
-                continue
-
-            title = item.get("title", item.get("name", "Без названия"))
-
-            # Filter by category slug in urlPath
-            url_path = item.get("urlPath", "")
-            if target_category_id and url_path:
-                # target_category_id is actually category slug now (e.g. "telefony")
-                if f"/{target_category_id}/" not in url_path and not url_path.startswith(f"/{target_category_id}/"):
-                    # Also check without leading slash
-                    path_parts = [p for p in url_path.strip("/").split("/") if p]
-                    if len(path_parts) >= 2 and path_parts[1] != target_category_id:
-                        continue
-
-            # Price
-            price_info = item.get("priceDetailed", {})
-            if isinstance(price_info, dict):
-                price_str = price_info.get("string", "")
-                price_val = price_info.get("value", 0)
-                price = price_str if price_str else (f"{int(price_val):,} ₽".replace(",", " ") if price_val else "Цена не указана")
-            else:
-                price = "Цена не указана"
-
-            # URL
-            url_path = item.get("urlPath", "")
-            if url_path and "?" in url_path:
-                url_path = url_path.split("?")[0]
-            item_url = f"https://www.avito.ru{url_path}" if url_path else ""
-
-            # Image — prefer small for fast Telegram delivery
-            images = item.get("images", [])
-            image_url = None
-            if images and isinstance(images[0], dict):
-                image_url = (
-                    images[0].get("278x278")
-                    or images[0].get("339x339")
-                    or images[0].get("636x476")
-                    or images[0].get("140x140")
-                )
-
-            # Location — from API or from URL path
-            loc = item.get("location", "")
-            if isinstance(loc, dict):
-                location = loc.get("name", "") or loc.get("formattedAddress", "")
-            elif isinstance(loc, str):
-                location = loc
-            else:
-                location = ""
-
-            # Fallback: extract city from urlPath (e.g. /moskva/category/...)
-            if not location and url_path:
-                import re as _re
-                city_match = _re.match(r"/([a-z_-]+)/", url_path)
-                if city_match:
-                    city_slug = city_match.group(1).replace("-", "_")
-                    # Simple transliteration map for common cities
-                    _cities = {
-                        "moskva": "Москва", "sankt_peterburg": "Санкт-Петербург",
-                        "novosibirsk": "Новосибирск", "ekaterinburg": "Екатеринбург",
-                        "kazan": "Казань", "nizhniy_novgorod": "Нижний Новгород",
-                        "chelyabinsk": "Челябинск", "samara": "Самара", "omsk": "Омск",
-                        "rostov_na_donu": "Ростов-на-Дону", "ufa": "Уфа",
-                        "krasnoyarsk": "Красноярск", "voronezh": "Воронеж",
-                        "perm": "Пермь", "volgograd": "Волгоград",
-                        "krasnodar": "Краснодар", "saratov": "Саратов",
-                        "tyumen": "Тюмень", "barnaul": "Барнаул",
-                        "vladivostok": "Владивосток", "irkutsk": "Иркутск",
-                        "habarovsk": "Хабаровск", "yaroslavl": "Ярославль",
-                        "tomsk": "Томск", "orenburg": "Оренбург",
-                        "kaliningrad": "Калининград", "tula": "Тула",
-                        "ryazan": "Рязань", "kirov": "Киров",
-                        "simferopol": "Симферополь", "sevastopol": "Севастополь",
-                        "nizhnekamsk": "Нижнекамск", "podolsk": "Подольск",
-                        "blagoveshchensk": "Благовещенск", "tambov": "Тамбов",
-                    }
-                    location = _cities.get(city_slug, city_slug.replace("_", " ").title())
-
-            # Description fallback
-            description = item.get("imagesAlt", "")
-
-            items.append(AvitoItem(
-                avito_id=avito_id,
-                title=title,
-                price=price,
-                url=item_url,
-                image_url=image_url,
-                location=location or None,
-                description=description if description and description.lower() != title.lower() else None,
-            ))
-
-        logger.info("API returned %d items (filter slug=%s)", len(items), target_category_id)
-        return items
-
-    except Exception as e:
-        logger.error("API request failed: %s", e)
-        return None
-
-
-def enrich_item(item: AvitoItem, proxy: str | None) -> AvitoItem:
-    """Enrich item with description, seller, date from mobile API v19."""
-    try:
-        # Try direct API call without visiting main page first
-        resp = curl_requests.get(
-            f"https://m.avito.ru/api/19/items/{item.avito_id}",
-            params={"key": AVITO_MOBILE_KEY},
-            impersonate="chrome",
-            proxy=proxy,
-            headers={
-                "user-agent": "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36",
-                "accept": "application/json",
-                "accept-language": "ru-RU,ru;q=0.9",
-                "referer": "https://m.avito.ru/",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-            },
-            timeout=10,
-            allow_redirects=False,
-        )
-
-        if resp.status_code != 200:
-            logger.info("Enrich API returned %d for %s", resp.status_code, item.avito_id)
-            return item
-
-        d = resp.json()
-        logger.info("Enrich OK for %s, keys: %d", item.avito_id, len(d))
-
-        # Description
-        desc = d.get("description", "")
-        if isinstance(desc, dict):
-            desc = desc.get("text", desc.get("value", ""))
-        if desc and isinstance(desc, str):
-            desc = re.sub(r"<[^>]+>", "", desc).strip()
-            if len(desc) > 200:
-                desc = desc[:200] + "..."
-            item.description = desc
-
-        # Address
-        addr = d.get("address", "")
-        if addr and isinstance(addr, str):
-            item.location = addr
-
-        # Seller
-        seller = d.get("seller", {})
-        if isinstance(seller, dict):
-            item.seller_name = seller.get("name", seller.get("title", "")) or None
-            rating = seller.get("rating", {})
-            if isinstance(rating, dict):
-                score = rating.get("score", rating.get("value", ""))
-                count = rating.get("count", rating.get("reviews", ""))
-                if score:
-                    try:
-                        item.seller_rating = f"{float(score):.1f}"
-                    except (ValueError, TypeError):
-                        item.seller_rating = str(score)
-                if count:
-                    item.seller_reviews = str(count)
-
-        # Views
-        for vk in ["viewsCount", "views", "totalViews"]:
-            v = d.get(vk)
-            if v and v != 0:
-                if isinstance(v, dict):
-                    total = v.get("total", v.get("all", 0))
-                    today = v.get("today", 0)
-                    item.views = f"{total} (+{today})" if today else str(total)
-                else:
-                    item.views = str(v)
-                break
-
-        # Favorites
-        for fk in ["favoritesCount", "favorites"]:
-            f = d.get(fk)
-            if f and f != 0:
-                if isinstance(f, dict):
-                    f = f.get("total", f.get("all", 0))
-                if f:
-                    item.favorites = str(f)
-                break
-
-        # Time
-        time_val = d.get("time", d.get("createdAt", d.get("sortTimeStamp", "")))
-        if isinstance(time_val, (int, float)) and time_val > 1000000000:
-            from datetime import datetime, timezone
-            try:
-                item.published_date = datetime.fromtimestamp(time_val, tz=timezone.utc).strftime("%H:%M:%S %d.%m.%Y")
-            except (ValueError, OSError):
-                pass
-        elif isinstance(time_val, str) and time_val:
-            item.published_date = time_val
-
-        return item
-
-    except Exception as e:
-        logger.debug("Enrich failed for %s: %s", item.avito_id, e)
-        return item
-
-
 # ---------------------------------------------------------------------------
-# Playwright browser singleton for enrichment
+# Playwright browser singleton
 # ---------------------------------------------------------------------------
 
 _pw_browser = None
@@ -462,136 +81,160 @@ async def close_playwright():
             _pw_playwright = None
 
 
-async def enrich_item_playwright(item: AvitoItem) -> AvitoItem:
-    """Enrich item with details from Avito page via Playwright."""
-    if not item.url:
-        return item
+# ---------------------------------------------------------------------------
+# Parsing a single card
+# ---------------------------------------------------------------------------
 
+async def _parse_card(card) -> AvitoItem | None:
+    """Parse a single listing card element into AvitoItem."""
+    try:
+        # ID
+        item_id = await card.get_attribute("data-item-id") or ""
+        if not item_id:
+            try:
+                link = await card.query_selector("a[href]")
+                if link:
+                    href = await link.get_attribute("href") or ""
+                    match = re.search(r"_(\d+)$", href)
+                    if match:
+                        item_id = match.group(1)
+            except Exception:
+                pass
+
+        if not item_id:
+            return None
+
+        # Title
+        title = "Без названия"
+        try:
+            title_el = await card.query_selector('[data-marker="item-title"]')
+            if not title_el:
+                title_el = await card.query_selector("h3")
+            if title_el:
+                title = (await title_el.text_content() or "").strip() or "Без названия"
+        except Exception:
+            pass
+
+        # Price
+        price = "Цена не указана"
+        try:
+            price_el = await card.query_selector('[data-marker="item-price"]')
+            if price_el:
+                price = (await price_el.text_content() or "").strip() or "Цена не указана"
+        except Exception:
+            pass
+
+        # Image
+        image_url = None
+        try:
+            img = await card.query_selector("img[src]")
+            if img:
+                image_url = await img.get_attribute("src")
+            if not image_url:
+                img2 = await card.query_selector("img[data-src]")
+                if img2:
+                    image_url = await img2.get_attribute("data-src")
+        except Exception:
+            pass
+
+        # URL
+        item_url = ""
+        try:
+            link = await card.query_selector('a[href*="/"]')
+            if link:
+                url_path = await link.get_attribute("href") or ""
+                if url_path and not url_path.startswith("http"):
+                    item_url = f"https://www.avito.ru{url_path}"
+                else:
+                    item_url = url_path
+        except Exception:
+            pass
+
+        # Location
+        location = None
+        try:
+            loc_el = await card.query_selector('[data-marker="item-address"]')
+            if not loc_el:
+                loc_el = await card.query_selector('[class*="geo"]')
+            if loc_el:
+                location = (await loc_el.text_content() or "").strip() or None
+        except Exception:
+            pass
+
+        return AvitoItem(
+            avito_id=item_id,
+            title=title,
+            price=price,
+            url=item_url,
+            image_url=image_url,
+            location=location,
+        )
+
+    except Exception as e:
+        logger.debug("Failed to parse card: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main listing parser
+# ---------------------------------------------------------------------------
+
+async def parse_listings(url: str) -> list[AvitoItem] | None:
+    """Fetch listings from Avito via Playwright (real browser rendering)."""
     try:
         browser = await _get_browser()
 
-        # Create context with proxy (so each page goes through mobile proxy)
-        context_kwargs = {}
+        # Create context with proxy
+        context_kwargs = {
+            "user_agent": (
+                "Mozilla/5.0 (Linux; Android 13; SM-S908B) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
+            ),
+            "locale": "ru-RU",
+        }
         if config.proxy_list:
             context_kwargs["proxy"] = _parse_proxy_for_playwright(config.proxy_list[0])
+
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
-        page.set_default_timeout(5000)
 
         try:
-            await page.goto(item.url, wait_until="domcontentloaded", timeout=15000)
+            # Random delay before request
+            delay = random.uniform(config.request_delay_min, config.request_delay_max)
+            await asyncio.sleep(delay)
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
             # Check for captcha / block page
-            title = await page.title()
             content = await page.content()
             content_lower = content.lower()
             if "captcha" in content_lower or "доступ ограничен" in content_lower or "проблема с ip" in content_lower:
-                logger.info("Captcha/block for %s (title: %s)", item.avito_id, title)
-                return item
-            logger.info("Playwright loaded %s (title: %s, size: %d)", item.avito_id, title[:50], len(content))
+                logger.warning("Playwright: captcha/block on %s", url[:60])
+                return None
 
-            # Description
+            # Wait for listing cards
             try:
-                el = await page.wait_for_selector('[data-marker="item-view/item-description"]', timeout=5000)
-                if el:
-                    text = (await el.text_content() or "").strip()
-                    if text:
-                        if len(text) > 300:
-                            text = text[:300] + "..."
-                        item.description = text
+                await page.wait_for_selector('[data-marker="item"]', timeout=15000)
             except Exception:
-                pass
+                logger.info("Playwright: no [data-marker=item] found on %s", url[:60])
+                return []
 
-            # Views
-            try:
-                el = await page.query_selector('[data-marker="item-view/total-views"]')
-                if el:
-                    text = (await el.text_content() or "").strip()
-                    if text:
-                        item.views = text
-            except Exception:
-                pass
+            cards = await page.query_selector_all('[data-marker="item"]')
 
-            # Date
-            try:
-                el = await page.query_selector('[data-marker="item-view/item-date"]')
-                if el:
-                    text = (await el.text_content() or "").strip()
-                    if text:
-                        item.published_date = text
-            except Exception:
-                pass
+            items: list[AvitoItem] = []
+            for card in cards:
+                item = await _parse_card(card)
+                if item:
+                    items.append(item)
 
-            # Seller name
-            try:
-                el = await page.query_selector('[data-marker="seller-info/label"]')
-                if el:
-                    text = (await el.text_content() or "").strip()
-                    if text:
-                        item.seller_name = text
-            except Exception:
-                pass
-
-            # Seller rating (text with "отзыв" near seller-info)
-            try:
-                els = await page.query_selector_all('[data-marker^="seller-info"]')
-                for sel_el in els:
-                    text = (await sel_el.text_content() or "").strip()
-                    if "отзыв" in text.lower() or "рейтинг" in text.lower():
-                        # Extract rating number like "4.8" or "4.8 · 123 отзыва"
-                        m = re.search(r"(\d+[.,]\d+)", text)
-                        if m:
-                            item.seller_rating = m.group(1).replace(",", ".")
-                        break
-            except Exception:
-                pass
-
-            # Address (more precise than API)
-            try:
-                el = await page.query_selector('[data-marker="item-view/item-address"]')
-                if el:
-                    text = (await el.text_content() or "").strip()
-                    if text:
-                        item.location = text
-            except Exception:
-                pass
+            logger.info("Playwright: found %d items on %s", len(items), url[:60])
+            return items
 
         finally:
             await page.close()
             await context.close()
 
     except Exception as e:
-        logger.debug("Playwright enrich failed for %s: %s", item.avito_id, e)
-
-    return item
-
-
-async def fetch_page_title(url: str, proxy: str | None) -> str | None:
-    """Fetch page title from Avito search page for subscription info."""
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: _fetch_title(url, proxy))
-    except Exception:
-        return None
-
-
-def _fetch_title(url: str, proxy: str | None) -> str | None:
-    """Get the search page title (e.g. 'Женская одежда')."""
-    try:
-        resp = curl_requests.get(
-            url, impersonate="chrome", proxy=proxy,
-            headers={"Accept-Language": "ru-RU,ru;q=0.9"},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            return None
-        # Extract <title> or <h1>
-        m = re.search(r"<h1[^>]*>([^<]+)</h1>", resp.text)
-        if m:
-            title = m.group(1).strip()
-            # Remove count like "2 111 986"
-            title = re.sub(r"\s*[\d\s]{4,}$", "", title).strip()
-            return title if title else None
-        return None
-    except Exception:
+        logger.error("Playwright parse error for %s: %s", url[:60], e)
         return None
