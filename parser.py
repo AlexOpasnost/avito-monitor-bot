@@ -109,12 +109,12 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
         elif category_slug is None:
             category_slug = part
 
-    # Build params for mobile API (reliable filtering)
+    # Build params for web API with category/location filtering
     params = {
-        "key": AVITO_MOBILE_KEY,
+        "key": AVITO_API_KEY,
         "sort": "date",
         "display": "list",
-        "limit": "50",
+        "limit": "30",
         "page": "1",
     }
 
@@ -130,12 +130,15 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
         if cat_id:
             params["categoryId"] = str(cat_id)
 
-    # Pass query params from URL (q, pmin, pmax, etc.)
-    for key in ["q", "pmin", "pmax"]:
-        if key in qs:
-            params[key] = qs[key][0]
+    # Pass query params from URL (q, pmin, pmax, s, f, context, etc.)
+    for key, values in qs.items():
+        if key not in params:
+            params[key] = values[0]
 
-    api_url = "https://m.avito.ru/api/9/items"
+    if "s" not in params:
+        params["s"] = "104"
+
+    api_url = "https://www.avito.ru/web/1/main/items"
 
     logger.info("Parsed URL -> city=%s (loc=%s), cat=%s (id=%s)",
         city_slug, params.get("locationId", "?"),
@@ -201,9 +204,12 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
         except (json.JSONDecodeError, ValueError):
             return None
 
-        # Mobile API wraps items in "result"
-        result = data.get("result", data)
-        items_data = result.get("items", data.get("items", []))
+        items_data = data.get("items", [])
+        # Mobile API may wrap in "result"
+        if not items_data and "result" in data:
+            result = data["result"]
+            if isinstance(result, dict):
+                items_data = result.get("items", [])
         if not items_data:
             return []
 
