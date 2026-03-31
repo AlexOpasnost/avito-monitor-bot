@@ -40,9 +40,19 @@ def _get_proxy() -> str | None:
     return random.choice(config.proxy_list)
 
 
-def _extract_search_params(url: str) -> dict:
+def _extract_search_params(url: str) -> tuple[str, dict]:
+    """Extract API path and query params from Avito search URL.
+
+    Returns (api_path, params) where api_path includes the category/location path.
+    """
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
+
+    # The path contains category and location info (e.g. /moskva/odezhda/muzhskaya_odezhda)
+    # API uses the same path: /web/1/main/items/moskva/odezhda/muzhskaya_odezhda
+    path = parsed.path.strip("/")
+    api_path = f"https://www.avito.ru/web/1/main/items/{path}" if path else "https://www.avito.ru/web/1/main/items"
+
     params = {
         "key": AVITO_API_KEY,
         "sort": "date",
@@ -50,18 +60,20 @@ def _extract_search_params(url: str) -> dict:
         "display": "list",
         "limit": "30",
     }
-    for key in ["s", "pmin", "pmax", "q", "cd", "context", "f"]:
-        if key in qs:
-            params[key] = qs[key][0]
+    # Pass ALL query params from the original URL
+    for key, values in qs.items():
+        params[key] = values[0]
+
     if "s" not in params:
         params["s"] = "104"
-    return params
+
+    return api_path, params
 
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
     """Fetch listings from Avito internal API."""
     proxy = _get_proxy()
-    params = _extract_search_params(url)
+    api_path, params = _extract_search_params(url)
 
     delay = random.uniform(config.request_delay_min, config.request_delay_max)
     await asyncio.sleep(delay)
@@ -77,16 +89,17 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
     try:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: _fetch_api(referer, params, proxy))
+        return await loop.run_in_executor(None, lambda: _fetch_api(api_path, referer, params, proxy))
     except Exception as e:
         logger.error("Parse error for %s: %s", url, e)
         return None
 
 
-def _fetch_api(referer: str, params: dict, proxy: str | None) -> list[AvitoItem] | None:
+def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> list[AvitoItem] | None:
     try:
+        logger.info("Fetching API: %s", api_url[:100])
         resp = curl_requests.get(
-            "https://www.avito.ru/web/1/main/items",
+            api_url,
             params=params,
             impersonate="chrome",
             proxy=proxy,
