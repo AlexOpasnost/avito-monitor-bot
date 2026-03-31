@@ -41,30 +41,32 @@ def _get_proxy() -> str | None:
 
 
 def _extract_search_params(url: str) -> tuple[str, dict]:
-    """Extract API path and query params from Avito search URL.
+    """Extract API URL and query params from Avito search URL.
 
-    Returns (api_url, params) where api_url includes the clean category/location path.
+    The web API mirrors the site URL structure:
+    - Site: avito.ru/moskva/telefony?f=ASgBAg...
+    - API:  avito.ru/web/1/main/items/moskva/telefony?f=ASgBAg...&key=...
+
+    Encoded slugs (with uppercase) are stripped from path and passed via 'f' param.
     """
     import re as _re
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
-    # Clean path: keep only lowercase slug parts (city, category)
-    # Avito real slugs: all, moskva, odezhda_obuv_aksessuary, muzhskaya_odezhda
-    # Encoded slugs: ASgBAgICAUSwQ2I_Dc, mobile-ASgBAgICAUSwQ2I_Dc, prodam-ASgB...
+    # Build clean path from URL (only lowercase parts)
     path_parts = [p for p in parsed.path.strip("/").split("/") if p]
     clean_parts = []
     for part in path_parts:
-        # Skip anything with uppercase letters (encoded Avito slugs)
+        # Skip encoded slugs (contain uppercase)
         if _re.search(r'[A-Z]', part):
             continue
-        # Skip item URLs (end with _12345678)
+        # Skip item-specific URLs (name_12345678)
         if _re.match(r'^.+_\d{6,}$', part):
             continue
         clean_parts.append(part)
 
+    # Try with path first, fallback to no path
     clean_path = "/".join(clean_parts)
-    api_url = f"https://www.avito.ru/web/1/main/items/{clean_path}" if clean_path else "https://www.avito.ru/web/1/main/items"
 
     params = {
         "key": AVITO_API_KEY,
@@ -73,12 +75,18 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
         "display": "list",
         "limit": "30",
     }
-    # Pass ALL query params from the original URL
+    # Pass ALL query params from the original URL (f, context, s, q, etc.)
     for key, values in qs.items():
         params[key] = values[0]
 
     if "s" not in params:
         params["s"] = "104"
+
+    # Build API URL — try path-based first
+    if clean_path:
+        api_url = f"https://www.avito.ru/web/1/main/items/{clean_path}"
+    else:
+        api_url = "https://www.avito.ru/web/1/main/items"
 
     return api_url, params
 
@@ -110,7 +118,7 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
 def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> list[AvitoItem] | None:
     try:
-        logger.info("Fetching API: %s", api_url[:100])
+        logger.info("Fetching API: %s", api_url[:120])
         resp = curl_requests.get(
             api_url,
             params=params,
@@ -123,6 +131,22 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
             },
             timeout=20,
         )
+
+        # If path-based URL returns 404, fallback to base URL
+        if resp.status_code == 404 and api_url != "https://www.avito.ru/web/1/main/items":
+            logger.info("Path-based API returned 404, trying base URL")
+            resp = curl_requests.get(
+                "https://www.avito.ru/web/1/main/items",
+                params=params,
+                impersonate="chrome",
+                proxy=proxy,
+                headers={
+                    "Referer": referer,
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "ru-RU,ru;q=0.9",
+                },
+                timeout=20,
+            )
 
         if resp.status_code == 429:
             logger.warning("API 429 (rate limited)")
