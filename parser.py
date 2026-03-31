@@ -218,17 +218,14 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, targ
             if not avito_id:
                 continue
 
+            title = item.get("title", item.get("name", "Без названия"))
+
             # Filter by category
             item_cat = item.get("category", {})
             item_cat_id = item_cat.get("id", 0) if isinstance(item_cat, dict) else 0
             if target_category_id:
                 if item_cat_id != target_category_id:
-                    # Log first few skipped for debugging
-                    if len(items) == 0:
-                        logger.info("Skipping cat=%d title=%s (want=%d)", item_cat_id, title[:30], target_category_id)
                     continue
-
-            title = item.get("title", item.get("name", "Без названия"))
 
             # Price
             price_info = item.get("priceDetailed", {})
