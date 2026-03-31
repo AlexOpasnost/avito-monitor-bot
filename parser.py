@@ -226,6 +226,7 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, targ
             if target_category_id:
                 if item_cat_id != target_category_id:
                     continue
+                logger.info("PASSED filter: cat=%d, title=%s", item_cat_id, title[:40])
 
             # Price
             price_info = item.get("priceDetailed", {})
