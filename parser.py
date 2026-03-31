@@ -4,7 +4,7 @@ import random
 import re
 from dataclasses import dataclass
 
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 
 from config import config
 
@@ -121,7 +121,7 @@ async def _get_context():
 
         # Warm-up: visit main page to establish cookies
         warmup_page = await context.new_page()
-        await stealth_async(warmup_page)
+        await Stealth().apply(warmup_page)
         try:
             await warmup_page.goto(
                 "https://www.avito.ru/",
@@ -256,7 +256,7 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
     try:
         context = await _get_context()
         page = await context.new_page()
-        await stealth_async(page)
+        await Stealth().apply(page)
 
         try:
             # Random delay before request
