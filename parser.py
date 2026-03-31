@@ -109,28 +109,17 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
         elif category_slug is None:
             category_slug = part
 
-    # Build params for web API with category/location filtering
+    # Web API — categoryId/locationId don't work as params
+    # We'll filter results client-side by category.id
     params = {
         "key": AVITO_API_KEY,
         "sort": "date",
         "display": "list",
-        "limit": "30",
+        "limit": "50",  # Fetch more to have enough after filtering
         "page": "1",
     }
 
-    # Map city to locationId
-    if city_slug:
-        loc_id = LOCATION_IDS.get(city_slug)
-        if loc_id:
-            params["locationId"] = str(loc_id)
-
-    # Map category to categoryId
-    if category_slug:
-        cat_id = CATEGORY_IDS.get(category_slug)
-        if cat_id:
-            params["categoryId"] = str(cat_id)
-
-    # Pass query params from URL (q, pmin, pmax, s, f, context, etc.)
+    # Pass query params from URL
     for key, values in qs.items():
         if key not in params:
             params[key] = values[0]
@@ -138,19 +127,23 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
     if "s" not in params:
         params["s"] = "104"
 
+    # Resolve category ID for client-side filtering
+    target_category_id = None
+    if category_slug:
+        target_category_id = CATEGORY_IDS.get(category_slug)
+
     api_url = "https://www.avito.ru/web/1/main/items"
 
-    logger.info("Parsed URL -> city=%s (loc=%s), cat=%s (id=%s)",
-        city_slug, params.get("locationId", "?"),
-        category_slug, params.get("categoryId", "?"))
+    logger.info("Parsed URL -> city=%s, cat=%s (filter_id=%s)",
+        city_slug, category_slug, target_category_id)
 
-    return api_url, params
+    return api_url, params, target_category_id
 
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
     """Fetch listings from Avito internal API."""
     proxy = _get_proxy()
-    api_path, params = _extract_search_params(url)
+    api_path, params, target_category_id = _extract_search_params(url)
 
     delay = random.uniform(config.request_delay_min, config.request_delay_max)
     await asyncio.sleep(delay)
@@ -166,13 +159,13 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
     try:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: _fetch_api(api_path, referer, params, proxy))
+        return await loop.run_in_executor(None, lambda: _fetch_api(api_path, referer, params, proxy, target_category_id))
     except Exception as e:
         logger.error("Parse error for %s: %s", url, e)
         return None
 
 
-def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> list[AvitoItem] | None:
+def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None, target_category_id: int | None = None) -> list[AvitoItem] | None:
     try:
         logger.info("Fetching API: %s?categoryId=%s&locationId=%s",
             api_url[:60], params.get("categoryId", "?"), params.get("locationId", "?"))
@@ -224,6 +217,16 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
             avito_id = str(item.get("id", item.get("itemId", "")))
             if not avito_id:
                 continue
+
+            # Filter by category
+            if target_category_id:
+                item_cat = item.get("category", {})
+                if isinstance(item_cat, dict):
+                    item_cat_id = item_cat.get("id", 0)
+                else:
+                    item_cat_id = 0
+                if item_cat_id != target_category_id:
+                    continue
 
             title = item.get("title", item.get("name", "Без названия"))
 
@@ -303,7 +306,7 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
                 description=description if description and description.lower() != title.lower() else None,
             ))
 
-        logger.info("API returned %d items", len(items))
+        logger.info("API returned %d items (filter cat=%s)", len(items), target_category_id)
         return items
 
     except Exception as e:
