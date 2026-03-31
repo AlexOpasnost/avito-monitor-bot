@@ -15,6 +15,54 @@ logger = logging.getLogger(__name__)
 AVITO_API_KEY = "af0deccbgcgidddjgnvljitrat3lbhpb"
 AVITO_MOBILE_KEY = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
 
+# Avito category slug -> categoryId mapping for mobile API
+CATEGORY_IDS = {
+    "telefony": 24, "smartfony": 24,
+    "noutbuki": 4, "kompyutery": 31,
+    "planshety_i_elektronnye_knigi": 137,
+    "audio_i_video": 32, "foto_i_videokamery": 34,
+    "igry_pristavki_i_programmy": 97,
+    "bytovaya_tehnika": 21, "elektronika": 6,
+    "odezhda_obuv_aksessuary": 27,
+    "muzhskaya_odezhda": 108, "zhenskaya_odezhda": 107,
+    "detskaya_odezhda_i_obuv": 109,
+    "kvartiry": 18, "komnaty": 19,
+    "doma_dachi_kottedzhi": 20,
+    "nedvizhimost": 4,
+    "avtomobili": 9, "mototsikly_i_mototehnika": 14,
+    "gruzoviki_i_spetstehnika": 81,
+    "zapchasti_i_aksessuary": 10,
+    "transport": 1,
+    "vakansii": 110, "rezyume": 111, "rabota": 2,
+    "mebel_i_interer": 35,
+    "sport_i_otdyh": 39, "hobbi_i_otdyh": 7,
+    "zhivotnye": 47, "sobaki": 48, "koshki": 49,
+    "dlya_doma_i_dachi": 5,
+    "remont_i_stroitelstvo": 112,
+    "uslugi": 8, "predlozheniya_uslug": 113,
+    "lichnye_veschi": 3, "krasota_i_zdorove": 110,
+    "rasteniya": 106,
+}
+
+# City slug -> locationId mapping
+LOCATION_IDS = {
+    "all": 621540,  # Вся Россия
+    "moskva": 637640, "sankt-peterburg": 653240,
+    "novosibirsk": 648070, "ekaterinburg": 643720,
+    "kazan": 645100, "nizhniy_novgorod": 647540,
+    "chelyabinsk": 655120, "samara": 652500,
+    "omsk": 649100, "rostov-na-donu": 651920,
+    "ufa": 654360, "krasnoyarsk": 646200,
+    "voronezh": 642440, "perm": 649900,
+    "volgograd": 641940, "krasnodar": 645880,
+    "saratov": 653000, "tyumen": 654080,
+    "barnaul": 641400, "vladivostok": 641780,
+    "irkutsk": 644640, "habarovsk": 654520,
+    "yaroslavl": 656060, "tomsk": 654000,
+    "orenburg": 649200, "kaliningrad": 645020,
+    "tula": 654160, "ryazan": 652320,
+}
+
 
 @dataclass
 class AvitoItem:
@@ -41,65 +89,57 @@ def _get_proxy() -> str | None:
 
 
 def _extract_search_params(url: str) -> tuple[str, dict]:
-    """Extract API URL and query params from Avito search URL.
-
-    The web API mirrors the site URL structure:
-    - Site: avito.ru/moskva/telefony?f=ASgBAg...
-    - API:  avito.ru/web/1/main/items/moskva/telefony?f=ASgBAg...&key=...
-
-    Encoded slugs (with uppercase) are stripped from path and passed via 'f' param.
-    """
+    """Extract API URL and params. Uses web API with path, falls back to mobile API with categoryId."""
     import re as _re
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
-    # Build clean path and extract encoded filter from slug
     path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-    clean_parts = []
-    encoded_filter = None
 
+    # Extract city and category slugs (lowercase only)
+    city_slug = None
+    category_slug = None
     for part in path_parts:
-        # Skip item-specific URLs (name_12345678)
+        if _re.search(r'[A-Z]', part):
+            continue
         if _re.match(r'^.+_\d{6,}$', part):
             continue
+        if city_slug is None:
+            city_slug = part
+        elif category_slug is None:
+            category_slug = part
 
-        # Check for encoded slug: "subcategory-ASgBAgICAUSwQ2I_Dc" or just "ASgBAgICA..."
-        if _re.search(r'[A-Z]', part):
-            # Extract the encoded part (after last hyphen, or whole thing)
-            match = _re.search(r'[A-Z][A-Za-z0-9_+/=]+', part)
-            if match:
-                encoded_filter = match.group(0)
-            continue
-
-        clean_parts.append(part)
-
-    clean_path = "/".join(clean_parts)
-
+    # Build params for mobile API (reliable filtering)
     params = {
-        "key": AVITO_API_KEY,
+        "key": AVITO_MOBILE_KEY,
         "sort": "date",
-        "page": "1",
         "display": "list",
-        "limit": "30",
+        "limit": "50",
+        "page": "1",
     }
-    # Pass ALL query params from the original URL
-    for key, values in qs.items():
-        params[key] = values[0]
 
-    if "s" not in params:
-        params["s"] = "104"
+    # Map city to locationId
+    if city_slug:
+        loc_id = LOCATION_IDS.get(city_slug)
+        if loc_id:
+            params["locationId"] = str(loc_id)
 
-    # If we found encoded filter in path slug, add as 'f' param
-    if encoded_filter and "f" not in params:
-        params["f"] = encoded_filter
+    # Map category to categoryId
+    if category_slug:
+        cat_id = CATEGORY_IDS.get(category_slug)
+        if cat_id:
+            params["categoryId"] = str(cat_id)
 
-    # Build API URL
-    if clean_path:
-        api_url = f"https://www.avito.ru/web/1/main/items/{clean_path}"
-    else:
-        api_url = "https://www.avito.ru/web/1/main/items"
+    # Pass query params from URL (q, pmin, pmax, etc.)
+    for key in ["q", "pmin", "pmax"]:
+        if key in qs:
+            params[key] = qs[key][0]
 
-    logger.info("Parsed URL -> API: %s, f=%s", api_url[:80], params.get("f", "none")[:30] if params.get("f") else "none")
+    api_url = "https://m.avito.ru/api/9/items"
+
+    logger.info("Parsed URL -> city=%s (loc=%s), cat=%s (id=%s)",
+        city_slug, params.get("locationId", "?"),
+        category_slug, params.get("categoryId", "?"))
 
     return api_url, params
 
@@ -131,7 +171,8 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 
 def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> list[AvitoItem] | None:
     try:
-        logger.info("Fetching API: %s", api_url[:120])
+        logger.info("Fetching API: %s?categoryId=%s&locationId=%s",
+            api_url[:60], params.get("categoryId", "?"), params.get("locationId", "?"))
         resp = curl_requests.get(
             api_url,
             params=params,
@@ -144,28 +185,6 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
             },
             timeout=20,
         )
-
-        # If path-based URL returns 404, try removing last path segment
-        if resp.status_code == 404 and "/items/" in api_url:
-            # Try shorter path (e.g. /all/telefony instead of /all/telefony/subcategory)
-            shorter = api_url.rsplit("/", 1)[0]
-            if shorter != api_url and "/items" in shorter:
-                logger.info("404, trying shorter path: %s", shorter[:100])
-                resp = curl_requests.get(
-                    shorter, params=params, impersonate="chrome", proxy=proxy,
-                    headers={"Referer": referer, "Accept": "application/json, text/plain, */*", "Accept-Language": "ru-RU,ru;q=0.9"},
-                    timeout=20,
-                )
-
-            # Still 404? Try base URL with referer (filters come from f/context params)
-            if resp.status_code == 404:
-                logger.info("Still 404, trying base URL")
-                resp = curl_requests.get(
-                    "https://www.avito.ru/web/1/main/items",
-                    params=params, impersonate="chrome", proxy=proxy,
-                    headers={"Referer": referer, "Accept": "application/json, text/plain, */*", "Accept-Language": "ru-RU,ru;q=0.9"},
-                    timeout=20,
-                )
 
         if resp.status_code == 429:
             logger.warning("API 429 (rate limited)")
@@ -182,7 +201,9 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
         except (json.JSONDecodeError, ValueError):
             return None
 
-        items_data = data.get("items", [])
+        # Mobile API wraps items in "result"
+        result = data.get("result", data)
+        items_data = result.get("items", data.get("items", []))
         if not items_data:
             return []
 
@@ -190,11 +211,15 @@ def _fetch_api(api_url: str, referer: str, params: dict, proxy: str | None) -> l
         for item in items_data:
             if not isinstance(item, dict):
                 continue
-            avito_id = str(item.get("id", ""))
+            # Mobile API may nest item data in "value" key
+            if "value" in item and isinstance(item["value"], dict):
+                item = item["value"]
+
+            avito_id = str(item.get("id", item.get("itemId", "")))
             if not avito_id:
                 continue
 
-            title = item.get("title", "Без названия")
+            title = item.get("title", item.get("name", "Без названия"))
 
             # Price
             price_info = item.get("priceDetailed", {})
