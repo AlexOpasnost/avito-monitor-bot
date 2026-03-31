@@ -115,7 +115,7 @@ def _extract_search_params(url: str) -> tuple[str, dict]:
         "key": AVITO_API_KEY,
         "sort": "date",
         "display": "list",
-        "limit": "50",  # Fetch more to have enough after filtering
+        "limit": "100",  # Fetch more to have enough after category filtering
         "page": "1",
     }
 
