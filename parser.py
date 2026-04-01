@@ -39,62 +39,55 @@ def _get_proxy() -> str | None:
     return random.choice(config.proxy_list)
 
 
-def _extract_category_slug(url: str) -> str | None:
-    """Extract category slug from Avito URL path for client-side filtering."""
-    parsed = urlparse(url)
-    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-
-    # Skip city (first part), return category (second part)
-    # e.g. /all/telefony/mobile-ASgB... -> "telefony"
-    # e.g. /moskva/kvartiry -> "kvartiry"
-    for i, part in enumerate(path_parts):
-        if i == 0:
-            continue  # skip city
-        # Skip encoded slugs
-        if re.search(r'[A-Z]', part):
-            continue
-        if re.match(r'^.+_\d{6,}$', part):
-            continue
-        return part
-    return None
-
-
 async def parse_listings(url: str) -> list[AvitoItem] | None:
-    """Fetch listings from Avito Web API with client-side category filtering."""
+    """Fetch listings from Avito Web API using key= param with full path."""
     proxy = _get_proxy()
-    category_slug = _extract_category_slug(url)
 
     delay = random.uniform(config.request_delay_min, config.request_delay_max)
     await asyncio.sleep(delay)
 
-    # Normalize referer
+    # Normalize to www.avito.ru
     parsed = urlparse(url)
     host = parsed.hostname or ""
     if host == "m.avito.ru":
-        referer = url.replace("m.avito.ru", "www.avito.ru")
-    else:
-        referer = url
+        url = url.replace("m.avito.ru", "www.avito.ru")
+        parsed = urlparse(url)
+
+    # key= is the full path from URL (with encoded slug — contains category info)
+    path = parsed.path  # e.g. /all/odezhda.../verhnyaya_odezhda-ASgBAgICAkTeAtgL4ALeCw
+    qs = parse_qs(parsed.query)
+
+    referer = url
 
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, lambda: _fetch_api(referer, proxy, category_slug)
+            None, lambda: _fetch_api(path, qs, referer, proxy)
         )
     except Exception as e:
         logger.error("Parse error for %s: %s", url, e)
         return None
 
 
-def _fetch_api(referer: str, proxy: str | None, category_slug: str | None) -> list[AvitoItem] | None:
+def _fetch_api(path: str, qs: dict, referer: str, proxy: str | None) -> list[AvitoItem] | None:
     try:
         params = {
-            "key": AVITO_API_KEY,
+            "key": path,  # Full path with encoded slug = exact category filter
             "sort": "date",
             "display": "list",
             "limit": "50",
             "page": "1",
-            "s": "104",
         }
+
+        # Pass f, s, cd and other params from original URL
+        for k, v in qs.items():
+            if k not in params:
+                params[k] = v[0]
+
+        if "s" not in params:
+            params["s"] = "104"
+
+        logger.info("API request: key=%s", path[:80])
 
         resp = curl_requests.get(
             "https://www.avito.ru/web/1/main/items",
@@ -139,19 +132,10 @@ def _fetch_api(referer: str, proxy: str | None, category_slug: str | None) -> li
 
             title = item.get("title", "Без названия")
 
-            # URL path — used for filtering
+            # URL
             url_path = item.get("urlPath", "")
             if url_path and "?" in url_path:
                 url_path = url_path.split("?")[0]
-
-            # Filter by category slug in urlPath
-            if category_slug and url_path:
-                path_parts = [p for p in url_path.strip("/").split("/") if p]
-                # Category is usually the second part: /city/category/item_name
-                item_category = path_parts[1] if len(path_parts) >= 2 else ""
-                if item_category != category_slug:
-                    continue
-
             item_url = f"https://www.avito.ru{url_path}" if url_path else ""
 
             # Price
@@ -195,8 +179,7 @@ def _fetch_api(referer: str, proxy: str | None, category_slug: str | None) -> li
                 location=location or None,
             ))
 
-        logger.info("API returned %d items (filter=%s, total_raw=%d)",
-            len(items), category_slug, len(items_data))
+        logger.info("API returned %d items", len(items))
         return items
 
     except Exception as e:
