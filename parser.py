@@ -120,6 +120,7 @@ async def _get_context():
         _pw_context = context
 
         # Warm-up: visit main page to establish cookies
+        logger.info("Playwright: warming up context (visiting avito.ru)")
         warmup_page = await context.new_page()
         await Stealth().apply(warmup_page)
         try:
@@ -128,9 +129,10 @@ async def _get_context():
                 wait_until="domcontentloaded",
                 timeout=15000,
             )
-            await asyncio.sleep(3)
-        except Exception:
-            pass
+            await asyncio.sleep(2)
+            logger.info("Playwright: warmup done")
+        except Exception as e:
+            logger.warning("Playwright: warmup failed: %s", e)
         finally:
             await warmup_page.close()
 
@@ -253,6 +255,18 @@ async def _parse_card(card) -> AvitoItem | None:
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
     """Fetch listings from Avito via Playwright (real browser rendering)."""
+    try:
+        # Overall timeout — don't let Playwright hang the scheduler
+        return await asyncio.wait_for(_parse_listings_inner(url), timeout=60)
+    except asyncio.TimeoutError:
+        logger.error("Playwright: overall timeout (60s) for %s", url[:60])
+        return None
+    except Exception as e:
+        logger.error("Playwright error for %s: %s", url[:60], e)
+        return None
+
+
+async def _parse_listings_inner(url: str) -> list[AvitoItem] | None:
     try:
         context = await _get_context()
         page = await context.new_page()
