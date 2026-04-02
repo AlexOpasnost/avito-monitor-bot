@@ -43,10 +43,10 @@ def _get_proxy() -> str | None:
     return random.choice(config.proxy_list)
 
 
-def _to_mobile_url(url: str) -> str:
-    """Convert any avito URL to mobile version."""
-    url = url.replace("www.avito.ru", "m.avito.ru")
-    url = url.replace("://avito.ru", "://m.avito.ru")
+def _normalize_url(url: str) -> str:
+    """Ensure URL uses www.avito.ru."""
+    url = url.replace("m.avito.ru", "www.avito.ru")
+    url = url.replace("://avito.ru/", "://www.avito.ru/")
     return url
 
 
@@ -57,7 +57,7 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
     No API needed — just load the page user sees and parse cards.
     """
     proxy = _get_proxy()
-    mobile_url = _to_mobile_url(url)
+    mobile_url = _normalize_url(url)
 
     delay = random.uniform(config.request_delay_min, config.request_delay_max)
     await asyncio.sleep(delay)
