@@ -255,6 +255,16 @@ def _fetch_api(url: str, proxy: str | None, category_path: list[str]) -> list[Av
                 location=location or None,
             ))
 
+        # Log first few urlPaths for debugging
+        if category_path and len(items) == 0 and items_data:
+            sample_paths = []
+            for it in items_data[:5]:
+                p = it.get("urlPath", "")
+                if p and "?" in p:
+                    p = p.split("?")[0]
+                sample_paths.append(p[:60])
+            logger.info("Sample urlPaths: %s", sample_paths)
+
         logger.info("API returned %d items after filter (raw=%d, path=%s)",
             len(items), len(items_data), category_path)
         return items
