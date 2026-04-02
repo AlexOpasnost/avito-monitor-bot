@@ -1,18 +1,22 @@
 import asyncio
-import json
 import logging
 import random
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs
 
 from curl_cffi import requests as curl_requests
+from bs4 import BeautifulSoup
 
 from config import config
 
 logger = logging.getLogger(__name__)
 
-AVITO_API_KEY = "af0deccbgcgidddjgnvljitrat3lbhpb"
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; 22081212UG) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+]
 
 
 @dataclass
@@ -39,149 +43,187 @@ def _get_proxy() -> str | None:
     return random.choice(config.proxy_list)
 
 
+def _to_mobile_url(url: str) -> str:
+    """Convert any avito URL to mobile version."""
+    url = url.replace("www.avito.ru", "m.avito.ru")
+    url = url.replace("://avito.ru", "://m.avito.ru")
+    return url
+
+
 async def parse_listings(url: str) -> list[AvitoItem] | None:
-    """Fetch listings from Avito Web API using key= param with full path."""
+    """Fetch and parse Avito search page HTML (mobile version).
+
+    Mobile version returns pre-rendered HTML with all filters applied.
+    No API needed — just load the page user sees and parse cards.
+    """
     proxy = _get_proxy()
+    mobile_url = _to_mobile_url(url)
 
     delay = random.uniform(config.request_delay_min, config.request_delay_max)
     await asyncio.sleep(delay)
 
-    # Normalize to www.avito.ru
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    if host == "m.avito.ru":
-        url = url.replace("m.avito.ru", "www.avito.ru")
-        parsed = urlparse(url)
-
-    # key= is the full path from URL (with encoded slug — contains category info)
-    path = parsed.path  # e.g. /all/odezhda.../verhnyaya_odezhda-ASgBAgICAkTeAtgL4ALeCw
-    qs = parse_qs(parsed.query)
-
-    referer = url
-
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            None, lambda: _fetch_api(path, qs, referer, proxy)
+            None, lambda: _fetch_and_parse(mobile_url, proxy)
         )
     except Exception as e:
-        logger.error("Parse error for %s: %s", url, e)
+        logger.error("Parse error for %s: %s", url[:60], e)
         return None
 
 
-def _fetch_api(path: str, qs: dict, referer: str, proxy: str | None) -> list[AvitoItem] | None:
+def _fetch_and_parse(url: str, proxy: str | None) -> list[AvitoItem] | None:
+    """Fetch mobile Avito page and parse item cards from HTML."""
     try:
-        params = {
-            "key": path,  # Full path with encoded slug = exact category filter
-            "sort": "date",
-            "display": "list",
-            "limit": "50",
-            "page": "1",
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         }
 
-        # Pass f, s, cd and other params from original URL
-        for k, v in qs.items():
-            if k not in params:
-                params[k] = v[0]
-
-        if "s" not in params:
-            params["s"] = "104"
-
-        logger.info("API request: key=%s", path[:80])
-
         resp = curl_requests.get(
-            "https://www.avito.ru/web/1/main/items",
-            params=params,
-            impersonate="chrome",
+            url,
+            headers=headers,
             proxy=proxy,
-            headers={
-                "Referer": referer,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
+            impersonate="chrome",
             timeout=20,
         )
 
         if resp.status_code == 429:
-            logger.warning("API 429 (rate limited)")
+            logger.warning("HTTP 429 (rate limited) for %s", url[:60])
             return None
         if resp.status_code == 403:
-            logger.warning("API 403 (blocked)")
+            logger.warning("HTTP 403 (blocked) for %s", url[:60])
             return None
         if resp.status_code != 200:
-            logger.warning("API status: %d", resp.status_code)
+            logger.warning("HTTP %d for %s", resp.status_code, url[:60])
             return None
 
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
+        html = resp.text
+
+        # Check for captcha/block
+        if "captcha" in html.lower() or "доступ ограничен" in html.lower() or "проблема с ip" in html.lower():
+            logger.warning("Captcha/block detected for %s", url[:60])
             return None
 
-        items_data = data.get("items", [])
-        if not items_data:
-            return []
+        # Parse HTML
+        soup = BeautifulSoup(html, "html.parser")
+        items = _parse_items_from_html(soup)
 
-        items = []
-        for item in items_data:
-            if not isinstance(item, dict):
-                continue
-
-            avito_id = str(item.get("id", ""))
-            if not avito_id:
-                continue
-
-            title = item.get("title", "Без названия")
-
-            # URL
-            url_path = item.get("urlPath", "")
-            if url_path and "?" in url_path:
-                url_path = url_path.split("?")[0]
-            item_url = f"https://www.avito.ru{url_path}" if url_path else ""
-
-            # Price
-            price_info = item.get("priceDetailed", {})
-            if isinstance(price_info, dict):
-                price = price_info.get("string", "") or "Цена не указана"
-            else:
-                price = "Цена не указана"
-
-            # Image
-            images = item.get("images", [])
-            image_url = None
-            if images and isinstance(images[0], dict):
-                image_url = (
-                    images[0].get("278x278")
-                    or images[0].get("339x339")
-                    or images[0].get("140x140")
-                )
-
-            # Location
-            loc = item.get("location", "")
-            if isinstance(loc, dict):
-                location = loc.get("name", "")
-            elif isinstance(loc, str):
-                location = loc
-            else:
-                location = ""
-
-            # Fallback location from URL
-            if not location and url_path:
-                city_match = re.match(r"/([a-z_-]+)/", url_path)
-                if city_match:
-                    location = city_match.group(1).replace("-", " ").replace("_", " ").title()
-
-            items.append(AvitoItem(
-                avito_id=avito_id,
-                title=title,
-                price=price,
-                url=item_url,
-                image_url=image_url,
-                location=location or None,
-            ))
-
-        logger.info("API returned %d items", len(items))
+        logger.info("Parsed %d items from %s", len(items), url[:60])
         return items
 
     except Exception as e:
-        logger.error("API request failed: %s", e)
+        logger.error("Fetch failed for %s: %s", url[:60], e)
         return None
+
+
+def _parse_items_from_html(soup: BeautifulSoup) -> list[AvitoItem]:
+    """Parse item cards from Avito HTML page."""
+    items = []
+
+    # Find item cards — try multiple selectors
+    cards = soup.find_all(attrs={"data-marker": "item"})
+    if not cards:
+        cards = soup.find_all("div", class_=re.compile(r"iva-item"))
+    if not cards:
+        # Try finding by item links pattern
+        cards = soup.find_all("div", attrs={"data-item-id": True})
+
+    for card in cards:
+        try:
+            item = _parse_single_card(card)
+            if item and item.avito_id:
+                items.append(item)
+        except Exception as e:
+            logger.debug("Failed to parse card: %s", e)
+            continue
+
+    return items
+
+
+def _parse_single_card(card) -> AvitoItem | None:
+    """Parse a single item card element."""
+
+    # ID
+    avito_id = card.get("data-item-id", "")
+    if not avito_id:
+        # Try from link href
+        link = card.find("a", href=re.compile(r"_\d+"))
+        if link:
+            href = link.get("href", "")
+            match = re.search(r"_(\d+)$", href.split("?")[0])
+            if match:
+                avito_id = match.group(1)
+    if not avito_id:
+        return None
+
+    # Title
+    title_el = (
+        card.find(attrs={"data-marker": "item-title"})
+        or card.find("h3")
+        or card.find("span", class_=re.compile(r"title", re.I))
+    )
+    title = title_el.get_text(strip=True) if title_el else "Без названия"
+
+    # Price
+    price_el = (
+        card.find(attrs={"data-marker": "item-price"})
+        or card.find("span", class_=re.compile(r"price", re.I))
+        or card.find("meta", attrs={"itemprop": "price"})
+    )
+    if price_el:
+        if price_el.get("content"):
+            price = f"{price_el['content']} ₽"
+        else:
+            price = price_el.get_text(strip=True)
+    else:
+        price = "Цена не указана"
+
+    # URL
+    link_el = card.find("a", href=True)
+    item_url = ""
+    if link_el:
+        href = link_el["href"].split("?")[0]  # Remove tracking params
+        if href.startswith("http"):
+            item_url = href
+        else:
+            item_url = f"https://www.avito.ru{href}"
+
+    # Image
+    image_url = None
+    img_el = card.find("img")
+    if img_el:
+        image_url = img_el.get("src") or img_el.get("data-src")
+        if image_url and image_url.startswith("//"):
+            image_url = "https:" + image_url
+
+    # Location
+    loc_el = (
+        card.find(attrs={"data-marker": "item-address"})
+        or card.find("span", class_=re.compile(r"geo", re.I))
+        or card.find("div", class_=re.compile(r"location", re.I))
+    )
+    location = loc_el.get_text(strip=True) if loc_el else None
+
+    # Description snippet (if available on list page)
+    desc_el = card.find(attrs={"data-marker": "item-description"})
+    description = None
+    if desc_el:
+        description = desc_el.get_text(strip=True)
+        if len(description) > 200:
+            description = description[:200] + "..."
+
+    return AvitoItem(
+        avito_id=str(avito_id),
+        title=title,
+        price=price,
+        url=item_url,
+        image_url=image_url,
+        location=location,
+        description=description,
+    )
