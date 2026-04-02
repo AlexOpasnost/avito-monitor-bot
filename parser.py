@@ -1,8 +1,12 @@
 import asyncio
+import json
 import logging
+import random
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
+
+from curl_cffi import requests as curl_requests
 
 from config import config
 
@@ -33,182 +37,232 @@ def _get_proxy() -> str | None:
     return config.proxy_list[0]
 
 
-def _parse_proxy(proxy_str: str) -> dict:
-    """Convert proxy string to Playwright proxy dict (HTTP)."""
-    from urllib.parse import urlparse as _urlparse
-    p = _urlparse(proxy_str)
-    result = {"server": f"http://{p.hostname}:{p.port}"}
-    if p.username:
-        result["username"] = p.username
-    if p.password:
-        result["password"] = p.password
-    return result
-
-
-# Playwright singleton
-_browser = None
-_playwright = None
-_lock = asyncio.Lock()
-
-
-async def _get_browser():
-    global _browser, _playwright
-    async with _lock:
-        if _browser and _browser.is_connected():
-            return _browser
-        from playwright.async_api import async_playwright
-        _playwright = await async_playwright().start()
-        _browser = await _playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        logger.info("Playwright browser started")
-        return _browser
-
-
-async def close_playwright():
-    global _browser, _playwright
-    async with _lock:
-        if _browser:
-            await _browser.close()
-            _browser = None
-        if _playwright:
-            await _playwright.stop()
-            _playwright = None
-
-
 async def parse_listings(url: str) -> list[AvitoItem] | None:
-    """Load Avito search page via Playwright and parse item cards.
-
-    All user filters are preserved because we load the exact same URL.
-    """
-    # Normalize URL
+    """Load Avito search page HTML via curl_cffi + proxy,
+    extract items from embedded JSON (window.__initialData__)."""
+    proxy = _get_proxy()
     url = url.replace("m.avito.ru", "www.avito.ru")
 
-    proxy = _get_proxy()
-    proxy_dict = _parse_proxy(proxy) if proxy else None
+    delay = random.uniform(config.request_delay_min, config.request_delay_max)
+    await asyncio.sleep(delay)
 
     try:
-        browser = await _get_browser()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: _fetch_and_parse(url, proxy))
+    except Exception as e:
+        logger.error("Parse error: %s", e)
+        return None
 
-        # New context per request (fresh cookies, proxy)
-        ctx_kwargs = {
-            "viewport": {"width": 1280, "height": 800},
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "locale": "ru-RU",
-            "timezone_id": "Europe/Moscow",
-        }
-        # Note: proxy disabled for Playwright — mobileproxy.space doesn't support
-        # HTTPS CONNECT tunnel. Playwright goes direct from Railway IP.
-        # if proxy_dict:
-        #     ctx_kwargs["proxy"] = proxy_dict
 
-        context = await browser.new_context(**ctx_kwargs)
-        page = await context.new_page()
-
+def _fetch_and_parse(url: str, proxy: str | None) -> list[AvitoItem] | None:
+    """Fetch HTML page and extract items from embedded JSON."""
+    try:
+        # Session with cookies
+        s = curl_requests.Session(impersonate="chrome")
         try:
-            # Load the page
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            s.get("https://www.avito.ru/", proxy=proxy, timeout=10)
+        except Exception:
+            pass
 
-            # Check for captcha
-            title = await page.title()
-            if "проблема с ip" in title.lower() or "captcha" in title.lower():
-                logger.warning("Captcha on %s (title: %s)", url[:60], title[:50])
-                return None
+        resp = s.get(url, proxy=proxy, timeout=20)
 
-            # Wait for items to render
-            try:
-                await page.wait_for_selector('[data-marker="item"]', timeout=15000)
-            except Exception:
-                # Maybe different selector or empty results
-                logger.info("No [data-marker=item] found, checking page...")
-                content = await page.content()
-                if "captcha" in content.lower() or "доступ ограничен" in content.lower():
-                    logger.warning("Captcha detected in content for %s", url[:60])
-                    return None
-                # Page loaded but no items — empty search
-                logger.info("Empty search results for %s", url[:60])
-                return []
+        if resp.status_code == 429:
+            logger.warning("HTTP 429 for %s", url[:60])
+            return None
+        if resp.status_code == 403:
+            logger.warning("HTTP 403 for %s", url[:60])
+            return None
+        if resp.status_code != 200:
+            logger.warning("HTTP %d for %s", resp.status_code, url[:60])
+            return None
 
-            # Parse all item cards
-            cards = await page.query_selector_all('[data-marker="item"]')
-            logger.info("Found %d cards on %s", len(cards), url[:60])
+        html = resp.text
 
-            items = []
-            for card in cards:
-                try:
-                    item = await _parse_card(card)
-                    if item:
-                        items.append(item)
-                except Exception as e:
-                    logger.debug("Card parse error: %s", e)
-                    continue
+        if "captcha" in html.lower() or "проблема с ip" in html.lower():
+            logger.warning("Captcha for %s", url[:60])
+            return None
 
-            logger.info("Parsed %d items from %s", len(items), url[:60])
+        # Try to find embedded JSON data
+        items = _extract_from_initial_data(html)
+        if items is not None:
+            logger.info("Extracted %d items from __initialData__", len(items))
             return items
 
-        finally:
-            await page.close()
-            await context.close()
+        items = _extract_from_preloaded_state(html)
+        if items is not None:
+            logger.info("Extracted %d items from __preloadedState__", len(items))
+            return items
+
+        items = _extract_from_any_json(html)
+        if items is not None:
+            logger.info("Extracted %d items from embedded JSON", len(items))
+            return items
+
+        # Log what we found for debugging
+        json_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
+        logger.info("No items found. Page size=%d, JS vars=%s, title=%s",
+            len(html), json_vars[:5],
+            re.search(r'<title>([^<]+)</title>', html).group(1)[:50] if re.search(r'<title>([^<]+)</title>', html) else "?")
+
+        return []
 
     except Exception as e:
-        logger.error("Playwright error for %s: %s", url[:60], e)
+        logger.error("Fetch failed: %s", e)
         return None
 
 
-async def _parse_card(card) -> AvitoItem | None:
-    """Parse a single item card."""
-    # ID
-    avito_id = await card.get_attribute("data-item-id") or ""
-    if not avito_id:
-        link = await card.query_selector("a[href]")
-        if link:
-            href = await link.get_attribute("href") or ""
-            m = re.search(r"_(\d+)", href.split("?")[0])
-            if m:
-                avito_id = m.group(1)
-    if not avito_id:
+def _extract_from_initial_data(html: str) -> list[AvitoItem] | None:
+    """Extract from window.__initialData__ = "URL_ENCODED_JSON";"""
+    match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+    if not match:
         return None
 
-    # Title
-    title_el = await card.query_selector('[data-marker="item-title"]')
-    if not title_el:
-        title_el = await card.query_selector("h3")
-    title = (await title_el.text_content()).strip() if title_el else "Без названия"
+    try:
+        raw = unquote(match.group(1))
+        data = json.loads(raw)
 
-    # Price
-    price_el = await card.query_selector('[data-marker="item-price"]')
-    price = (await price_el.text_content()).strip() if price_el else "Цена не указана"
+        # Navigate to items
+        items_list = _find_items_in_data(data)
+        if items_list:
+            return _parse_items(items_list)
+    except Exception as e:
+        logger.debug("__initialData__ parse error: %s", e)
 
-    # URL
-    link = await card.query_selector("a[href]")
-    href = (await link.get_attribute("href")) if link else ""
-    if href:
-        href = href.split("?")[0]
-        item_url = href if href.startswith("http") else f"https://www.avito.ru{href}"
-    else:
-        item_url = ""
+    return None
 
-    # Image
-    img = await card.query_selector("img[src]")
-    image_url = (await img.get_attribute("src")) if img else None
-    if not image_url:
-        img2 = await card.query_selector("img[data-src]")
-        image_url = (await img2.get_attribute("data-src")) if img2 else None
-    if image_url and image_url.startswith("//"):
-        image_url = "https:" + image_url
 
-    # Location
-    loc_el = await card.query_selector('[data-marker="item-address"]')
-    if not loc_el:
-        loc_el = await card.query_selector("span[class*='geo']")
-    location = (await loc_el.text_content()).strip() if loc_el else None
+def _extract_from_preloaded_state(html: str) -> list[AvitoItem] | None:
+    """Extract from window.__preloadedState__ = {...};"""
+    match = re.search(r'window\.__preloadedState__\s*=\s*({.+?})\s*;', html, re.DOTALL)
+    if not match:
+        return None
 
-    return AvitoItem(
-        avito_id=str(avito_id),
-        title=title,
-        price=price,
-        url=item_url,
-        image_url=image_url,
-        location=location,
-    )
+    try:
+        data = json.loads(match.group(1))
+        items_list = _find_items_in_data(data)
+        if items_list:
+            return _parse_items(items_list)
+    except Exception as e:
+        logger.debug("__preloadedState__ parse error: %s", e)
+
+    return None
+
+
+def _extract_from_any_json(html: str) -> list[AvitoItem] | None:
+    """Try to find items array in any embedded JSON."""
+    # Look for "items":[ pattern
+    for match in re.finditer(r'"items"\s*:\s*(\[\s*\{.+?\}\s*\])', html[:500000], re.DOTALL):
+        try:
+            items_data = json.loads(match.group(1))
+            if len(items_data) >= 3:
+                items = _parse_items(items_data)
+                if items:
+                    return items
+        except Exception:
+            continue
+    return None
+
+
+def _find_items_in_data(data: dict) -> list | None:
+    """Recursively find items array in nested data structure."""
+    if not isinstance(data, dict):
+        return None
+
+    # Direct keys
+    for key in ["items", "catalog", "results"]:
+        val = data.get(key)
+        if isinstance(val, list) and len(val) >= 1:
+            return val
+        if isinstance(val, dict):
+            sub = val.get("items") or val.get("list")
+            if isinstance(sub, list) and len(sub) >= 1:
+                return sub
+
+    # Search one level deep
+    for key, val in data.items():
+        if isinstance(val, dict):
+            for subkey in ["items", "catalog", "results", "list"]:
+                sub = val.get(subkey)
+                if isinstance(sub, list) and len(sub) >= 1:
+                    return sub
+
+    return None
+
+
+def _parse_items(items_data: list) -> list[AvitoItem]:
+    """Parse items from JSON data."""
+    items = []
+    for item in items_data:
+        if not isinstance(item, dict):
+            continue
+
+        # Handle "value" wrapper
+        if "value" in item and isinstance(item["value"], dict):
+            item = item["value"]
+
+        avito_id = str(item.get("id", item.get("itemId", "")))
+        if not avito_id:
+            continue
+
+        title = item.get("title", item.get("name", "Без названия"))
+
+        # Price
+        price_info = item.get("priceDetailed", item.get("price", {}))
+        if isinstance(price_info, dict):
+            price = price_info.get("string", price_info.get("value", ""))
+            if not price:
+                val = price_info.get("value", 0)
+                price = f"{val} ₽" if val else "Цена не указана"
+        elif isinstance(price_info, (int, float)):
+            price = f"{int(price_info)} ₽"
+        else:
+            price = str(price_info) if price_info else "Цена не указана"
+
+        # URL
+        url_path = item.get("urlPath", item.get("url", ""))
+        if url_path and "?" in url_path:
+            url_path = url_path.split("?")[0]
+        item_url = f"https://www.avito.ru{url_path}" if url_path and not url_path.startswith("http") else url_path
+
+        # Image
+        images = item.get("images", item.get("photos", []))
+        image_url = None
+        if images:
+            if isinstance(images[0], str):
+                image_url = images[0]
+            elif isinstance(images[0], dict):
+                image_url = (
+                    images[0].get("278x278")
+                    or images[0].get("636x476")
+                    or images[0].get("140x140")
+                    or images[0].get("url")
+                    or images[0].get("src")
+                )
+
+        # Location
+        loc = item.get("location", item.get("address", item.get("geo", "")))
+        if isinstance(loc, dict):
+            location = loc.get("name", loc.get("formattedAddress", ""))
+        elif isinstance(loc, str):
+            location = loc
+        else:
+            location = ""
+
+        # Description
+        desc = item.get("description", "")
+        if isinstance(desc, dict):
+            desc = desc.get("text", desc.get("value", ""))
+        if desc and len(desc) > 200:
+            desc = desc[:200] + "..."
+
+        items.append(AvitoItem(
+            avito_id=avito_id,
+            title=title,
+            price=price,
+            url=item_url,
+            image_url=image_url,
+            location=location or None,
+            description=desc or None,
+        ))
+
+    return items
