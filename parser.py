@@ -1,18 +1,12 @@
 import asyncio
-import json
 import logging
-import random
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs
-
-from curl_cffi import requests as curl_requests
+from urllib.parse import urlparse
 
 from config import config
 
 logger = logging.getLogger(__name__)
-
-AVITO_API_KEY = "af0deccbgcgidddjgnvljitrat3lbhpb"
 
 
 @dataclass
@@ -36,311 +30,183 @@ class AvitoItem:
 def _get_proxy() -> str | None:
     if not config.proxy_list:
         return None
-    return random.choice(config.proxy_list)
+    return config.proxy_list[0]
 
 
-def _extract_category_path(url: str) -> list[str]:
-    """Extract category path segments from user's Avito URL.
+def _parse_proxy(proxy_str: str) -> dict:
+    """Convert http://user:pass@host:port to Playwright proxy dict."""
+    from urllib.parse import urlparse as _urlparse
+    p = _urlparse(proxy_str)
+    result = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
+    if p.username:
+        result["username"] = p.username
+    if p.password:
+        result["password"] = p.password
+    return result
 
-    /all/odezhda_obuv_aksessuary/muzhskaya_odezhda/verhnyaya_odezhda-ASgB...
-    -> ["odezhda_obuv_aksessuary", "muzhskaya_odezhda"]
 
-    These are used to filter items by matching against their urlPath.
-    """
-    parsed = urlparse(url)
-    parts = [p for p in parsed.path.strip("/").split("/") if p]
+# Playwright singleton
+_browser = None
+_playwright = None
+_lock = asyncio.Lock()
 
-    category_parts = []
-    for i, part in enumerate(parts):
-        if i == 0:
-            continue  # skip city (all, moskva, etc)
-        # Stop at encoded slugs (contain uppercase)
-        if re.search(r'[A-Z]', part):
-            # Extract the lowercase prefix before the encoded part
-            prefix = re.split(r'-[A-Z]', part)[0]
-            if prefix and prefix != part:
-                category_parts.append(prefix)
-            break
-        # Skip item URLs
-        if re.match(r'^.+_\d{6,}$', part):
-            continue
-        category_parts.append(part)
 
-    # Limit to max 2 segments — deeper subcategories are encoded in slug,
-    # not present in item urlPath. E.g. "verhnyaya_odezhda" won't be in urlPath.
-    return category_parts[:2]
+async def _get_browser():
+    global _browser, _playwright
+    async with _lock:
+        if _browser and _browser.is_connected():
+            return _browser
+        from playwright.async_api import async_playwright
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        logger.info("Playwright browser started")
+        return _browser
+
+
+async def close_playwright():
+    global _browser, _playwright
+    async with _lock:
+        if _browser:
+            await _browser.close()
+            _browser = None
+        if _playwright:
+            await _playwright.stop()
+            _playwright = None
 
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
-    """Fetch listings from Avito Web API with client-side path-based filtering."""
+    """Load Avito search page via Playwright and parse item cards.
+
+    All user filters are preserved because we load the exact same URL.
+    """
+    # Normalize URL
+    url = url.replace("m.avito.ru", "www.avito.ru")
+
     proxy = _get_proxy()
-    category_path = _extract_category_path(url)
-
-    delay = random.uniform(config.request_delay_min, config.request_delay_max)
-    await asyncio.sleep(delay)
+    proxy_dict = _parse_proxy(proxy) if proxy else None
 
     try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: _fetch_api(url, proxy, category_path)
-        )
-    except Exception as e:
-        logger.error("Parse error for %s: %s", url[:60], e)
-        return None
+        browser = await _get_browser()
 
+        # New context per request (fresh cookies, proxy)
+        ctx_kwargs = {
+            "viewport": {"width": 1280, "height": 800},
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "locale": "ru-RU",
+            "timezone_id": "Europe/Moscow",
+        }
+        if proxy_dict:
+            ctx_kwargs["proxy"] = proxy_dict
 
-def _fetch_api(url: str, proxy: str | None, category_path: list[str]) -> list[AvitoItem] | None:
-    """Fetch page HTML with session cookies, then try to extract items."""
-    try:
-        logger.info("Fetching with session, filter_path=%s", category_path)
+        context = await browser.new_context(**ctx_kwargs)
+        page = await context.new_page()
 
-        # Create session with cookies (like a real browser)
-        s = curl_requests.Session(impersonate="chrome")
-
-        # Step 1: Visit main page to get cookies
         try:
-            s.get("https://www.avito.ru/", proxy=proxy, timeout=10)
-        except Exception:
-            pass
+            # Load the page
+            await page.goto(url, wait_until="networkidle", timeout=30000)
 
-        # Step 2: Load the actual user URL (with all filters)
-        resp = s.get(
-            url,
-            proxy=proxy,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-                "Referer": "https://www.avito.ru/",
-            },
-            timeout=20,
-        )
+            # Check for captcha
+            title = await page.title()
+            if "проблема с ip" in title.lower() or "captcha" in title.lower():
+                logger.warning("Captcha on %s (title: %s)", url[:60], title[:50])
+                return None
 
-        if resp.status_code == 200 and "captcha" not in resp.text.lower() and "проблема с ip" not in resp.text.lower():
-            # Try to parse HTML first (has all filters applied)
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(resp.text, "html.parser")
-            cards = soup.find_all(attrs={"data-marker": "item"})
-            if not cards:
-                cards = soup.find_all("div", attrs={"data-item-id": True})
+            # Wait for items to render
+            try:
+                await page.wait_for_selector('[data-marker="item"]', timeout=15000)
+            except Exception:
+                # Maybe different selector or empty results
+                logger.info("No [data-marker=item] found, checking page...")
+                content = await page.content()
+                if "captcha" in content.lower() or "доступ ограничен" in content.lower():
+                    logger.warning("Captcha detected in content for %s", url[:60])
+                    return None
+                # Page loaded but no items — empty search
+                logger.info("Empty search results for %s", url[:60])
+                return []
 
-            if cards:
-                logger.info("HTML: found %d cards", len(cards))
-                items = []
-                for card in cards:
-                    try:
-                        item = _parse_html_card(card)
-                        if item:
-                            items.append(item)
-                    except Exception:
-                        continue
-                if items:
-                    logger.info("Parsed %d items from HTML", len(items))
-                    return items
+            # Parse all item cards
+            cards = await page.query_selector_all('[data-marker="item"]')
+            logger.info("Found %d cards on %s", len(cards), url[:60])
 
-            # If no cards in HTML, try extracting JSON from page
-            import re as _re
-            json_match = _re.search(r'"items"\s*:\s*(\[.+?\])\s*[,}]', resp.text)
-            if json_match:
+            items = []
+            for card in cards:
                 try:
-                    items_data = json.loads(json_match.group(1))
-                    logger.info("Found %d items in embedded JSON", len(items_data))
-                    return _parse_json_items(items_data, category_path)
-                except Exception:
-                    pass
-
-        # Step 3: Fallback to API (no filters but works)
-        logger.info("HTML failed (status=%d), falling back to API", resp.status_code)
-        resp = s.get(
-            "https://www.avito.ru/web/1/main/items",
-            params={
-                "key": AVITO_API_KEY,
-                "sort": "date",
-                "display": "list",
-                "limit": "50",
-                "page": "1",
-                "s": "104",
-            },
-            proxy=proxy,
-            headers={
-                "Referer": url,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
-            timeout=20,
-        )
-
-        if resp.status_code == 429:
-            logger.warning("API 429 (rate limited)")
-            return None
-        if resp.status_code == 403:
-            logger.warning("API 403 (blocked)")
-            return None
-        if resp.status_code != 200:
-            logger.warning("API status: %d", resp.status_code)
-            return None
-
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
-
-        items_data = data.get("items", [])
-        if not items_data:
-            return []
-
-        items = []
-        for item in items_data:
-            if not isinstance(item, dict):
-                continue
-
-            avito_id = str(item.get("id", ""))
-            if not avito_id:
-                continue
-
-            title = item.get("title", "Без названия")
-
-            # URL path
-            url_path = item.get("urlPath", "")
-            if url_path and "?" in url_path:
-                url_path = url_path.split("?")[0]
-
-            # Filter: check that item urlPath contains ALL category segments
-            # User URL: /all/odezhda_obuv_aksessuary/muzhskaya_odezhda/...
-            # Item urlPath: /moskva/odezhda_obuv_aksessuary/muzhskaya_odezhda/kurtka_12345
-            # Match: both contain "odezhda_obuv_aksessuary" AND "muzhskaya_odezhda"
-            if category_path:
-                item_path_parts = [p for p in url_path.strip("/").split("/") if p]
-                match = all(seg in item_path_parts for seg in category_path)
-                if not match:
+                    item = await _parse_card(card)
+                    if item:
+                        items.append(item)
+                except Exception as e:
+                    logger.debug("Card parse error: %s", e)
                     continue
 
-            item_url = f"https://www.avito.ru{url_path}" if url_path else ""
+            logger.info("Parsed %d items from %s", len(items), url[:60])
+            return items
 
-            # Price
-            price_info = item.get("priceDetailed", {})
-            if isinstance(price_info, dict):
-                price = price_info.get("string", "") or "Цена не указана"
-            else:
-                price = "Цена не указана"
-
-            # Image
-            images = item.get("images", [])
-            image_url = None
-            if images and isinstance(images[0], dict):
-                image_url = (
-                    images[0].get("278x278")
-                    or images[0].get("339x339")
-                    or images[0].get("140x140")
-                )
-
-            # Location
-            loc = item.get("location", "")
-            if isinstance(loc, dict):
-                location = loc.get("name", "")
-            elif isinstance(loc, str):
-                location = loc
-            else:
-                location = ""
-            if not location and url_path:
-                city_match = re.match(r"/([a-z_-]+)/", url_path)
-                if city_match:
-                    location = city_match.group(1).replace("-", " ").replace("_", " ").title()
-
-            items.append(AvitoItem(
-                avito_id=avito_id,
-                title=title,
-                price=price,
-                url=item_url,
-                image_url=image_url,
-                location=location or None,
-            ))
-
-        # Log first few urlPaths for debugging
-        if category_path and len(items) == 0 and items_data:
-            sample_paths = []
-            for it in items_data[:5]:
-                p = it.get("urlPath", "")
-                if p and "?" in p:
-                    p = p.split("?")[0]
-                sample_paths.append(p[:60])
-            logger.info("Sample urlPaths: %s", sample_paths)
-
-        logger.info("API returned %d items after filter (raw=%d, path=%s)",
-            len(items), len(items_data), category_path)
-        return items
+        finally:
+            await page.close()
+            await context.close()
 
     except Exception as e:
-        logger.error("API request failed: %s", e)
+        logger.error("Playwright error for %s: %s", url[:60], e)
         return None
 
 
-def _parse_html_card(card) -> AvitoItem | None:
-    """Parse a single item card from HTML."""
-    avito_id = card.get("data-item-id", "")
+async def _parse_card(card) -> AvitoItem | None:
+    """Parse a single item card."""
+    # ID
+    avito_id = await card.get_attribute("data-item-id") or ""
     if not avito_id:
-        link = card.find("a", href=re.compile(r"_\d+"))
+        link = await card.query_selector("a[href]")
         if link:
-            href = link.get("href", "")
-            match = re.search(r"_(\d+)", href.split("?")[0])
-            if match:
-                avito_id = match.group(1)
+            href = await link.get_attribute("href") or ""
+            m = re.search(r"_(\d+)", href.split("?")[0])
+            if m:
+                avito_id = m.group(1)
     if not avito_id:
         return None
 
-    title_el = card.find(attrs={"data-marker": "item-title"}) or card.find("h3")
-    title = title_el.get_text(strip=True) if title_el else "Без названия"
+    # Title
+    title_el = await card.query_selector('[data-marker="item-title"]')
+    if not title_el:
+        title_el = await card.query_selector("h3")
+    title = (await title_el.text_content()).strip() if title_el else "Без названия"
 
-    price_el = card.find(attrs={"data-marker": "item-price"}) or card.find("span", class_=re.compile(r"price", re.I))
-    price = price_el.get_text(strip=True) if price_el else "Цена не указана"
+    # Price
+    price_el = await card.query_selector('[data-marker="item-price"]')
+    price = (await price_el.text_content()).strip() if price_el else "Цена не указана"
 
-    link_el = card.find("a", href=True)
-    item_url = ""
-    if link_el:
-        href = link_el["href"].split("?")[0]
+    # URL
+    link = await card.query_selector("a[href]")
+    href = (await link.get_attribute("href")) if link else ""
+    if href:
+        href = href.split("?")[0]
         item_url = href if href.startswith("http") else f"https://www.avito.ru{href}"
+    else:
+        item_url = ""
 
-    img = card.find("img")
-    image_url = None
-    if img:
-        image_url = img.get("src") or img.get("data-src")
-        if image_url and image_url.startswith("//"):
-            image_url = "https:" + image_url
+    # Image
+    img = await card.query_selector("img[src]")
+    image_url = (await img.get_attribute("src")) if img else None
+    if not image_url:
+        img2 = await card.query_selector("img[data-src]")
+        image_url = (await img2.get_attribute("data-src")) if img2 else None
+    if image_url and image_url.startswith("//"):
+        image_url = "https:" + image_url
 
-    loc_el = card.find(attrs={"data-marker": "item-address"}) or card.find("span", class_=re.compile(r"geo", re.I))
-    location = loc_el.get_text(strip=True) if loc_el else None
+    # Location
+    loc_el = await card.query_selector('[data-marker="item-address"]')
+    if not loc_el:
+        loc_el = await card.query_selector("span[class*='geo']")
+    location = (await loc_el.text_content()).strip() if loc_el else None
 
     return AvitoItem(
-        avito_id=str(avito_id), title=title, price=price,
-        url=item_url, image_url=image_url, location=location,
+        avito_id=str(avito_id),
+        title=title,
+        price=price,
+        url=item_url,
+        image_url=image_url,
+        location=location,
     )
-
-
-def _parse_json_items(items_data: list, category_path: list[str]) -> list[AvitoItem]:
-    """Parse items from embedded JSON (no filtering needed — page is already filtered)."""
-    items = []
-    for item in items_data:
-        if not isinstance(item, dict):
-            continue
-        avito_id = str(item.get("id", ""))
-        if not avito_id:
-            continue
-        title = item.get("title", "Без названия")
-        url_path = item.get("urlPath", "").split("?")[0]
-        item_url = f"https://www.avito.ru{url_path}" if url_path else ""
-        price_info = item.get("priceDetailed", {})
-        price = price_info.get("string", "Цена не указана") if isinstance(price_info, dict) else "Цена не указана"
-        images = item.get("images", [])
-        image_url = None
-        if images and isinstance(images[0], dict):
-            image_url = images[0].get("278x278") or images[0].get("339x339") or images[0].get("140x140")
-        loc = item.get("location", "")
-        location = loc.get("name", "") if isinstance(loc, dict) else str(loc) if loc else ""
-        if not location and url_path:
-            m = re.match(r"/([a-z_-]+)/", url_path)
-            if m:
-                location = m.group(1).replace("-", " ").replace("_", " ").title()
-        items.append(AvitoItem(
-            avito_id=avito_id, title=title, price=price,
-            url=item_url, image_url=image_url, location=location or None,
-        ))
-    return items
