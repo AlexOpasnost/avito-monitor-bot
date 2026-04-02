@@ -98,8 +98,10 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
             "locale": "ru-RU",
             "timezone_id": "Europe/Moscow",
         }
-        if proxy_dict:
-            ctx_kwargs["proxy"] = proxy_dict
+        # Note: proxy disabled for Playwright — mobileproxy.space doesn't support
+        # HTTPS CONNECT tunnel. Playwright goes direct from Railway IP.
+        # if proxy_dict:
+        #     ctx_kwargs["proxy"] = proxy_dict
 
         context = await browser.new_context(**ctx_kwargs)
         page = await context.new_page()
