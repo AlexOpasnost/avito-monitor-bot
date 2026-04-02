@@ -57,7 +57,6 @@ def _extract_category_path(url: str) -> list[str]:
         # Stop at encoded slugs (contain uppercase)
         if re.search(r'[A-Z]', part):
             # Extract the lowercase prefix before the encoded part
-            # e.g. "verhnyaya_odezhda-ASgBAgICA" -> "verhnyaya_odezhda"
             prefix = re.split(r'-[A-Z]', part)[0]
             if prefix and prefix != part:
                 category_parts.append(prefix)
@@ -67,7 +66,9 @@ def _extract_category_path(url: str) -> list[str]:
             continue
         category_parts.append(part)
 
-    return category_parts
+    # Limit to max 2 segments — deeper subcategories are encoded in slug,
+    # not present in item urlPath. E.g. "verhnyaya_odezhda" won't be in urlPath.
+    return category_parts[:2]
 
 
 async def parse_listings(url: str) -> list[AvitoItem] | None:
