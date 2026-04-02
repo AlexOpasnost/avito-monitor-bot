@@ -34,18 +34,10 @@ def _get_proxy() -> str | None:
 
 
 def _parse_proxy(proxy_str: str) -> dict:
-    """Convert proxy string to Playwright proxy dict.
-
-    Uses SOCKS5 for Playwright (HTTP CONNECT tunnel doesn't work).
-    Input:  http://user:pass@mproxy.site:17751
-    Output: {server: socks5://bproxy.site:17751, username: ..., password: ...}
-    """
+    """Convert proxy string to Playwright proxy dict (HTTP)."""
     from urllib.parse import urlparse as _urlparse
     p = _urlparse(proxy_str)
-    # Replace HTTP proxy host with SOCKS5 host
-    # mproxy.site -> bproxy.site (SOCKS5 version)
-    socks_host = (p.hostname or "").replace("mproxy.site", "bproxy.site")
-    result = {"server": f"socks5://{socks_host}:{p.port}"}
+    result = {"server": f"http://{p.hostname}:{p.port}"}
     if p.username:
         result["username"] = p.username
     if p.password:
