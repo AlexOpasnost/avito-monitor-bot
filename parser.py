@@ -468,54 +468,86 @@ def _extract_json_object(html: str, start: int) -> str | None:
 
 
 def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
-    """Extract items from HTML data attributes (data-item-id, iva-item-root)."""
-    # Avito renders items as divs with data-item-id attribute
-    item_ids = re.findall(r'data-item-id="(\d+)"', html)
-    if len(item_ids) < 3:
+    """Extract items from HTML by splitting on data-item-id blocks."""
+    # Find all item IDs
+    id_matches = list(re.finditer(r'data-item-id="(\d+)"', html))
+    if len(id_matches) < 3:
         return None
 
-    logger.info("Found %d data-item-id in HTML", len(item_ids))
+    logger.info("Found %d data-item-id in HTML", len(id_matches))
 
-    # Try to extract more info from surrounding HTML
     items = []
-    # Pattern: find item blocks with title, price, location
-    pattern = re.compile(
-        r'data-item-id="(\d+)".*?'
-        r'iva-item-title[^>]*>.*?href="([^"]*)"[^>]*>([^<]+)<'
-        r'.*?iva-item-price[^>]*>([^<]*)<'
-        r'.*?iva-item-geo[^>]*>([^<]*)<',
-        re.DOTALL
-    )
+    for i, match in enumerate(id_matches):
+        avito_id = match.group(1)
 
-    for m in pattern.finditer(html):
-        avito_id = m.group(1)
-        url_path = m.group(2)
-        title = m.group(3).strip()
-        price = m.group(4).strip() or "Цена не указана"
-        location = m.group(5).strip()
+        # Extract block: from this data-item-id to the next one (or +5000 chars)
+        start = match.start()
+        end = id_matches[i + 1].start() if i + 1 < len(id_matches) else start + 5000
+        block = html[start:end]
 
-        item_url = f"https://www.avito.ru{url_path}" if not url_path.startswith("http") else url_path
+        # Title: first <a> with href containing the item ID or /item path
+        title = "Объявление"
+        title_match = re.search(r'href="(/[^"]*?)"[^>]*?title="([^"]*)"', block)
+        if not title_match:
+            # Try: text inside link that has href with path
+            title_match = re.search(r'href="(/[^"]*?)"[^>]*>([^<]{3,80})<', block)
+        if title_match:
+            url_path = title_match.group(1)
+            title = title_match.group(2).strip()
+        else:
+            url_path = None
+
+        # Try to get URL from any link containing the avito_id
+        if not url_path:
+            url_match = re.search(rf'href="(/[^"]*?{avito_id}[^"]*?)"', block)
+            if url_match:
+                url_path = url_match.group(1)
+
+        item_url = f"https://www.avito.ru{url_path}" if url_path else f"https://www.avito.ru/{avito_id}"
+
+        # Price: look for price patterns (digits + ₽ or "руб")
+        price = "Цена не указана"
+        price_match = re.search(r'(\d[\d\s]*\d)\s*₽', block)
+        if not price_match:
+            price_match = re.search(r'data-marker="item-price"[^>]*>([^<]+)<', block)
+        if not price_match:
+            price_match = re.search(r'price[^>]*>([^<]*\d[^<]*)<', block, re.IGNORECASE)
+        if price_match:
+            price = price_match.group(1).strip()
+            if not price.endswith('₽'):
+                price += ' ₽'
+
+        # Location
+        location = None
+        loc_match = re.search(r'geo[^>]*>([^<]{3,60})<', block, re.IGNORECASE)
+        if not loc_match:
+            loc_match = re.search(r'location[^>]*>([^<]{3,60})<', block, re.IGNORECASE)
+        if loc_match:
+            location = loc_match.group(1).strip()
+
+        # Image
+        image_url = None
+        img_match = re.search(r'src="(https://[^"]*(?:avito|images)[^"]*\.(?:jpg|jpeg|png|webp))', block, re.IGNORECASE)
+        if not img_match:
+            img_match = re.search(r'data-src="(https://[^"]*\.(?:jpg|jpeg|png|webp))', block, re.IGNORECASE)
+        if img_match:
+            image_url = img_match.group(1)
 
         items.append(AvitoItem(
             avito_id=avito_id,
             title=title,
             price=price,
             url=item_url,
-            location=location or None,
+            image_url=image_url,
+            location=location,
         ))
 
+    # Log first item for debugging
     if items:
-        return items
-
-    # Fallback: at least return items with IDs so we can track new ones
-    # Even without full details, new data-item-ids mean new listings
-    for item_id in item_ids[:30]:
-        items.append(AvitoItem(
-            avito_id=item_id,
-            title="Новое объявление",
-            price="Смотрите на Авито",
-            url=f"https://www.avito.ru/{item_id}",
-        ))
+        first = items[0]
+        logger.info("HTML first item: id=%s title='%s' price='%s' url=%s img=%s",
+                     first.avito_id, first.title[:40], first.price[:20],
+                     first.url[:60], "yes" if first.image_url else "no")
 
     return items if items else None
 
