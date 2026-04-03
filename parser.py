@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
-from curl_cffi import requests as curl_requests
+import requests as std_requests
 
 from config import config
 
@@ -60,6 +60,31 @@ async def rotate_ip() -> bool:
         return False
 
 
+def _make_proxies(proxy: str | None) -> dict | None:
+    """Convert proxy string to requests-compatible proxies dict."""
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
+# Realistic Chrome browser headers
+_CHROME_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
+
 async def check_proxy_ip() -> str | None:
     """Check what IP the proxy is actually using. Returns IP string or None."""
     proxy = _get_proxy()
@@ -68,10 +93,9 @@ async def check_proxy_ip() -> str | None:
     try:
         loop = asyncio.get_event_loop()
         def _check():
-            resp = curl_requests.get(
+            resp = std_requests.get(
                 "https://api.ipify.org?format=json",
-                proxy=proxy,
-                impersonate="chrome",
+                proxies=_make_proxies(proxy),
                 timeout=15,
             )
             return resp.json().get("ip")
@@ -174,16 +198,20 @@ async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | No
 
             if blocked:
                 logger.warning(
-                    "Avito blocked attempt %d/%d for %s — rotating IP",
+                    "API blocked attempt %d/%d for %s — rotating IP",
                     attempt + 1, max_retries, url[:60],
                 )
                 await rotate_ip()
+                # Longer pause after rotation to let new IP settle
+                await asyncio.sleep(random.uniform(3, 7))
                 continue
 
             if items is not None:
                 return items
 
             # Fallback: try HTML scraping
+            logger.info("API returned no items, trying HTML for %s", url[:60])
+            await asyncio.sleep(random.uniform(2, 5))
             result = await loop.run_in_executor(
                 None, lambda: _fetch_html(url, proxy)
             )
@@ -195,6 +223,7 @@ async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | No
                     attempt + 1, max_retries,
                 )
                 await rotate_ip()
+                await asyncio.sleep(random.uniform(3, 7))
                 continue
 
             return items
@@ -211,40 +240,36 @@ async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | No
 def _fetch_via_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
     """Fetch listings via Avito mobile API. Returns (items, blocked)."""
     try:
-        # Build API URL from search URL
-        # Method 1: Direct search API with the same path
         parsed = urlparse(url)
         path = parsed.path.rstrip("/")
-        query = parsed.query
+        qs = parse_qs(parsed.query)
 
-        # Mobile API endpoint — mirrors the web URL structure
-        api_url = f"https://m.avito.ru/api/11/items?key=af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir&display=list&limit=30&sort=date"
+        api_url = "https://m.avito.ru/api/11/items"
+        params = {
+            "key": "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir",
+            "display": "list",
+            "limit": "30",
+            "sort": "date",
+            "forceLocation": parsed.path,
+        }
 
-        # Extract query param
-        qs = parse_qs(query)
         if "q" in qs:
-            api_url += f"&query={qs['q'][0]}"
-
-        # Price filters
+            params["query"] = qs["q"][0]
         if "pmin" in qs:
-            api_url += f"&priceMin={qs['pmin'][0]}"
+            params["priceMin"] = qs["pmin"][0]
         if "pmax" in qs:
-            api_url += f"&priceMax={qs['pmax'][0]}"
+            params["priceMax"] = qs["pmax"][0]
 
-        # Pass the full path as forceLocation to preserve city/category
-        api_url += f"&forceLocation={parsed.path}"
-
-        # Also try the categoryId approach: extract from path params
         path_parts = [p for p in path.strip("/").split("/") if p]
         for part in path_parts:
             if re.match(r'^[A-Z][A-Za-z0-9+/=_-]+$', part) and len(part) > 4:
-                api_url += f"&params={part}"
+                params["params"] = part
                 break
 
-        resp = curl_requests.get(
+        resp = std_requests.get(
             api_url,
-            proxy=proxy,
-            impersonate="chrome",
+            params=params,
+            proxies=_make_proxies(proxy),
             headers={
                 "Accept": "application/json",
                 "Accept-Language": "ru-RU,ru;q=0.9",
@@ -256,30 +281,28 @@ def _fetch_via_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None,
         )
 
         if _is_blocked(resp.text or "", resp.status_code):
+            logger.warning("API blocked (HTTP %d) body: %s", resp.status_code, resp.text[:300])
             return (None, True)
 
         if resp.status_code != 200:
-            logger.warning("API HTTP %d for %s", resp.status_code, url[:60])
+            logger.warning("API HTTP %d for %s, body: %s", resp.status_code, url[:60], resp.text[:300])
             return (None, False)
 
         data = resp.json()
         items_data = data.get("result", {}).get("items", [])
-
         if not items_data:
-            # Try alternative JSON paths
             items_data = data.get("items", [])
 
         if not items_data:
-            logger.info("API returned 0 items for %s, keys=%s",
-                        url[:60], list(data.keys())[:5])
-            return (None, False)  # Return None to trigger HTML fallback
+            logger.info("API returned 0 items for %s, keys=%s", url[:60], list(data.keys())[:5])
+            return (None, False)
 
         items = _parse_api_items(items_data)
         logger.info("API: extracted %d items for %s", len(items), url[:60])
         return (items, False)
 
     except json.JSONDecodeError:
-        logger.warning("API returned non-JSON for %s", url[:60])
+        logger.warning("API non-JSON for %s, body: %s", url[:60], resp.text[:300] if resp else "?")
         return (None, False)
     except Exception as e:
         logger.error("API fetch failed: %s", e)
@@ -384,15 +407,11 @@ def _fetch_html(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bo
     """Fallback: fetch HTML page and extract items from embedded JSON.
     Returns (items, blocked)."""
     try:
-        resp = curl_requests.get(
+        session = std_requests.Session()
+        session.headers.update(_CHROME_HEADERS)
+        resp = session.get(
             url,
-            proxy=proxy,
-            impersonate="chrome",
-            headers={
-                "Accept-Language": "ru-RU,ru;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": "https://www.avito.ru/",
-            },
+            proxies=_make_proxies(proxy),
             timeout=60,
         )
 
