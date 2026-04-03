@@ -283,6 +283,12 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
             logger.info("Extracted %d items from embedded JSON", len(items))
             return (items, False)
 
+        # Try HTML data attributes (iva-item-root)
+        items = _extract_from_html_items(html)
+        if items is not None:
+            logger.info("Extracted %d items from HTML data-attrs", len(items))
+            return (items, False)
+
         # Debug: log what's on the page
         json_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
         title_match = re.search(r'<title>([^<]+)</title>', html)
@@ -340,7 +346,21 @@ def _extract_from_preloaded_state(html: str) -> list[AvitoItem] | None:
         data = _parse_js_value(html, match.end())
         if not data:
             return None
-        logger.info("__preloadedState keys: %s", list(data.keys())[:10])
+        top_keys = list(data.keys())
+        logger.info("__preloadedState keys: %s", top_keys[:15])
+
+        # Log structure of promising keys to find where listings hide
+        for key in top_keys:
+            val = data[key]
+            if isinstance(val, dict):
+                sub_keys = list(val.keys())[:10]
+                # Check sizes to find the big data blob
+                size = len(json.dumps(val, ensure_ascii=False)) if len(sub_keys) > 0 else 0
+                if size > 10000:  # Only log big objects (likely contain data)
+                    logger.info("  preloadedState.%s (%d bytes) keys: %s", key, size, sub_keys)
+            elif isinstance(val, list):
+                logger.info("  preloadedState.%s is list[%d]", key, len(val))
+
         items_list = _find_items_in_data(data)
         if items_list:
             return _parse_items(items_list)
@@ -362,6 +382,19 @@ def _extract_from_mfe(html: str) -> list[AvitoItem] | None:
         if not data:
             return None
         logger.info("__mfe__ keys: %s", list(data.keys())[:10])
+
+        # Log deeper structure of __mfe__
+        for key in list(data.keys())[:5]:
+            val = data[key]
+            if isinstance(val, dict):
+                for k2 in list(val.keys())[:10]:
+                    v2 = val[k2]
+                    if isinstance(v2, dict):
+                        size = len(json.dumps(v2, ensure_ascii=False))
+                        if size > 5000:
+                            logger.info("  mfe.%s.%s (%d bytes) keys: %s",
+                                        key, k2, size, list(v2.keys())[:10])
+
         items_list = _deep_find_items(data)
         if items_list:
             return _parse_items(items_list)
@@ -432,6 +465,59 @@ def _extract_json_object(html: str, start: int) -> str | None:
                     return html[start:i + 1]
         i += 1
     return None
+
+
+def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
+    """Extract items from HTML data attributes (data-item-id, iva-item-root)."""
+    # Avito renders items as divs with data-item-id attribute
+    item_ids = re.findall(r'data-item-id="(\d+)"', html)
+    if len(item_ids) < 3:
+        return None
+
+    logger.info("Found %d data-item-id in HTML", len(item_ids))
+
+    # Try to extract more info from surrounding HTML
+    items = []
+    # Pattern: find item blocks with title, price, location
+    pattern = re.compile(
+        r'data-item-id="(\d+)".*?'
+        r'iva-item-title[^>]*>.*?href="([^"]*)"[^>]*>([^<]+)<'
+        r'.*?iva-item-price[^>]*>([^<]*)<'
+        r'.*?iva-item-geo[^>]*>([^<]*)<',
+        re.DOTALL
+    )
+
+    for m in pattern.finditer(html):
+        avito_id = m.group(1)
+        url_path = m.group(2)
+        title = m.group(3).strip()
+        price = m.group(4).strip() or "Цена не указана"
+        location = m.group(5).strip()
+
+        item_url = f"https://www.avito.ru{url_path}" if not url_path.startswith("http") else url_path
+
+        items.append(AvitoItem(
+            avito_id=avito_id,
+            title=title,
+            price=price,
+            url=item_url,
+            location=location or None,
+        ))
+
+    if items:
+        return items
+
+    # Fallback: at least return items with IDs so we can track new ones
+    # Even without full details, new data-item-ids mean new listings
+    for item_id in item_ids[:30]:
+        items.append(AvitoItem(
+            avito_id=item_id,
+            title="Новое объявление",
+            price="Смотрите на Авито",
+            url=f"https://www.avito.ru/{item_id}",
+        ))
+
+    return items if items else None
 
 
 def _extract_from_any_json(html: str) -> list[AvitoItem] | None:
