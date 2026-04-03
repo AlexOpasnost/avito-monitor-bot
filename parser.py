@@ -124,6 +124,7 @@ def _get_session(proxy: str | None) -> cloudscraper.CloudScraper:
     proxies = _make_proxies(proxy)
 
     # Warm up: visit Avito homepage to get session cookies
+    # If blocked, the caller will rotate IP and invalidate session
     try:
         warmup_resp = scraper.get(
             "https://www.avito.ru/",
@@ -135,8 +136,16 @@ def _get_session(proxy: str | None) -> cloudscraper.CloudScraper:
             "Session warmup: HTTP %d, %d cookies, size=%d",
             warmup_resp.status_code, cookies_count, len(warmup_resp.text),
         )
+
+        # If warmup itself is blocked, don't cache this session
+        if warmup_resp.status_code in (403, 429) or len(warmup_resp.text) < 50000:
+            blocked_check, reason = _is_blocked(warmup_resp.text, warmup_resp.status_code)
+            if blocked_check:
+                logger.warning("Warmup blocked (%s) — session not cached", reason)
+                return scraper  # Return but don't cache
     except Exception as e:
         logger.warning("Session warmup failed: %s", e)
+        return scraper  # Return uncached
 
     _session = scraper
     _session_created_at = now
@@ -177,7 +186,7 @@ def _is_blocked(html: str, status_code: int) -> tuple[bool, str]:
     return (False, "")
 
 
-async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | None:
+async def parse_listings(url: str, max_retries: int = 5) -> list[AvitoItem] | None:
     """Fetch Avito listings. Strategy:
     1. Use cloudscraper session with cookies (warm up on avito.ru first)
     2. Parse HTML for embedded JSON data
@@ -204,7 +213,9 @@ async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | No
                 )
                 _invalidate_session()
                 await rotate_ip()
-                await asyncio.sleep(random.uniform(5, 10))
+                # Progressive backoff: wait longer on each retry
+                wait = 5 + attempt * 5  # 5s, 10s, 15s
+                await asyncio.sleep(random.uniform(wait, wait + 5))
                 continue
 
             return items
@@ -214,6 +225,7 @@ async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | No
             if attempt < max_retries - 1:
                 _invalidate_session()
                 await rotate_ip()
+                await asyncio.sleep(5)
 
     logger.error("All %d attempts failed for %s", max_retries, url[:60])
     return None
