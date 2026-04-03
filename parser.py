@@ -308,13 +308,18 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
 # --- JSON extraction from HTML ---
 
 def _extract_from_initial_data(html: str) -> list[AvitoItem] | None:
-    match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+    match = re.search(r'window\.__initialData__\s*=\s*', html)
     if not match:
         return None
     try:
-        raw = unquote(match.group(1))
-        data = json.loads(raw)
+        data = _parse_js_value(html, match.end())
+        if not data:
+            return None
+        logger.info("__initialData__ keys: %s", list(data.keys())[:10])
         items_list = _find_items_in_data(data)
+        if items_list:
+            return _parse_items(items_list)
+        items_list = _deep_find_items(data)
         if items_list:
             return _parse_items(items_list)
     except Exception as e:
@@ -323,25 +328,27 @@ def _extract_from_initial_data(html: str) -> list[AvitoItem] | None:
 
 
 def _extract_from_preloaded_state(html: str) -> list[AvitoItem] | None:
-    # Find start of JSON after __preloadedState__ =
-    match = re.search(r'window\.__preloadedState__\s*=\s*', html)
-    if not match:
+    # Note: Avito uses __preloadedState_ (single underscore!) not __preloadedState__
+    # Value can be raw JSON {..} OR url-encoded string "..."
+    for pattern in [r'window\.__preloadedState__\s*=\s*', r'window\.__preloadedState_\s*=\s*']:
+        match = re.search(pattern, html)
+        if match:
+            break
+    else:
         return None
     try:
-        json_str = _extract_json_object(html, match.end())
-        if not json_str:
+        data = _parse_js_value(html, match.end())
+        if not data:
             return None
-        data = json.loads(json_str)
-        logger.debug("__preloadedState__ keys: %s", list(data.keys())[:10])
+        logger.info("__preloadedState keys: %s", list(data.keys())[:10])
         items_list = _find_items_in_data(data)
         if items_list:
             return _parse_items(items_list)
-        # Try deeper search
         items_list = _deep_find_items(data)
         if items_list:
             return _parse_items(items_list)
     except Exception as e:
-        logger.warning("__preloadedState__ parse error: %s", e)
+        logger.warning("__preloadedState parse error: %s", e)
     return None
 
 
@@ -351,17 +358,42 @@ def _extract_from_mfe(html: str) -> list[AvitoItem] | None:
     if not match:
         return None
     try:
-        json_str = _extract_json_object(html, match.end())
-        if not json_str:
+        data = _parse_js_value(html, match.end())
+        if not data:
             return None
-        data = json.loads(json_str)
-        logger.debug("__mfe__ keys: %s", list(data.keys())[:10])
-        # __mfe__ has different structure — search recursively
+        logger.info("__mfe__ keys: %s", list(data.keys())[:10])
         items_list = _deep_find_items(data)
         if items_list:
             return _parse_items(items_list)
     except Exception as e:
         logger.warning("__mfe__ parse error: %s", e)
+    return None
+
+
+def _parse_js_value(html: str, pos: int) -> dict | None:
+    """Parse a JS value that can be either raw JSON {..} or URL-encoded string "..."."""
+    if pos >= len(html):
+        return None
+
+    ch = html[pos]
+
+    if ch == '{':
+        # Raw JSON object
+        json_str = _extract_json_object(html, pos)
+        if json_str:
+            return json.loads(json_str)
+
+    elif ch == '"':
+        # URL-encoded string: "...encoded..."
+        end = html.find('";', pos + 1)
+        if end == -1:
+            end = html.find('"', pos + 1)
+        if end == -1:
+            return None
+        encoded = html[pos + 1:end]
+        decoded = unquote(encoded)
+        return json.loads(decoded)
+
     return None
 
 
