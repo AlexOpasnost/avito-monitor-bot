@@ -57,14 +57,17 @@ async def parse_listings(url: str) -> list[AvitoItem] | None:
 def _fetch_and_parse(url: str, proxy: str | None) -> list[AvitoItem] | None:
     """Fetch HTML page and extract items from embedded JSON."""
     try:
-        # Session with cookies
-        s = curl_requests.Session(impersonate="chrome")
-        try:
-            s.get("https://www.avito.ru/", proxy=proxy, timeout=10)
-        except Exception:
-            pass
-
-        resp = s.get(url, proxy=proxy, timeout=20)
+        # Direct request with impersonate (no warmup — saves time and IP)
+        resp = curl_requests.get(
+            url,
+            proxy=proxy,
+            impersonate="chrome",
+            headers={
+                "Accept-Language": "ru-RU,ru;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            timeout=60,
+        )
 
         if resp.status_code == 429:
             logger.warning("HTTP 429 for %s", url[:60])
