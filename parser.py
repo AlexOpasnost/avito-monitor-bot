@@ -546,6 +546,19 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if img_match:
             image_url = img_match.group(1)
 
+        # Description — snippet text from the listing card
+        description = None
+        desc_match = re.search(r'data-marker="item-description"[^>]*>([^<]{5,})<', block)
+        if not desc_match:
+            # Look for long text blocks that aren't title/price/location
+            for text_match in re.finditer(r'>([^<]{30,200})<', block):
+                text = text_match.group(1).strip()
+                if text != title and text != price and text != location:
+                    description = text[:200]
+                    break
+        else:
+            description = desc_match.group(1).strip()[:200]
+
         items.append(AvitoItem(
             avito_id=avito_id,
             title=title,
@@ -553,6 +566,7 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             url=item_url,
             image_url=image_url,
             location=location,
+            description=description,
         ))
 
     # Log first item for debugging
