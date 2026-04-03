@@ -12,27 +12,32 @@ logger = logging.getLogger(__name__)
 
 
 def format_notification(item: AvitoItem) -> str:
-    """Format item notification with enriched data."""
+    """Format item notification — clean style like AvtoRinger."""
     from datetime import datetime, timezone, timedelta
 
-    loc = item.location or "Россия"
     msk = timezone(timedelta(hours=3))
     now = datetime.now(msk).strftime("%H:%M %d.%m.%Y")
 
     lines = [f"<b>{item.title}</b>"]
-    lines.append(f"💰 {item.price}")
+    lines.append(f"💰 <b>{item.price}</b>")
 
-    # Stats line (views + rating)
+    # Stats line
     stats = []
     if item.views:
-        stats.append(f"👀 {item.views}")
+        stats.append(f"👁 {item.views}")
+    if item.favorites:
+        stats.append(f"❤️ {item.favorites}")
     if item.seller_rating:
         stats.append(f"⭐ {item.seller_rating}")
     if stats:
         lines.append(" ".join(stats))
 
-    lines.append(f"📍 {loc}")
-    lines.append(f"🔗 avito.ru/{item.avito_id}")
+    # Location
+    if item.location:
+        lines.append(f"📍 {item.location}")
+
+    # Full URL
+    lines.append(f"🔗 {item.url}")
 
     # Description
     if item.description:
@@ -40,20 +45,18 @@ def format_notification(item: AvitoItem) -> str:
 
     # Seller
     if item.seller_name:
-        lines.append(f"\n👤 {item.seller_name}")
+        lines.append(f"👤 {item.seller_name}")
 
-    # Date — from Avito or our timestamp
+    # Date
     date_str = item.published_date or now
     lines.append(f"📅 {date_str}")
-    lines.append(f"🆔 <code>{item.avito_id}</code>")
 
     return "\n".join(lines)
 
 
 def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
-    short_url = f"https://www.avito.ru/{item.avito_id}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=short_url)],
+        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=item.url)],
     ])
 
 

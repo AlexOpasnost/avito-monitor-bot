@@ -517,19 +517,32 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             if not price.endswith('₽'):
                 price += ' ₽'
 
-        # Location
+        # Location — look for specific Avito geo markers
         location = None
-        loc_match = re.search(r'geo[^>]*>([^<]{3,60})<', block, re.IGNORECASE)
+        loc_match = re.search(r'data-marker="item-address"[^>]*>([^<]{3,60})<', block)
         if not loc_match:
-            loc_match = re.search(r'location[^>]*>([^<]{3,60})<', block, re.IGNORECASE)
+            loc_match = re.search(r'class="[^"]*geo-address[^"]*"[^>]*>([^<]{3,60})<', block)
+        if not loc_match:
+            loc_match = re.search(r'class="[^"]*item-address[^"]*"[^>]*>([^<]{3,60})<', block)
+        if not loc_match:
+            # Look for city patterns like "Москва, район" but NOT the title
+            loc_match = re.search(r'>([А-Я][а-яё]+(?:,\s*[А-Яа-яё\s]+(?:район|р-н|обл|край))[^<]{0,30})<', block)
         if loc_match:
-            location = loc_match.group(1).strip()
+            loc_text = loc_match.group(1).strip()
+            # Verify it's not the title repeated
+            if loc_text != title and len(loc_text) < 60:
+                location = loc_text
 
-        # Image
+        # Image — try multiple sources for lazy-loaded images
         image_url = None
-        img_match = re.search(r'src="(https://[^"]*(?:avito|images)[^"]*\.(?:jpg|jpeg|png|webp))', block, re.IGNORECASE)
+        # 1. data-src (lazy loaded)
+        img_match = re.search(r'data-src="(https://[^"]*\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.IGNORECASE)
+        # 2. Regular src with avito CDN
         if not img_match:
-            img_match = re.search(r'data-src="(https://[^"]*\.(?:jpg|jpeg|png|webp))', block, re.IGNORECASE)
+            img_match = re.search(r'src="(https://(?:\d+\.)?avito\.st/[^"]+)"', block, re.IGNORECASE)
+        # 3. Any image src with common image CDN patterns
+        if not img_match:
+            img_match = re.search(r'(?:src|data-src)="(https://[^"]*(?:/items|/images|/thumbs)[^"]*)"', block, re.IGNORECASE)
         if img_match:
             image_url = img_match.group(1)
 
