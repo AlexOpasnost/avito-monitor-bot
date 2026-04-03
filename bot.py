@@ -12,6 +12,7 @@ from config import config
 from database import db
 from handlers import router
 from scheduler import run_scheduler
+from parser import rotate_ip, check_proxy_ip
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +33,18 @@ async def main():
     # Connect to database
     await db.connect()
     logger.info("Database connected")
+
+    # Verify proxy and rotate IP at startup
+    if config.proxy_list:
+        logger.info("Proxy configured: %s", config.proxy_list[0].split("@")[-1])
+        await rotate_ip()
+        ip = await check_proxy_ip()
+        if ip:
+            logger.info("Proxy working! External IP: %s", ip)
+        else:
+            logger.error("Proxy NOT working — requests will fail!")
+    else:
+        logger.warning("No proxy configured — Avito will likely block requests")
 
     # Use custom Telegram API URL if set (for local dev behind firewall)
     if config.telegram_api_url and config.telegram_api_url != "https://api.telegram.org":

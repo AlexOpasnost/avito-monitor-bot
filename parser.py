@@ -4,7 +4,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 from curl_cffi import requests as curl_requests
 
@@ -37,27 +37,353 @@ def _get_proxy() -> str | None:
     return config.proxy_list[0]
 
 
-async def parse_listings(url: str) -> list[AvitoItem] | None:
-    """Load Avito search page HTML via curl_cffi + proxy,
-    extract items from embedded JSON (window.__initialData__)."""
+async def rotate_ip() -> bool:
+    """Call proxy provider's IP rotation endpoint. Returns True on success."""
+    if not config.proxy_rotate_url:
+        logger.warning("No PROXY_ROTATE_URL configured, cannot rotate IP")
+        return False
+    try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(config.proxy_rotate_url) as resp:
+                if resp.status == 200:
+                    logger.info("IP rotated successfully")
+                    await asyncio.sleep(3)
+                    return True
+                else:
+                    body = await resp.text()
+                    logger.warning("IP rotation HTTP %d: %s", resp.status, body[:200])
+                    return False
+    except Exception as e:
+        logger.warning("IP rotation failed: %s", e)
+        return False
+
+
+async def check_proxy_ip() -> str | None:
+    """Check what IP the proxy is actually using. Returns IP string or None."""
     proxy = _get_proxy()
-    url = url.replace("m.avito.ru", "www.avito.ru")
-
-    delay = random.uniform(config.request_delay_min, config.request_delay_max)
-    await asyncio.sleep(delay)
-
+    if not proxy:
+        return None
     try:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: _fetch_and_parse(url, proxy))
+        def _check():
+            resp = curl_requests.get(
+                "https://api.ipify.org?format=json",
+                proxy=proxy,
+                impersonate="chrome",
+                timeout=15,
+            )
+            return resp.json().get("ip")
+        ip = await loop.run_in_executor(None, _check)
+        logger.info("Proxy IP: %s", ip)
+        return ip
     except Exception as e:
-        logger.error("Parse error: %s", e)
+        logger.warning("Proxy IP check failed: %s", e)
         return None
 
 
-def _fetch_and_parse(url: str, proxy: str | None) -> list[AvitoItem] | None:
-    """Fetch HTML page and extract items from embedded JSON."""
+def _is_blocked(html: str, status_code: int) -> bool:
+    """Check if Avito blocked the request."""
+    if status_code in (403, 429):
+        return True
+    html_lower = html.lower() if html else ""
+    return (
+        "captcha" in html_lower
+        or "проблема с ip" in html_lower
+        or "доступ ограничен" in html_lower
+        or "geetest" in html_lower
+    )
+
+
+def _url_to_api_params(url: str) -> dict | None:
+    """Convert Avito search URL to mobile API parameters.
+
+    Example URL: https://www.avito.ru/moskva/kvartiry/prodam-ASgBAgICAUSSA8YQ?q=test
+    → API: https://m.avito.ru/api/11/items?key=...&locationId=...&categoryId=...&query=test
+    """
+    parsed = urlparse(url)
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+    qs = parse_qs(parsed.query)
+
+    params = {
+        "key": "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir",
+        "page": "1",
+        "lastStamp": "",
+        "display": "list",
+        "limit": "30",
+    }
+
+    # Query text
+    if "q" in qs:
+        params["query"] = qs["q"][0]
+
+    # Price filters
+    if "pmin" in qs:
+        params["priceMin"] = qs["pmin"][0]
+    if "pmax" in qs:
+        params["priceMax"] = qs["pmax"][0]
+
+    # Sort
+    sort_map = {"104": "date", "101": "priceAsc", "102": "priceDesc"}
+    if "s" in qs:
+        params["sort"] = sort_map.get(qs["s"][0], "date")
+    else:
+        params["sort"] = "date"
+
+    # Owner type (private/company)
+    if "user" in qs:
+        params["owner"] = qs["user"][0]
+
+    # With photo only
+    if "bt" in qs:
+        params["withImagesOnly"] = "1"
+
+    # The encoded search params from URL (ASgB... part) — pass as searchArea
+    # These encode category, location, and other filters
+    for part in path_parts:
+        if re.match(r'^[A-Z][A-Za-z0-9+/=_-]+$', part) and len(part) > 4:
+            params["params"] = part
+            break
+
+    # Pass the full original URL path for the API to parse
+    # The API accepts the path directly
+    params["url"] = parsed.path + ("?" + parsed.query if parsed.query else "")
+
+    return params
+
+
+async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | None:
+    """Fetch Avito listings using mobile API with fallback to HTML scraping.
+    Auto-rotates IP and retries on block."""
+    proxy = _get_proxy()
+    url = url.replace("m.avito.ru", "www.avito.ru")
+
+    for attempt in range(max_retries):
+        delay = random.uniform(config.request_delay_min, config.request_delay_max)
+        await asyncio.sleep(delay)
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            # Try mobile API first
+            result = await loop.run_in_executor(
+                None, lambda: _fetch_via_api(url, proxy)
+            )
+            items, blocked = result
+
+            if blocked:
+                logger.warning(
+                    "Avito blocked attempt %d/%d for %s — rotating IP",
+                    attempt + 1, max_retries, url[:60],
+                )
+                await rotate_ip()
+                continue
+
+            if items is not None:
+                return items
+
+            # Fallback: try HTML scraping
+            result = await loop.run_in_executor(
+                None, lambda: _fetch_html(url, proxy)
+            )
+            items, blocked = result
+
+            if blocked:
+                logger.warning(
+                    "HTML also blocked attempt %d/%d — rotating IP",
+                    attempt + 1, max_retries,
+                )
+                await rotate_ip()
+                continue
+
+            return items
+
+        except Exception as e:
+            logger.error("Parse error attempt %d/%d: %s", attempt + 1, max_retries, e)
+            if attempt < max_retries - 1:
+                await rotate_ip()
+
+    logger.error("All %d attempts failed for %s", max_retries, url[:60])
+    return None
+
+
+def _fetch_via_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
+    """Fetch listings via Avito mobile API. Returns (items, blocked)."""
     try:
-        # Direct request with impersonate (no warmup — saves time and IP)
+        # Build API URL from search URL
+        # Method 1: Direct search API with the same path
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/")
+        query = parsed.query
+
+        # Mobile API endpoint — mirrors the web URL structure
+        api_url = f"https://m.avito.ru/api/11/items?key=af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir&display=list&limit=30&sort=date"
+
+        # Extract query param
+        qs = parse_qs(query)
+        if "q" in qs:
+            api_url += f"&query={qs['q'][0]}"
+
+        # Price filters
+        if "pmin" in qs:
+            api_url += f"&priceMin={qs['pmin'][0]}"
+        if "pmax" in qs:
+            api_url += f"&priceMax={qs['pmax'][0]}"
+
+        # Pass the full path as forceLocation to preserve city/category
+        api_url += f"&forceLocation={parsed.path}"
+
+        # Also try the categoryId approach: extract from path params
+        path_parts = [p for p in path.strip("/").split("/") if p]
+        for part in path_parts:
+            if re.match(r'^[A-Z][A-Za-z0-9+/=_-]+$', part) and len(part) > 4:
+                api_url += f"&params={part}"
+                break
+
+        resp = curl_requests.get(
+            api_url,
+            proxy=proxy,
+            impersonate="chrome",
+            headers={
+                "Accept": "application/json",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+                "User-Agent": "Avito/150.0 (Android 14; Build/AP2A.240805.005)",
+                "X-Source": "avito_android",
+                "X-Api-Key": "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir",
+            },
+            timeout=30,
+        )
+
+        if _is_blocked(resp.text or "", resp.status_code):
+            return (None, True)
+
+        if resp.status_code != 200:
+            logger.warning("API HTTP %d for %s", resp.status_code, url[:60])
+            return (None, False)
+
+        data = resp.json()
+        items_data = data.get("result", {}).get("items", [])
+
+        if not items_data:
+            # Try alternative JSON paths
+            items_data = data.get("items", [])
+
+        if not items_data:
+            logger.info("API returned 0 items for %s, keys=%s",
+                        url[:60], list(data.keys())[:5])
+            return (None, False)  # Return None to trigger HTML fallback
+
+        items = _parse_api_items(items_data)
+        logger.info("API: extracted %d items for %s", len(items), url[:60])
+        return (items, False)
+
+    except json.JSONDecodeError:
+        logger.warning("API returned non-JSON for %s", url[:60])
+        return (None, False)
+    except Exception as e:
+        logger.error("API fetch failed: %s", e)
+        return (None, False)
+
+
+def _parse_api_items(items_data: list) -> list[AvitoItem]:
+    """Parse items from Avito mobile API JSON response."""
+    items = []
+    for item in items_data:
+        if not isinstance(item, dict):
+            continue
+
+        # API wraps items in {"type": "item", "value": {...}}
+        if "value" in item and isinstance(item["value"], dict):
+            item = item["value"]
+
+        avito_id = str(item.get("id", item.get("itemId", "")))
+        if not avito_id:
+            continue
+
+        title = item.get("title", "Без названия")
+
+        # Price
+        price = "Цена не указана"
+        price_info = item.get("priceDetailed") or item.get("price")
+        if isinstance(price_info, dict):
+            price = price_info.get("string") or price_info.get("value", price)
+            if isinstance(price, (int, float)):
+                price = f"{int(price):,} ₽".replace(",", " ")
+        elif isinstance(price_info, str):
+            price = price_info
+        elif isinstance(price_info, (int, float)):
+            price = f"{int(price_info):,} ₽".replace(",", " ")
+
+        # URL
+        url_path = item.get("urlPath", item.get("url", ""))
+        if url_path and "?" in url_path:
+            url_path = url_path.split("?")[0]
+        item_url = f"https://www.avito.ru{url_path}" if url_path and not url_path.startswith("http") else url_path
+
+        # Image — API provides multiple sizes
+        image_url = None
+        images = item.get("images", item.get("photos", []))
+        if images:
+            if isinstance(images[0], str):
+                image_url = images[0]
+            elif isinstance(images[0], dict):
+                image_url = (
+                    images[0].get("636x476")
+                    or images[0].get("278x278")
+                    or images[0].get("140x140")
+                    or images[0].get("url")
+                    or images[0].get("src")
+                )
+
+        # Location
+        location = ""
+        loc = item.get("location") or item.get("address") or item.get("geo")
+        if isinstance(loc, dict):
+            location = loc.get("name", loc.get("formattedAddress", ""))
+        elif isinstance(loc, str):
+            location = loc
+
+        # Description
+        desc = item.get("description", "")
+        if isinstance(desc, dict):
+            desc = desc.get("text", desc.get("value", ""))
+        if desc and len(desc) > 200:
+            desc = desc[:200] + "..."
+
+        # Seller info
+        seller = item.get("seller", {})
+        seller_name = None
+        if isinstance(seller, dict):
+            seller_name = seller.get("name")
+
+        # Date
+        pub_date = item.get("sortTimeStamp") or item.get("time") or item.get("publishDate")
+        pub_date_str = None
+        if isinstance(pub_date, (int, float)) and pub_date > 1000000000:
+            from datetime import datetime, timezone, timedelta
+            msk = timezone(timedelta(hours=3))
+            pub_date_str = datetime.fromtimestamp(pub_date, msk).strftime("%H:%M %d.%m.%Y")
+
+        items.append(AvitoItem(
+            avito_id=avito_id,
+            title=title,
+            price=str(price),
+            url=item_url,
+            image_url=image_url,
+            location=location or None,
+            description=desc or None,
+            seller_name=seller_name,
+            published_date=pub_date_str,
+        ))
+
+    return items
+
+
+def _fetch_html(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
+    """Fallback: fetch HTML page and extract items from embedded JSON.
+    Returns (items, blocked)."""
+    try:
         resp = curl_requests.get(
             url,
             proxy=proxy,
@@ -65,100 +391,84 @@ def _fetch_and_parse(url: str, proxy: str | None) -> list[AvitoItem] | None:
             headers={
                 "Accept-Language": "ru-RU,ru;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://www.avito.ru/",
             },
             timeout=60,
         )
 
-        if resp.status_code == 429:
-            logger.warning("HTTP 429 for %s", url[:60])
-            return None
-        if resp.status_code == 403:
-            logger.warning("HTTP 403 for %s", url[:60])
-            return None
+        html = resp.text if resp.text else ""
+
+        if _is_blocked(html, resp.status_code):
+            return (None, True)
+
         if resp.status_code != 200:
-            logger.warning("HTTP %d for %s", resp.status_code, url[:60])
-            return None
+            logger.warning("HTML HTTP %d for %s", resp.status_code, url[:60])
+            return (None, False)
 
-        html = resp.text
-
-        if "captcha" in html.lower() or "проблема с ip" in html.lower():
-            logger.warning("Captcha for %s", url[:60])
-            return None
-
-        # Try to find embedded JSON data
+        # Try embedded JSON extraction
         items = _extract_from_initial_data(html)
         if items is not None:
-            logger.info("Extracted %d items from __initialData__", len(items))
-            return items
+            logger.info("HTML: extracted %d items from __initialData__", len(items))
+            return (items, False)
 
         items = _extract_from_preloaded_state(html)
         if items is not None:
-            logger.info("Extracted %d items from __preloadedState__", len(items))
-            return items
+            logger.info("HTML: extracted %d items from __preloadedState__", len(items))
+            return (items, False)
 
         items = _extract_from_any_json(html)
         if items is not None:
-            logger.info("Extracted %d items from embedded JSON", len(items))
-            return items
+            logger.info("HTML: extracted %d items from embedded JSON", len(items))
+            return (items, False)
 
-        # Log what we found for debugging
         json_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
-        logger.info("No items found. Page size=%d, JS vars=%s, title=%s",
+        title_match = re.search(r'<title>([^<]+)</title>', html)
+        logger.info("HTML: no items. size=%d, vars=%s, title=%s",
             len(html), json_vars[:5],
-            re.search(r'<title>([^<]+)</title>', html).group(1)[:50] if re.search(r'<title>([^<]+)</title>', html) else "?")
+            title_match.group(1)[:50] if title_match else "?")
 
-        return []
+        return ([], False)
 
     except Exception as e:
-        logger.error("Fetch failed: %s", e)
-        return None
+        logger.error("HTML fetch failed: %s", e)
+        return (None, False)
 
 
 def _extract_from_initial_data(html: str) -> list[AvitoItem] | None:
-    """Extract from window.__initialData__ = "URL_ENCODED_JSON";"""
     match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
     if not match:
         return None
-
     try:
         raw = unquote(match.group(1))
         data = json.loads(raw)
-
-        # Navigate to items
         items_list = _find_items_in_data(data)
         if items_list:
-            return _parse_items(items_list)
+            return _parse_html_items(items_list)
     except Exception as e:
         logger.debug("__initialData__ parse error: %s", e)
-
     return None
 
 
 def _extract_from_preloaded_state(html: str) -> list[AvitoItem] | None:
-    """Extract from window.__preloadedState__ = {...};"""
     match = re.search(r'window\.__preloadedState__\s*=\s*({.+?})\s*;', html, re.DOTALL)
     if not match:
         return None
-
     try:
         data = json.loads(match.group(1))
         items_list = _find_items_in_data(data)
         if items_list:
-            return _parse_items(items_list)
+            return _parse_html_items(items_list)
     except Exception as e:
         logger.debug("__preloadedState__ parse error: %s", e)
-
     return None
 
 
 def _extract_from_any_json(html: str) -> list[AvitoItem] | None:
-    """Try to find items array in any embedded JSON."""
-    # Look for "items":[ pattern
     for match in re.finditer(r'"items"\s*:\s*(\[\s*\{.+?\}\s*\])', html[:500000], re.DOTALL):
         try:
             items_data = json.loads(match.group(1))
             if len(items_data) >= 3:
-                items = _parse_items(items_data)
+                items = _parse_html_items(items_data)
                 if items:
                     return items
         except Exception:
@@ -167,11 +477,8 @@ def _extract_from_any_json(html: str) -> list[AvitoItem] | None:
 
 
 def _find_items_in_data(data: dict) -> list | None:
-    """Recursively find items array in nested data structure."""
     if not isinstance(data, dict):
         return None
-
-    # Direct keys
     for key in ["items", "catalog", "results"]:
         val = data.get(key)
         if isinstance(val, list) and len(val) >= 1:
@@ -180,26 +487,21 @@ def _find_items_in_data(data: dict) -> list | None:
             sub = val.get("items") or val.get("list")
             if isinstance(sub, list) and len(sub) >= 1:
                 return sub
-
-    # Search one level deep
     for key, val in data.items():
         if isinstance(val, dict):
             for subkey in ["items", "catalog", "results", "list"]:
                 sub = val.get(subkey)
                 if isinstance(sub, list) and len(sub) >= 1:
                     return sub
-
     return None
 
 
-def _parse_items(items_data: list) -> list[AvitoItem]:
-    """Parse items from JSON data."""
+def _parse_html_items(items_data: list) -> list[AvitoItem]:
+    """Parse items from HTML-embedded JSON (same as old _parse_items)."""
     items = []
     for item in items_data:
         if not isinstance(item, dict):
             continue
-
-        # Handle "value" wrapper
         if "value" in item and isinstance(item["value"], dict):
             item = item["value"]
 
@@ -209,7 +511,6 @@ def _parse_items(items_data: list) -> list[AvitoItem]:
 
         title = item.get("title", item.get("name", "Без названия"))
 
-        # Price
         price_info = item.get("priceDetailed", item.get("price", {}))
         if isinstance(price_info, dict):
             price = price_info.get("string", price_info.get("value", ""))
@@ -221,13 +522,11 @@ def _parse_items(items_data: list) -> list[AvitoItem]:
         else:
             price = str(price_info) if price_info else "Цена не указана"
 
-        # URL
         url_path = item.get("urlPath", item.get("url", ""))
         if url_path and "?" in url_path:
             url_path = url_path.split("?")[0]
         item_url = f"https://www.avito.ru{url_path}" if url_path and not url_path.startswith("http") else url_path
 
-        # Image
         images = item.get("images", item.get("photos", []))
         image_url = None
         if images:
@@ -242,7 +541,6 @@ def _parse_items(items_data: list) -> list[AvitoItem]:
                     or images[0].get("src")
                 )
 
-        # Location
         loc = item.get("location", item.get("address", item.get("geo", "")))
         if isinstance(loc, dict):
             location = loc.get("name", loc.get("formattedAddress", ""))
@@ -251,7 +549,6 @@ def _parse_items(items_data: list) -> list[AvitoItem]:
         else:
             location = ""
 
-        # Description
         desc = item.get("description", "")
         if isinstance(desc, dict):
             desc = desc.get("text", desc.get("value", ""))
@@ -267,5 +564,4 @@ def _parse_items(items_data: list) -> list[AvitoItem]:
             location=location or None,
             description=desc or None,
         ))
-
     return items

@@ -122,19 +122,6 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
 
     while not stop_event.is_set():
         try:
-            # Rotate IP before each cycle
-            if config.proxy_rotate_url:
-                try:
-                    import aiohttp as _aiohttp
-                    timeout = _aiohttp.ClientTimeout(total=15)
-                    async with _aiohttp.ClientSession(timeout=timeout) as _sess:
-                        async with _sess.get(config.proxy_rotate_url) as _resp:
-                            if _resp.status == 200:
-                                logger.info("IP rotated")
-                            await asyncio.sleep(5)
-                except Exception as e:
-                    logger.warning("IP rotation failed: %s", e)
-
             subs = await db.get_active_subscriptions()
             if subs:
                 # Deduplicate: group subscriptions by URL, parse each URL once
