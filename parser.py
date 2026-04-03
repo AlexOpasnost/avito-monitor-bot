@@ -143,17 +143,15 @@ def _get_session(proxy: str | None) -> cloudscraper.CloudScraper:
     return scraper
 
 
-def _is_blocked(html: str, status_code: int) -> bool:
-    """Check if Avito blocked the request."""
+def _is_blocked(html: str, status_code: int) -> tuple[bool, str]:
+    """Check if Avito blocked the request. Returns (blocked, reason)."""
     if status_code in (403, 429):
-        return True
+        return (True, f"HTTP {status_code}")
     html_lower = html.lower() if html else ""
-    return (
-        "captcha" in html_lower
-        or "проблема с ip" in html_lower
-        or "доступ ограничен" in html_lower
-        or "geetest" in html_lower
-    )
+    for keyword in ["captcha", "проблема с ip", "доступ ограничен", "geetest"]:
+        if keyword in html_lower:
+            return (True, f"keyword '{keyword}'")
+    return (False, "")
 
 
 async def parse_listings(url: str, max_retries: int = 3) -> list[AvitoItem] | None:
@@ -212,11 +210,14 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
 
         html = resp.text or ""
 
-        if _is_blocked(html, resp.status_code):
+        blocked, reason = _is_blocked(html, resp.status_code)
+        if blocked:
             title_match = re.search(r'<title>([^<]+)</title>', html)
             title = title_match.group(1) if title_match else "?"
-            logger.warning("Blocked (HTTP %d) title='%s' cookies=%d",
-                           resp.status_code, title[:50], len(scraper.cookies))
+            # Log first 500 chars to understand what Avito returns
+            preview = html[:500].replace('\n', ' ').replace('\r', '')
+            logger.warning("Blocked (HTTP %d) reason=%s title='%s' cookies=%d preview='%s'",
+                           resp.status_code, reason, title[:50], len(scraper.cookies), preview)
             return (None, True)
 
         if resp.status_code != 200:
