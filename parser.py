@@ -467,26 +467,37 @@ def _find_items_in_data(data: dict) -> list | None:
     return None
 
 
+def _is_real_listing(item: dict) -> bool:
+    """Check if a dict looks like a real Avito listing (not a category/nav item).
+    Real listings have: id + (urlPath or price or images)."""
+    if "value" in item and isinstance(item["value"], dict):
+        item = item["value"]
+    has_id = "id" in item or "itemId" in item
+    has_url = bool(item.get("urlPath"))
+    has_price = "price" in item or "priceDetailed" in item
+    has_images = bool(item.get("images") or item.get("photos"))
+    # Must have ID and at least one listing-specific field
+    return has_id and (has_url or has_price or has_images)
+
+
 def _deep_find_items(data, depth: int = 0, max_depth: int = 8) -> list | None:
     """Recursively search for items array in nested data (up to max_depth)."""
     if depth > max_depth:
         return None
 
     if isinstance(data, dict):
-        # Check if this dict looks like an item (has id + title)
         if "id" in data and ("title" in data or "name" in data):
-            return None  # This is a single item, not a list
+            return None  # Single item, not a list
 
         for key in ["items", "catalog", "results", "list", "mainItems", "snippets"]:
             val = data.get(key)
-            if isinstance(val, list) and len(val) >= 1:
-                # Verify it looks like items (first element has id)
-                first = val[0]
-                if isinstance(first, dict):
-                    inner = first.get("value", first) if "value" in first else first
-                    if isinstance(inner, dict) and ("id" in inner or "itemId" in inner):
-                        logger.debug("Found items at depth=%d key='%s' count=%d", depth, key, len(val))
-                        return val
+            if isinstance(val, list) and len(val) >= 3:
+                # Check that first items look like real listings
+                sample = val[:3]
+                real_count = sum(1 for v in sample if isinstance(v, dict) and _is_real_listing(v))
+                if real_count >= 2:
+                    logger.info("Found listings at depth=%d key='%s' count=%d", depth, key, len(val))
+                    return val
 
         # Recurse into dict values
         for key, val in data.items():
@@ -495,18 +506,27 @@ def _deep_find_items(data, depth: int = 0, max_depth: int = 8) -> list | None:
                 return result
 
     elif isinstance(data, list) and len(data) >= 3:
-        # Check if this list itself contains items
-        first = data[0]
-        if isinstance(first, dict):
-            inner = first.get("value", first) if "value" in first else first
-            if isinstance(inner, dict) and ("id" in inner or "itemId" in inner):
-                return data
+        sample = data[:3]
+        real_count = sum(1 for v in sample if isinstance(v, dict) and _is_real_listing(v))
+        if real_count >= 2:
+            return data
 
     return None
 
 
 def _parse_items(items_data: list) -> list[AvitoItem]:
     """Parse items from JSON data."""
+    # Log first item structure for debugging
+    if items_data:
+        first = items_data[0]
+        if isinstance(first, dict) and "value" in first:
+            first = first["value"]
+        if isinstance(first, dict):
+            logger.info("First item keys: %s", list(first.keys())[:15])
+            logger.info("First item sample: id=%s title=%s urlPath=%s price=%s",
+                        first.get("id"), str(first.get("title", ""))[:30],
+                        str(first.get("urlPath", ""))[:50], first.get("priceDetailed") or first.get("price"))
+
     items = []
     for item in items_data:
         if not isinstance(item, dict):
