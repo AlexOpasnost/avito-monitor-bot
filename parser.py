@@ -144,13 +144,36 @@ def _get_session(proxy: str | None) -> cloudscraper.CloudScraper:
 
 
 def _is_blocked(html: str, status_code: int) -> tuple[bool, str]:
-    """Check if Avito blocked the request. Returns (blocked, reason)."""
+    """Check if Avito blocked the request. Returns (blocked, reason).
+
+    Important: normal Avito pages (~1MB) contain 'captcha' in JS scripts.
+    Real block pages are small (<50KB) with specific titles.
+    """
     if status_code in (403, 429):
         return (True, f"HTTP {status_code}")
-    html_lower = html.lower() if html else ""
-    for keyword in ["captcha", "проблема с ip", "доступ ограничен", "geetest"]:
-        if keyword in html_lower:
-            return (True, f"keyword '{keyword}'")
+
+    if not html:
+        return (False, "")
+
+    # Extract title for precise check
+    title_match = re.search(r'<title>([^<]*)</title>', html[:5000], re.IGNORECASE)
+    title = title_match.group(1).lower() if title_match else ""
+
+    # Block page has specific title
+    if "доступ ограничен" in title or "проблема с ip" in title:
+        return (True, f"title '{title[:50]}'")
+
+    # Only check keywords on small pages (real block pages are <50KB)
+    # Normal Avito search pages are 500KB-2MB
+    if len(html) < 50000:
+        html_lower = html.lower()
+        for keyword in ["geetest", "проблема с ip", "доступ ограничен"]:
+            if keyword in html_lower:
+                return (True, f"small page + keyword '{keyword}'")
+        # Check captcha only in title or very small pages
+        if len(html) < 10000 and "captcha" in html_lower:
+            return (True, "captcha on tiny page")
+
     return (False, "")
 
 
