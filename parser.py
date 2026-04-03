@@ -261,6 +261,11 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
             logger.info("Extracted %d items from __preloadedState__", len(items))
             return (items, False)
 
+        items = _extract_from_mfe(html)
+        if items is not None:
+            logger.info("Extracted %d items from __mfe__", len(items))
+            return (items, False)
+
         items = _extract_from_any_json(html)
         if items is not None:
             logger.info("Extracted %d items from embedded JSON", len(items))
@@ -269,9 +274,17 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
         # Debug: log what's on the page
         json_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
         title_match = re.search(r'<title>([^<]+)</title>', html)
-        logger.info("No items found. size=%d, vars=%s, title=%s",
+        # Sample some data keys for debugging
+        sample = ""
+        for var_name in json_vars[:3]:
+            m = re.search(rf'window\.{var_name}\s*=\s*', html)
+            if m:
+                snippet = html[m.end():m.end()+200]
+                sample += f" {var_name}={snippet[:100]}..."
+        logger.info("No items found. size=%d, vars=%s, title=%s, sample=%s",
                      len(html), json_vars[:5],
-                     title_match.group(1)[:60] if title_match else "?")
+                     title_match.group(1)[:60] if title_match else "?",
+                     sample[:300])
 
         return ([], False)
 
@@ -298,16 +311,82 @@ def _extract_from_initial_data(html: str) -> list[AvitoItem] | None:
 
 
 def _extract_from_preloaded_state(html: str) -> list[AvitoItem] | None:
-    match = re.search(r'window\.__preloadedState__\s*=\s*({.+?})\s*;', html, re.DOTALL)
+    # Find start of JSON after __preloadedState__ =
+    match = re.search(r'window\.__preloadedState__\s*=\s*', html)
     if not match:
         return None
     try:
-        data = json.loads(match.group(1))
+        json_str = _extract_json_object(html, match.end())
+        if not json_str:
+            return None
+        data = json.loads(json_str)
+        logger.debug("__preloadedState__ keys: %s", list(data.keys())[:10])
         items_list = _find_items_in_data(data)
         if items_list:
             return _parse_items(items_list)
+        # Try deeper search
+        items_list = _deep_find_items(data)
+        if items_list:
+            return _parse_items(items_list)
     except Exception as e:
-        logger.debug("__preloadedState__ parse error: %s", e)
+        logger.warning("__preloadedState__ parse error: %s", e)
+    return None
+
+
+def _extract_from_mfe(html: str) -> list[AvitoItem] | None:
+    """Extract items from window.__mfe__ (modern Avito micro-frontend data)."""
+    match = re.search(r'window\.__mfe__\s*=\s*', html)
+    if not match:
+        return None
+    try:
+        json_str = _extract_json_object(html, match.end())
+        if not json_str:
+            return None
+        data = json.loads(json_str)
+        logger.debug("__mfe__ keys: %s", list(data.keys())[:10])
+        # __mfe__ has different structure — search recursively
+        items_list = _deep_find_items(data)
+        if items_list:
+            return _parse_items(items_list)
+    except Exception as e:
+        logger.warning("__mfe__ parse error: %s", e)
+    return None
+
+
+def _extract_json_object(html: str, start: int) -> str | None:
+    """Extract a complete JSON object starting at position `start` in html.
+    Uses bracket counting instead of regex to handle nested objects correctly."""
+    if start >= len(html) or html[start] != '{':
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+
+    # Limit scan to 10MB to avoid infinite loop
+    end_limit = min(len(html), start + 10_000_000)
+
+    while i < end_limit:
+        ch = html[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            i += 1
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return html[start:i + 1]
+        i += 1
     return None
 
 
@@ -341,6 +420,44 @@ def _find_items_in_data(data: dict) -> list | None:
                 sub = val.get(subkey)
                 if isinstance(sub, list) and len(sub) >= 1:
                     return sub
+    return None
+
+
+def _deep_find_items(data, depth: int = 0, max_depth: int = 8) -> list | None:
+    """Recursively search for items array in nested data (up to max_depth)."""
+    if depth > max_depth:
+        return None
+
+    if isinstance(data, dict):
+        # Check if this dict looks like an item (has id + title)
+        if "id" in data and ("title" in data or "name" in data):
+            return None  # This is a single item, not a list
+
+        for key in ["items", "catalog", "results", "list", "mainItems", "snippets"]:
+            val = data.get(key)
+            if isinstance(val, list) and len(val) >= 1:
+                # Verify it looks like items (first element has id)
+                first = val[0]
+                if isinstance(first, dict):
+                    inner = first.get("value", first) if "value" in first else first
+                    if isinstance(inner, dict) and ("id" in inner or "itemId" in inner):
+                        logger.debug("Found items at depth=%d key='%s' count=%d", depth, key, len(val))
+                        return val
+
+        # Recurse into dict values
+        for key, val in data.items():
+            result = _deep_find_items(val, depth + 1, max_depth)
+            if result:
+                return result
+
+    elif isinstance(data, list) and len(data) >= 3:
+        # Check if this list itself contains items
+        first = data[0]
+        if isinstance(first, dict):
+            inner = first.get("value", first) if "value" in first else first
+            if isinstance(inner, dict) and ("id" in inner or "itemId" in inner):
+                return data
+
     return None
 
 
