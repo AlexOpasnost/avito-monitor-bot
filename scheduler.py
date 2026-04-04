@@ -11,13 +11,27 @@ from config import config
 logger = logging.getLogger(__name__)
 
 
+def _clean_url(url: str) -> str:
+    """Ensure URL is valid for Telegram buttons."""
+    if not url:
+        return "https://www.avito.ru"
+    if not url.startswith("http"):
+        url = "https://www.avito.ru" + url
+    # Remove query params
+    if "?" in url:
+        url = url.split("?")[0]
+    return url
+
+
 def format_notification(item: AvitoItem) -> str:
     """Format item notification — AvtoRinger style."""
+    url = _clean_url(item.url)
+
     lines = []
     lines.append(f"<b>{item.title}</b>")
     lines.append(f"💰 <b>{item.price}</b>")
 
-    # Stats: views + seller rating
+    # Stats line
     stats = []
     if item.views:
         stats.append(f"👁 {item.views}")
@@ -29,13 +43,15 @@ def format_notification(item: AvitoItem) -> str:
     if item.location:
         lines.append(f"📍 {item.location}")
 
-    lines.append(f"🔗 {item.url}")
+    lines.append(f"🔗 <a href=\"{url}\">{url.split('/')[-1][:40]}</a>")
 
     if item.description:
         lines.append(f"\n<i>{item.description}</i>")
 
     if item.seller_name:
-        lines.append(f"\n👤 {item.seller_name}")
+        seller = item.seller_name
+        if seller.lower() not in ("подписаться", "профиль"):
+            lines.append(f"👤 {seller}")
 
     if item.published_date:
         lines.append(f"📅 {item.published_date}")
@@ -44,8 +60,9 @@ def format_notification(item: AvitoItem) -> str:
 
 
 def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
+    url = _clean_url(item.url)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=item.url)],
+        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=url)],
     ])
 
 

@@ -647,6 +647,18 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
                 raw_date = date_text_match.group(1).strip()
                 item.published_date = _convert_relative_date(raw_date, msk)
 
+        # 5. Broader search: any "DD month в HH:MM" or "Сегодня/Вчера в HH:MM" on page
+        if not item.published_date:
+            for pattern in [
+                r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+в\s+\d{1,2}:\d{2})',
+                r'([Сс]егодня\s+в\s+\d{1,2}:\d{2})',
+                r'([Вв]чера\s+в\s+\d{1,2}:\d{2})',
+            ]:
+                m = re.search(pattern, html)
+                if m:
+                    item.published_date = _convert_relative_date(m.group(1).strip(), msk)
+                    break
+
         # Description
         desc_match = re.search(r'data-marker="item-view/item-description"[^>]*>(.*?)</div>', html, re.DOTALL)
         if not desc_match:
@@ -800,27 +812,20 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if desc_match:
             description = desc_match.group(1).strip()[:200]
 
-        # Date — extract from multiple sources
-        pub_date = None
-        # 1. ISO datetime from <time> tag
-        date_match = re.search(r'<time[^>]*datetime="([^"]+)"', block)
-        if date_match:
-            try:
-                from datetime import datetime as dt, timezone as tz, timedelta
-                iso = date_match.group(1).strip()
-                msk = tz(timedelta(hours=3))
-                parsed = dt.fromisoformat(iso.replace("Z", "+00:00"))
-                pub_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
-            except Exception:
-                pub_date = date_match.group(1)
-        # 2. Text inside item-date marker (any text — "Вчера", "4 апреля", etc)
-        if not pub_date:
-            date_container = re.search(r'data-marker="item-date[^"]*"(.*?)</div>', block, re.DOTALL)
-            if date_container:
-                date_texts = re.findall(r'>([^<]+)<', date_container.group(1))
-                date_str = " ".join(t.strip() for t in date_texts if t.strip())
-                if date_str:
-                    pub_date = date_str
+        # Date from listing + age filter
+        listing_date = None
+        date_container = re.search(r'data-marker="item-date[^"]*"(.*?)</div>', block, re.DOTALL)
+        if date_container:
+            date_texts = re.findall(r'>([^<]+)<', date_container.group(1))
+            listing_date = " ".join(t.strip() for t in date_texts if t.strip())
+
+        # Skip items 2+ days old
+        if listing_date:
+            days_match = re.search(r'(\d+)\s*(?:день|дня|дней)', listing_date)
+            if days_match and int(days_match.group(1)) >= 2:
+                continue
+            if re.search(r'(?:недел|месяц|год)', listing_date):
+                continue
 
         items.append(AvitoItem(
             avito_id=avito_id,
