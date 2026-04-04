@@ -736,9 +736,37 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
 
 
 def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
-    """Extract items from HTML by splitting on data-item-id blocks."""
-    # Find all item IDs
-    id_matches = list(re.finditer(r'data-item-id="(\d+)"', html))
+    """Extract items from HTML by splitting on data-item-id blocks.
+    Only parses items from the search results container (catalog-serp),
+    ignoring 'recommended' and 'similar' sections below."""
+
+    # Limit to search results container — ignore recommendations
+    serp_match = re.search(r'data-marker="catalog-serp"', html)
+    if serp_match:
+        # Find the end of the serp container (next major section)
+        serp_start = serp_match.start()
+        # Look for recommendation/similar sections that follow
+        serp_end = len(html)
+        for end_marker in [
+            'data-marker="recommended',
+            'data-marker="similar',
+            'data-marker="catalog-rubricator"',
+            'Похожие объявления',
+            'Рекомендуем посмотреть',
+            'Вы недавно смотрели',
+        ]:
+            pos = html.find(end_marker, serp_start + 100)
+            if pos != -1 and pos < serp_end:
+                serp_end = pos
+        search_html = html[serp_start:serp_end]
+        logger.info("SERP container: %d chars (full page: %d)", len(search_html), len(html))
+    else:
+        # Fallback: use first 60% of page (results are at top, recommendations at bottom)
+        search_html = html[:int(len(html) * 0.6)]
+        logger.info("No catalog-serp marker, using first 60%% of page")
+
+    # Find all item IDs within search results only
+    id_matches = list(re.finditer(r'data-item-id="(\d+)"', search_html))
     if len(id_matches) < 3:
         return None
 
@@ -751,7 +779,7 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         # Extract block: from this data-item-id to the next one (or +5000 chars)
         start = match.start()
         end = id_matches[i + 1].start() if i + 1 < len(id_matches) else start + 5000
-        block = html[start:end]
+        block = search_html[start:end]
 
         # Title + URL — from link with title attribute containing the item name
         title = "Объявление"
