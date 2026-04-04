@@ -281,9 +281,13 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
                            resp.status_code, reason, title[:50], len(scraper.cookies), preview)
             return (None, True)
 
+        if resp.status_code in (301, 302, 303, 307, 308):
+            logger.warning("HTTP %d (redirect — likely blocked) for %s", resp.status_code, url[:60])
+            return (None, True)  # Treat redirects as blocks — Avito redirects to captcha
+
         if resp.status_code != 200:
             logger.warning("HTTP %d for %s", resp.status_code, url[:60])
-            return (None, False)
+            return (None, True)  # Any non-200 = blocked, trigger IP rotation
 
         logger.info("Page loaded: HTTP %d, size=%d, cookies=%d",
                      resp.status_code, len(html), len(scraper.cookies))
