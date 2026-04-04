@@ -485,28 +485,36 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         end = id_matches[i + 1].start() if i + 1 < len(id_matches) else start + 5000
         block = html[start:end]
 
-        # Title — data-marker="item-title"
+        # Title + URL — from link with title attribute containing the item name
         title = "Объявление"
         url_path = None
-        title_match = re.search(r'data-marker="item-title"[^>]*>.*?href="([^"]*)"[^>]*>([^<]+)<', block, re.DOTALL)
-        if not title_match:
-            title_match = re.search(r'data-marker="item-title"[^>]*title="([^"]*)"[^>]*href="([^"]*)"', block)
-            if title_match:
-                title = title_match.group(1).strip()
-                url_path = title_match.group(2)
-        if title_match and not url_path:
+
+        # Best: link inside item-title marker with title attr
+        title_match = re.search(r'data-marker="item-title"[^>]*>.*?href="([^"]*)"[^>]*?title="([^"]*)"', block, re.DOTALL)
+        if title_match:
             url_path = title_match.group(1)
             title = title_match.group(2).strip()
 
-        # Fallback: any link with the avito_id in href
+        # Alt: link with title attr that contains the avito_id in href
+        if not title_match:
+            title_match = re.search(rf'href="(/[^"]*{avito_id}[^"]*)"[^>]*?title="([^"]*)"', block)
+            if title_match:
+                url_path = title_match.group(1)
+                title = title_match.group(2).strip()
+
+        # Alt: any link with a meaningful title attr (not "Добавить")
+        if title == "Объявление":
+            for t in re.finditer(r'title="([^"]{5,120})"', block):
+                t_text = t.group(1).strip()
+                if "избранное" not in t_text.lower() and "сравнение" not in t_text.lower() and "добавить" not in t_text.lower():
+                    title = t_text
+                    break
+
+        # URL fallback: any link with the avito_id
         if not url_path:
             url_match = re.search(rf'href="(/[^"]*?{avito_id}[^"]*?)"', block)
             if url_match:
                 url_path = url_match.group(1)
-            # Also try getting title from any link with title attr
-            t_match = re.search(r'title="([^"]{5,80})"', block)
-            if t_match:
-                title = t_match.group(1).strip()
 
         # Clean URL — remove tracking query params
         if url_path and "?" in url_path:
