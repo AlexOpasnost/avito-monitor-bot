@@ -493,6 +493,23 @@ def _extract_json_object(html: str, start: int) -> str | None:
     return None
 
 
+def _truncate_description(text: str, max_len: int = 300) -> str:
+    """Truncate description at last sentence boundary within max_len."""
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    # Try to cut at last sentence end
+    for sep in ['. ', '! ', '? ', '\n']:
+        pos = truncated.rfind(sep)
+        if pos > max_len // 3:
+            return truncated[:pos + 1].strip()
+    # Cut at last space
+    pos = truncated.rfind(' ')
+    if pos > max_len // 3:
+        return truncated[:pos] + "..."
+    return truncated + "..."
+
+
 _MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
@@ -600,9 +617,10 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
         if len(html) < 10000:
             return item
 
-        # Exact publication date
+        # Exact publication date — ALWAYS overwrite listing date with detail page date
         from datetime import datetime as dt, timezone as tz, timedelta
         msk = tz(timedelta(hours=3))
+        detail_date = None  # Track separately, overwrite at end
 
         # 1. Unix timestamp in JSON: "time":1712345678 or "createTime":...
         ts_match = re.search(r'"(?:time|createTime|sortTimeStamp|publishDate)"\s*:\s*(\d{10,13})', html)
@@ -612,43 +630,43 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
                 if ts > 1_000_000_000_000:  # milliseconds
                     ts = ts // 1000
                 parsed = dt.fromtimestamp(ts, msk)
-                item.published_date = parsed.strftime("%H:%M:%S %d.%m.%Y")
+                detail_date = parsed.strftime("%H:%M:%S %d.%m.%Y")
             except Exception:
                 pass
 
         # 2. ISO date in JSON: "datePublished":"2026-..."
-        if not item.published_date:
+        if not detail_date:
             iso_match = re.search(r'"(?:datePublished|date|createdAt|created)"\s*:\s*"(20\d{2}-\d{2}-\d{2}[T ]\d{2}:\d{2}[^"]*)"', html)
             if iso_match:
                 try:
                     raw = iso_match.group(1).strip()
                     parsed = dt.fromisoformat(raw.replace("Z", "+00:00"))
-                    item.published_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+                    detail_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
                 except Exception:
                     pass
 
         # 3. <time datetime="...">
-        if not item.published_date:
+        if not detail_date:
             time_match = re.search(r'<time[^>]*datetime="([^"]+)"', html)
             if time_match:
                 try:
                     parsed = dt.fromisoformat(time_match.group(1).replace("Z", "+00:00"))
-                    item.published_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+                    detail_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
                 except Exception:
                     pass
 
         # 4. Text near item ID: "№ 8109418734 · 26 марта в 18:17"
-        if not item.published_date:
+        if not detail_date:
             date_text_match = re.search(
                 rf'№\s*{re.escape(item.avito_id)}[^<]*?·\s*([^·<]+?)(?:\s*·|\s*<)',
                 html
             )
             if date_text_match:
                 raw_date = date_text_match.group(1).strip()
-                item.published_date = _convert_relative_date(raw_date, msk)
+                detail_date = _convert_relative_date(raw_date, msk)
 
         # 5. Broader search: any "DD month в HH:MM" or "Сегодня/Вчера в HH:MM" on page
-        if not item.published_date:
+        if not detail_date:
             for pattern in [
                 r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+в\s+\d{1,2}:\d{2})',
                 r'([Сс]егодня\s+в\s+\d{1,2}:\d{2})',
@@ -656,8 +674,12 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
             ]:
                 m = re.search(pattern, html)
                 if m:
-                    item.published_date = _convert_relative_date(m.group(1).strip(), msk)
+                    detail_date = _convert_relative_date(m.group(1).strip(), msk)
                     break
+
+        # Overwrite with detail page date (more accurate than listing)
+        if detail_date:
+            item.published_date = detail_date
 
         # Description
         desc_match = re.search(r'data-marker="item-view/item-description"[^>]*>(.*?)</div>', html, re.DOTALL)
@@ -668,7 +690,7 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
             desc_text = re.sub(r'<[^>]+>', ' ', desc_match.group(1))
             desc_text = re.sub(r'\s+', ' ', desc_text).strip()
             if desc_text and len(desc_text) > 5:
-                item.description = desc_text[:300]
+                item.description = _truncate_description(desc_text)
 
         # Views
         views_match = re.search(r'data-marker="item-view/total-views"[^>]*>([^<]+)<', html)
@@ -815,7 +837,7 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         # Try data-marker="item-description" first (may not exist on list view)
         desc_match = re.search(r'data-marker="item-description"[^>]*>([^<]{5,})<', block)
         if desc_match:
-            description = desc_match.group(1).strip()[:200]
+            description = _truncate_description(desc_match.group(1).strip())
 
         # Date from listing + age filter
         listing_date = None
