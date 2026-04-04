@@ -555,39 +555,21 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
                 except Exception:
                     pass
 
-        # 4. Search __initialData__ on item page for timestamp
+        # 4. Text near item ID: "№ 8109418734 · 26 марта в 18:17"
         if not item.published_date:
-            init_match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
-            if init_match:
-                try:
-                    init_raw = unquote(init_match.group(1))
-                    # Search for timestamp patterns in decoded JSON
-                    for ts_key in ["time", "createTime", "sortTimeStamp", "publish"]:
-                        ts_find = re.search(rf'"{ts_key}"\s*:\s*(\d{{10,13}})', init_raw)
-                        if ts_find:
-                            ts_val = int(ts_find.group(1))
-                            if ts_val > 1_000_000_000_000:
-                                ts_val = ts_val // 1000
-                            parsed = dt.fromtimestamp(ts_val, msk)
-                            item.published_date = parsed.strftime("%H:%M:%S %d.%m.%Y")
-                            break
-                except Exception as e:
-                    logger.debug("__initialData__ date parse error: %s", e)
-
-        # 5. Log if date still not found (debug — first item only)
-        if not item.published_date:
-            # Find any 10-digit number that looks like a timestamp (2024-2027)
-            for ts_candidate in re.finditer(r'(\d{10})', html[:500000]):
-                val = int(ts_candidate.group(1))
-                if 1700000000 < val < 1800000000:  # 2023-2027
-                    try:
-                        parsed = dt.fromtimestamp(val, msk)
-                        item.published_date = parsed.strftime("%H:%M:%S %d.%m.%Y")
-                        logger.info("Found timestamp %d → %s in page for %s",
-                                    val, item.published_date, item.avito_id)
-                        break
-                    except Exception:
-                        pass
+            # Pattern: date text after item number, like "26 марта в 18:17" or "Вчера в 12:30"
+            date_text_match = re.search(
+                rf'№\s*{re.escape(item.avito_id)}[^<]*?·\s*([^·<]+?)(?:\s*·|\s*<)',
+                html
+            )
+            if not date_text_match:
+                # Alt: any "DD month в HH:MM" pattern
+                date_text_match = re.search(
+                    r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(?:в\s+)?\d{1,2}:\d{2})',
+                    html
+                )
+            if date_text_match:
+                item.published_date = date_text_match.group(1).strip()
 
         # Description
         desc_match = re.search(r'data-marker="item-view/item-description"[^>]*>(.*?)</div>', html, re.DOTALL)
