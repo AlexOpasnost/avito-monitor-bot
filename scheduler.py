@@ -30,8 +30,8 @@ def format_notification(item: AvitoItem) -> str:
     if item.description:
         lines.append(f"\n{item.description}")
 
-    date_str = item.published_date or now
-    lines.append(f"\n📅 {date_str}")
+    if item.published_date:
+        lines.append(f"\n📅 {item.published_date}")
 
     return "\n".join(lines)
 
