@@ -315,11 +315,24 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
         scraper = _get_session(proxy)
         proxies = _make_proxies(proxy)
 
+        # Log the URL being fetched (verify f= param preserved)
+        has_f = "f=" in url
+        logger.info("Fetching: %s (f= param: %s)", url[:120], "YES" if has_f else "NO")
+
         resp = scraper.get(
             url,
             proxies=proxies,
             timeout=60,
+            allow_redirects=False,  # Don't follow redirects that might strip params
         )
+
+        # If redirect, log where it goes
+        if resp.status_code in (301, 302, 303, 307):
+            redirect_url = resp.headers.get("Location", "?")
+            logger.warning("Redirect %d → %s (f= in redirect: %s)",
+                          resp.status_code, redirect_url[:120],
+                          "YES" if "f=" in redirect_url else "NO — FILTERS LOST!")
+            return (None, True)
 
         html = resp.text or ""
 
@@ -341,8 +354,10 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
             logger.warning("HTTP %d for %s", resp.status_code, url[:60])
             return (None, True)  # Any non-200 = blocked, trigger IP rotation
 
-        logger.info("Page loaded: HTTP %d, size=%d, cookies=%d",
-                     resp.status_code, len(html), len(scraper.cookies))
+        title_match = re.search(r'<title>([^<]+)</title>', html)
+        page_title = title_match.group(1)[:80] if title_match else "?"
+        logger.info("Page loaded: HTTP %d, size=%d, cookies=%d, title='%s'",
+                     resp.status_code, len(html), len(scraper.cookies), page_title)
 
         # Try to extract items from embedded JSON
         items = _extract_from_initial_data(html)
