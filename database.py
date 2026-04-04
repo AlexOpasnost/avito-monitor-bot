@@ -133,6 +133,17 @@ class Database:
             ON subscriptions(is_active) WHERE is_active = TRUE""")
         await conn.execute("""CREATE INDEX IF NOT EXISTS idx_sent_items_lookup
             ON sent_items(subscription_id, avito_id)""")
+        # Add deleted column if not exists (for stop/resume vs delete distinction)
+        try:
+            await conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE"
+            )
+            # Mark all currently inactive subs as deleted (legacy cleanup)
+            await conn.execute(
+                "UPDATE subscriptions SET deleted = TRUE WHERE is_active = FALSE AND deleted = FALSE"
+            )
+        except Exception:
+            pass
         logger.info("Tables created successfully")
 
     # --- Users ---
@@ -172,7 +183,8 @@ class Database:
         async def _op(conn):
             return await conn.fetch(
                 "SELECT id, url, is_active, created_at, last_checked_at, error_count "
-                "FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC",
+                "FROM subscriptions WHERE user_id = $1 AND deleted = FALSE "
+                "ORDER BY created_at DESC",
                 user_id,
             )
         return await self._execute(_op)
@@ -195,9 +207,10 @@ class Database:
         return await self._execute(_op)
 
     async def deactivate_subscription(self, sub_id: int):
+        """Mark subscription as deleted (won't be restored by /start)."""
         async def _op(conn):
             await conn.execute(
-                "UPDATE subscriptions SET is_active = FALSE WHERE id = $1", sub_id
+                "UPDATE subscriptions SET is_active = FALSE, deleted = TRUE WHERE id = $1", sub_id
             )
         await self._execute(_op)
 
@@ -210,14 +223,13 @@ class Database:
         await self._execute(_op)
 
     async def reactivate_all(self, user_id: int) -> int:
-        """Reactivate all paused subscriptions. Returns count reactivated."""
+        """Reactivate paused (not deleted) subscriptions. Returns count."""
         async def _op(conn):
             result = await conn.execute(
                 "UPDATE subscriptions SET is_active = TRUE, error_count = 0 "
-                "WHERE user_id = $1 AND is_active = FALSE",
+                "WHERE user_id = $1 AND is_active = FALSE AND deleted = FALSE",
                 user_id,
             )
-            # Extract count from "UPDATE N"
             return int(result.split()[-1])
         return await self._execute(_op)
 
