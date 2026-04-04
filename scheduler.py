@@ -5,7 +5,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from database import db
-from parser import parse_listings, AvitoItem
+from parser import parse_listings, enrich_item, AvitoItem
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -13,25 +13,32 @@ logger = logging.getLogger(__name__)
 
 def format_notification(item: AvitoItem) -> str:
     """Format item notification — AvtoRinger style."""
-    from datetime import datetime, timezone, timedelta
-
-    msk = timezone(timedelta(hours=3))
-    now = datetime.now(msk).strftime("%H:%M %d.%m.%Y")
-
     lines = []
     lines.append(f"<b>{item.title}</b>")
-    lines.append(f"💰 {item.price}")
+    lines.append(f"💰 <b>{item.price}</b>")
+
+    # Stats: views + seller rating
+    stats = []
+    if item.views:
+        stats.append(f"👁 {item.views}")
+    if item.seller_rating:
+        stats.append(f"⭐ {item.seller_rating}")
+    if stats:
+        lines.append(" ".join(stats))
 
     if item.location:
         lines.append(f"📍 {item.location}")
 
-    lines.append(item.url)
+    lines.append(f"🔗 {item.url}")
 
     if item.description:
-        lines.append(f"\n{item.description}")
+        lines.append(f"\n<i>{item.description}</i>")
+
+    if item.seller_name:
+        lines.append(f"\n👤 {item.seller_name}")
 
     if item.published_date:
-        lines.append(f"\n📅 {item.published_date}")
+        lines.append(f"📅 {item.published_date}")
 
     return "\n".join(lines)
 
@@ -65,6 +72,10 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
         if not still_active2:
             logger.info("Sub #%d deactivated before send, stopping", sub_id)
             return
+
+        # Fetch full details from item page (date, description, views, seller)
+        item = await enrich_item(item)
+        await asyncio.sleep(1)  # Don't hammer Avito
 
         text = format_notification(item)
         keyboard = make_item_keyboard(item)

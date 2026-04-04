@@ -493,6 +493,97 @@ def _extract_json_object(html: str, start: int) -> str | None:
     return None
 
 
+async def enrich_item(item: AvitoItem) -> AvitoItem:
+    """Fetch individual item page to get full details: exact date, description, views, seller."""
+    proxy = _get_proxy()
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _fetch_item_details(item, proxy))
+        return result
+    except Exception as e:
+        logger.warning("Enrich failed for %s: %s", item.avito_id, e)
+        return item
+
+
+def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
+    """Fetch item detail page and extract rich info."""
+    try:
+        session = _get_or_create_session(proxy)
+        resp = session.get(item.url, proxies=_make_proxies(proxy), timeout=20)
+
+        if resp.status_code != 200:
+            return item
+
+        html = resp.text
+        if len(html) < 10000:
+            return item
+
+        # Exact publication date from <time datetime="...">
+        date_match = re.search(r'<time[^>]*datetime="([^"]+)"', html)
+        if date_match:
+            try:
+                from datetime import datetime as dt, timezone as tz, timedelta
+                iso = date_match.group(1).strip()
+                msk = tz(timedelta(hours=3))
+                parsed = dt.fromisoformat(iso.replace("Z", "+00:00"))
+                item.published_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+            except Exception:
+                pass
+
+        # Description
+        desc_match = re.search(r'data-marker="item-view/item-description"[^>]*>(.*?)</div>', html, re.DOTALL)
+        if not desc_match:
+            desc_match = re.search(r'itemprop="description"[^>]*>(.*?)</div>', html, re.DOTALL)
+        if desc_match:
+            # Strip HTML tags
+            desc_text = re.sub(r'<[^>]+>', ' ', desc_match.group(1))
+            desc_text = re.sub(r'\s+', ' ', desc_text).strip()
+            if desc_text and len(desc_text) > 5:
+                item.description = desc_text[:300]
+
+        # Views
+        views_match = re.search(r'data-marker="item-view/total-views"[^>]*>([^<]+)<', html)
+        if not views_match:
+            views_match = re.search(r'(\d+)\s*просмотр', html)
+        if views_match:
+            item.views = views_match.group(1).strip()
+
+        # Seller name
+        seller_match = re.search(r'data-marker="seller-info/name"[^>]*>.*?<a[^>]*>([^<]+)<', html, re.DOTALL)
+        if not seller_match:
+            seller_match = re.search(r'data-marker="seller-info/name"[^>]*>([^<]+)<', html)
+        if seller_match:
+            item.seller_name = seller_match.group(1).strip()
+
+        # Seller rating
+        rating_match = re.search(r'data-marker="seller-info/score"[^>]*>([^<]+)<', html)
+        if not rating_match:
+            rating_match = re.search(r'(\d[.,]\d)\s*<.*?(\d+)\s*отзыв', html, re.DOTALL)
+        if rating_match:
+            item.seller_rating = rating_match.group(1).strip()
+
+        # Location (more precise from detail page)
+        loc_match = re.search(r'data-marker="delivery/location"[^>]*>([^<]+)<', html)
+        if not loc_match:
+            loc_match = re.search(r'data-marker="item-view/item-address"[^>]*>([^<]+)<', html)
+        if not loc_match:
+            loc_match = re.search(r'class="style-item-address[^"]*"[^>]*>.*?>([^<]{3,60})<', html, re.DOTALL)
+        if loc_match:
+            item.location = loc_match.group(1).strip()
+
+        logger.info("Enriched %s: date=%s views=%s seller=%s desc=%d chars",
+                     item.avito_id,
+                     item.published_date or "-",
+                     item.views or "-",
+                     item.seller_name or "-",
+                     len(item.description) if item.description else 0)
+        return item
+
+    except Exception as e:
+        logger.warning("Detail fetch error for %s: %s", item.avito_id, e)
+        return item
+
+
 def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
     """Extract items from HTML by splitting on data-item-id blocks."""
     # Find all item IDs
