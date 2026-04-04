@@ -105,6 +105,8 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
                      sub_id, len(items))
         return
 
+    MAX_NEW_PER_CYCLE = 5  # Limit to avoid proxy overload
+
     new_count = 0
     for item in items:
         if not item.avito_id:
@@ -114,6 +116,10 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
         if already_sent:
             continue
 
+        if new_count >= MAX_NEW_PER_CYCLE:
+            # Mark remaining as seen, send on next cycles
+            break
+
         still_active = await db.is_subscription_active(sub_id)
         if not still_active:
             logger.info("Sub #%d deactivated, stopping", sub_id)
@@ -121,7 +127,7 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
 
         # Fetch full details from item page (date, description, views, seller)
         item = await enrich_item(item)
-        await asyncio.sleep(1)  # Don't hammer Avito
+        await asyncio.sleep(2)  # Don't hammer proxy
 
         # Skip items older than 2 days by actual publish date
         if item.published_date and _is_too_old(item.published_date, max_days=2):

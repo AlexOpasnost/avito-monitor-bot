@@ -228,10 +228,11 @@ class Database:
         await self._execute(_op)
 
     async def reactivate_all(self, user_id: int) -> int:
-        """Reactivate paused (not deleted) subscriptions. Returns count."""
+        """Reactivate paused (not deleted) subscriptions. Reset last_checked for first-scan."""
         async def _op(conn):
             result = await conn.execute(
-                "UPDATE subscriptions SET is_active = TRUE, error_count = 0 "
+                "UPDATE subscriptions SET is_active = TRUE, error_count = 0, "
+                "last_checked_at = NULL "
                 "WHERE user_id = $1 AND is_active = FALSE AND deleted = FALSE",
                 user_id,
             )
