@@ -28,6 +28,8 @@ class Database:
                     await self._create_tables_on_conn(conn)
                 else:
                     logger.info("Tables already exist")
+                # Always run migrations
+                await self._run_migrations(conn)
                 await conn.close()
                 break
             except Exception as e:
@@ -133,18 +135,21 @@ class Database:
             ON subscriptions(is_active) WHERE is_active = TRUE""")
         await conn.execute("""CREATE INDEX IF NOT EXISTS idx_sent_items_lookup
             ON sent_items(subscription_id, avito_id)""")
-        # Add deleted column if not exists (for stop/resume vs delete distinction)
+        logger.info("Tables created successfully")
+
+    async def _run_migrations(self, conn):
+        """Run schema migrations (safe to call multiple times)."""
         try:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE"
             )
-            # Mark all currently inactive subs as deleted (legacy cleanup)
+            # Mark all currently inactive subs as deleted (one-time cleanup)
             await conn.execute(
                 "UPDATE subscriptions SET deleted = TRUE WHERE is_active = FALSE AND deleted = FALSE"
             )
-        except Exception:
-            pass
-        logger.info("Tables created successfully")
+            logger.info("Migrations applied")
+        except Exception as e:
+            logger.debug("Migration note: %s", e)
 
     # --- Users ---
 

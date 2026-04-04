@@ -835,7 +835,7 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             image_url=image_url,
             location=location,
             description=description,
-            published_date=pub_date,
+            published_date=listing_date,
         ))
 
     # Log first item for debugging
