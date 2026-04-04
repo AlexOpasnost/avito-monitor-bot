@@ -213,11 +213,14 @@ def _is_blocked(html: str, status_code: int) -> tuple[bool, str]:
 
 
 def _extract_url_filters(url: str) -> dict:
-    """Extract explicit filters from Avito search URL query params."""
+    """Extract filters from Avito search URL (query params + f= decode)."""
     from urllib.parse import urlparse, parse_qs
+    import base64
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
     filters = {}
+
+    # Price from query params
     if "pmin" in qs:
         try:
             filters["pmin"] = int(qs["pmin"][0])
@@ -228,6 +231,37 @@ def _extract_url_filters(url: str) -> dict:
             filters["pmax"] = int(qs["pmax"][0])
         except ValueError:
             pass
+
+    # Decode f= parameter to find condition/brand filters
+    # Known value IDs from Avito:
+    # 5608890 = Новое с биркой, 5608889 = Новое, 5608888 = Б/у
+    f_param = qs.get("f", [None])[0]
+    if not f_param:
+        # Also check in URL path (ASgB... tokens)
+        for part in parsed.path.split("/"):
+            if part.startswith("ASg") or part.startswith("-ASg"):
+                token = part.lstrip("-")
+                if "f" not in filters:
+                    f_param = token
+
+    if f_param:
+        try:
+            # URL-safe base64 decode
+            padded = f_param + "=" * (4 - len(f_param) % 4)
+            raw = base64.urlsafe_b64decode(padded)
+            raw_hex = raw.hex()
+            # Check for known condition value IDs in binary
+            # 5608890 = 0x55962A (varint encoded)
+            if b'\xba\xab\xd6\x02' in raw:  # varint for 5608890
+                filters["condition"] = "Новое с биркой"
+            elif b'\xb9\xab\xd6\x02' in raw:  # 5608889
+                filters["condition"] = "Новое"
+        except Exception:
+            pass
+
+    if filters:
+        logger.info("URL filters: %s", filters)
+
     return filters
 
 
@@ -793,49 +827,26 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
         if loc_match:
             item.location = loc_match.group(1).strip()
 
-        # Extract item attributes (Состояние, Бренд, Размер, etc.)
+        # Extract item attributes from JSON on detail page
+        # Format: "Состояние"...{"attributeId":115539,...,"description":"Новое"}
         attrs = {}
-
-        # Find all data-markers on detail page for debugging (first item only)
-        all_markers = re.findall(r'data-marker="([^"]*param[^"]*)"', html, re.IGNORECASE)
-        if not all_markers:
-            all_markers = re.findall(r'data-marker="([^"]*item[^"]*)"', html, re.IGNORECASE)
-
-        # Search for "Состояние" text on the page
-        condition_search = re.search(r'(Состояние.{0,100})', html)
-        brand_search = re.search(r'(Бренд.{0,100})', html)
-
-        # Try multiple attribute extraction methods
-        # Method 1: key-value pairs near "Состояние", "Бренд" etc
-        for attr_name in ["Состояние", "Бренд", "Размер", "Цвет", "Тип"]:
-            m = re.search(rf'{attr_name}[^<]*</[^>]+>\s*<[^>]+>([^<]+)<', html)
-            if not m:
-                m = re.search(rf'{attr_name}:\s*([^<,]+)', html)
+        for attr_label in ["Состояние", "Бренд", "Размер", "Цвет", "Тип"]:
+            # Find label, then grab the next "description":"value" after it
+            m = re.search(
+                rf'{attr_label}.*?"description"\s*:\s*"([^"]+)"',
+                html[:500000], re.DOTALL
+            )
             if m:
-                attrs[attr_name] = m.group(1).strip()
-
-        # Method 2: JSON in __initialData__ on detail page
-        if not attrs:
-            init_match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
-            if init_match:
-                try:
-                    init_raw = unquote(init_match.group(1))
-                    for attr_name, json_key in [("Состояние", "condition"), ("Бренд", "brand")]:
-                        m = re.search(rf'"{json_key}[^"]*"\s*:\s*"([^"]+)"', init_raw, re.IGNORECASE)
-                        if m:
-                            attrs[attr_name] = m.group(1)
-                except Exception:
-                    pass
+                val = m.group(1).strip()
+                # Skip if value is too long (grabbed wrong field)
+                if len(val) < 50:
+                    attrs[attr_label] = val
 
         if attrs:
             logger.info("Item %s attrs: %s", item.avito_id, attrs)
-        else:
-            # Log what we found for debugging
-            logger.info("Item %s NO attrs. markers=%s cond=%s brand=%s",
-                        item.avito_id,
-                        all_markers[:5],
-                        condition_search.group(1)[:60] if condition_search else "not found",
-                        brand_search.group(1)[:60] if brand_search else "not found")
+
+        # Store attrs for filtering (used by scheduler)
+        item._attrs = attrs
 
         logger.info("Enriched %s: date=%s views=%s seller=%s desc=%d chars",
                      item.avito_id,

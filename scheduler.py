@@ -90,11 +90,12 @@ def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
     ])
 
 
-async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
+async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem], url_filters: dict = None):
     """Send new items to a single subscription."""
     sub_id = sub["id"]
     telegram_id = sub["telegram_id"]
     is_first_scan = sub.get("last_checked_at") is None
+    url_filters = url_filters or {}
 
     # First scan: mark all existing items as seen WITHOUT sending
     if is_first_scan:
@@ -132,8 +133,19 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
         # Skip items older than 2 days by actual publish date
         if item.published_date and _is_too_old(item.published_date, max_days=2):
             logger.info("Skipping old item %s (published %s)", item.avito_id, item.published_date)
-            await db.mark_item_sent(sub_id, item.avito_id)  # Don't send again
+            await db.mark_item_sent(sub_id, item.avito_id)
             continue
+
+        # Check item attributes against URL filters
+        item_attrs = getattr(item, '_attrs', {})
+        if url_filters.get("condition") and item_attrs.get("Состояние"):
+            expected = url_filters["condition"].lower()
+            actual = item_attrs["Состояние"].lower()
+            if expected not in actual and actual not in expected:
+                logger.info("Skipping %s: condition '%s' != filter '%s'",
+                            item.avito_id, item_attrs["Состояние"], url_filters["condition"])
+                await db.mark_item_sent(sub_id, item.avito_id)
+                continue
 
         text = format_notification(item)
         keyboard = make_item_keyboard(item)
@@ -218,7 +230,9 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
                             break
                         try:
                             await db.reset_errors(sub["id"])
-                            await notify_subscription(bot, sub, items)
+                            from parser import _extract_url_filters
+                            sub_url_filters = _extract_url_filters(sub["url"])
+                            await notify_subscription(bot, sub, items, sub_url_filters)
                         except Exception as e:
                             logger.error("Error sub #%d: %s", sub["id"], e)
         except Exception as e:
