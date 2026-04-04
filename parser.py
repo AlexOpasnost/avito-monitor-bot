@@ -503,6 +503,10 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             if url_match:
                 url_path = url_match.group(1)
 
+        # Clean URL — remove tracking query params
+        if url_path and "?" in url_path:
+            url_path = url_path.split("?")[0]
+
         item_url = f"https://www.avito.ru{url_path}" if url_path else f"https://www.avito.ru/{avito_id}"
 
         # Price: look for price patterns (digits + ₽ or "руб")
@@ -569,12 +573,26 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             description=description,
         ))
 
-    # Log first item for debugging
-    if items:
+    # Log first item + raw block for debugging
+    if items and id_matches:
         first = items[0]
-        logger.info("HTML first item: id=%s title='%s' price='%s' url=%s img=%s",
+        # Log first block raw HTML (truncated) to see real structure
+        start = id_matches[0].start()
+        end = id_matches[1].start() if len(id_matches) > 1 else start + 3000
+        first_block = html[start:end]
+        # Extract all class names and data-markers from block
+        markers = re.findall(r'data-marker="([^"]+)"', first_block)
+        classes = re.findall(r'class="([^"]*item[^"]*)"', first_block, re.IGNORECASE)
+        img_srcs = re.findall(r'(?:src|data-src)="(https://[^"]{10,80})', first_block)
+
+        logger.info("HTML first item: id=%s title='%s' price='%s' url=%s img=%s desc=%s loc=%s",
                      first.avito_id, first.title[:40], first.price[:20],
-                     first.url[:60], "yes" if first.image_url else "no")
+                     first.url[:60], "yes" if first.image_url else "no",
+                     "yes" if first.description else "no",
+                     first.location[:30] if first.location else "no")
+        logger.info("HTML block markers: %s", markers[:15])
+        logger.info("HTML block item-classes: %s", classes[:10])
+        logger.info("HTML block img srcs: %s", img_srcs[:5])
 
     return items if items else None
 
