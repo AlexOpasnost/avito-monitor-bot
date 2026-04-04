@@ -209,23 +209,30 @@ async def cmd_start(message: Message):
 
     if reactivated > 0:
         await message.answer(
-            f"▶️ Возобновлено {reactivated} отслеживаний!\n\n"
-            "📋 /list — посмотреть активные\n"
-            "❌ /delete — удалить ненужные\n"
-            "⏸ /stop — приостановить всё",
+            f"▶️ <b>Возобновлено {reactivated} отслеживаний!</b>\n\n"
+            "Мониторинг запущен. Новые объявления придут автоматически.\n\n"
+            "/list — активные отслеживания\n"
+            "/delete — удалить\n"
+            "/stop — пауза",
+            parse_mode="HTML",
         )
     else:
         await message.answer(
-            "👋 Привет! Я мониторю объявления на Авито.\n\n"
-            "📌 Как пользоваться:\n"
-            "1. Открой Авито, настрой поиск (город, категория, цена)\n"
-            "2. Скопируй ссылку на страницу поиска\n"
-            "3. Отправь мне эту ссылку\n\n"
-            f"Можно отслеживать до {config.max_subscriptions} ссылок одновременно.\n\n"
-            "📋 Команды:\n"
-            "/list — активные отслеживания\n"
-            "/delete — удалить отслеживание\n"
-            "/stop — приостановить всё",
+            "<b>Avito Monitor</b> — мгновенные уведомления о новых объявлениях\n\n"
+            "Как это работает:\n"
+            "1. Настрой поиск на Авито (город, категория, цена, фильтры)\n"
+            "2. Скопируй ссылку\n"
+            "3. Отправь сюда\n\n"
+            "Что ты получишь:\n"
+            "• Фото, цена, описание, город\n"
+            "• Рейтинг и просмотры продавца\n"
+            "• Точная дата публикации\n"
+            "• Только свежие объявления (до 2 дней)\n"
+            f"• До {config.max_subscriptions} отслеживаний одновременно\n\n"
+            "/list — мои отслеживания\n"
+            "/profile — статистика\n"
+            "/stop — пауза",
+            parse_mode="HTML",
         )
 
 
@@ -355,8 +362,9 @@ async def cmd_stop(message: Message):
     )
     await db.deactivate_all(user_id)
     await message.answer(
-        "⏸ Все отслеживания приостановлены.\n"
-        "Ссылки сохранены — нажми /start чтобы возобновить."
+        "⏸ <b>Мониторинг приостановлен</b>\n\n"
+        "Все ссылки сохранены. Нажми /start чтобы возобновить.",
+        parse_mode="HTML",
     )
 
 
@@ -365,8 +373,10 @@ async def handle_url(message: Message):
     url = _validate_avito_url(message.text)
     if not url:
         await message.answer(
-            "Отправь мне ссылку на поиск Авито.\n"
-            "Например: https://www.avito.ru/moskva/kvartiry/prodam-ASgBAgICAUSSA8YQ"
+            "Отправь ссылку на поиск Авито.\n\n"
+            "Например:\n"
+            "<code>https://www.avito.ru/moskva/kvartiry</code>",
+            parse_mode="HTML",
         )
         return
 
@@ -398,11 +408,8 @@ async def handle_url(message: Message):
     await message.answer(
         f"✅ <b>Отслеживание #{sub_id} добавлено!</b>\n\n"
         f"{details_text}\n\n"
-        f"⏱ Проверка каждую <b>минуту</b>\n"
-        f"📋 Первая проверка — запомню текущие объявления\n"
-        f"🔔 Со второй проверки — буду слать только <b>новые</b>\n\n"
-        f"📋 /list — все отслеживания\n"
-        f"❌ /delete — удалить",
+        f"Проверяю каждую минуту. Как появится новое объявление — сразу пришлю с фото, ценой и описанием.\n\n"
+        f"/list — все отслеживания  ·  /delete — удалить",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
