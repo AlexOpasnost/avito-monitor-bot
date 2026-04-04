@@ -518,34 +518,51 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
         if len(html) < 10000:
             return item
 
-        # Exact publication date — try multiple sources
+        # Exact publication date
         from datetime import datetime as dt, timezone as tz, timedelta
         msk = tz(timedelta(hours=3))
 
-        # 1. <time datetime="ISO">
-        date_match = re.search(r'<time[^>]*datetime="([^"]+)"', html)
-        # 2. JSON-LD datePublished
-        if not date_match:
-            date_match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
-        # 3. meta tag
-        if not date_match:
-            date_match = re.search(r'<meta[^>]*property="[^"]*date[^"]*"[^>]*content="([^"]+)"', html, re.IGNORECASE)
-        # 4. data-marker with date
-        if not date_match:
-            date_match = re.search(r'data-marker="item-view/item-date"[^>]*>([^<]+)<', html)
-        # 5. "Размещено" text with date
-        if not date_match:
-            date_match = re.search(r'Размещено\s*[^<]*?(\d{1,2}\s+\w+\s+\d{4})', html)
-
-        if date_match:
-            raw = date_match.group(1).strip()
+        # 1. Unix timestamp in JSON: "time":1712345678 or "createTime":...
+        ts_match = re.search(r'"(?:time|createTime|sortTimeStamp|publishDate)"\s*:\s*(\d{10,13})', html)
+        if ts_match:
             try:
-                parsed = dt.fromisoformat(raw.replace("Z", "+00:00"))
-                item.published_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+                ts = int(ts_match.group(1))
+                if ts > 1_000_000_000_000:  # milliseconds
+                    ts = ts // 1000
+                parsed = dt.fromtimestamp(ts, msk)
+                item.published_date = parsed.strftime("%H:%M:%S %d.%m.%Y")
             except Exception:
-                # Not ISO — use as-is if it's not relative
-                if "назад" not in raw:
-                    item.published_date = raw
+                pass
+
+        # 2. ISO date in JSON: "datePublished":"2026-..."
+        if not item.published_date:
+            iso_match = re.search(r'"(?:datePublished|date|createdAt|created)"\s*:\s*"(20\d{2}-\d{2}-\d{2}[T ]\d{2}:\d{2}[^"]*)"', html)
+            if iso_match:
+                try:
+                    raw = iso_match.group(1).strip()
+                    parsed = dt.fromisoformat(raw.replace("Z", "+00:00"))
+                    item.published_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+                except Exception:
+                    pass
+
+        # 3. <time datetime="...">
+        if not item.published_date:
+            time_match = re.search(r'<time[^>]*datetime="([^"]+)"', html)
+            if time_match:
+                try:
+                    parsed = dt.fromisoformat(time_match.group(1).replace("Z", "+00:00"))
+                    item.published_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+                except Exception:
+                    pass
+
+        # 4. Text date near "Размещено" / item-date
+        if not item.published_date:
+            text_match = re.search(r'data-marker="item-view/item-date"[^>]*>(.*?)</span>', html, re.DOTALL)
+            if text_match:
+                texts = re.findall(r'>([^<]+)<', text_match.group(1))
+                date_text = " ".join(t.strip() for t in texts if t.strip())
+                if date_text and "назад" not in date_text:
+                    item.published_date = date_text
 
         # Description
         desc_match = re.search(r'data-marker="item-view/item-description"[^>]*>(.*?)</div>', html, re.DOTALL)
