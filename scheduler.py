@@ -12,44 +12,26 @@ logger = logging.getLogger(__name__)
 
 
 def format_notification(item: AvitoItem) -> str:
-    """Format item notification — clean style like AvtoRinger."""
+    """Format item notification — AvtoRinger style."""
     from datetime import datetime, timezone, timedelta
 
     msk = timezone(timedelta(hours=3))
     now = datetime.now(msk).strftime("%H:%M %d.%m.%Y")
 
-    lines = [f"<b>{item.title}</b>"]
-    lines.append(f"💰 <b>{item.price}</b>")
+    lines = []
+    lines.append(f"<b>{item.title}</b>")
+    lines.append(f"💰 {item.price}")
 
-    # Stats line
-    stats = []
-    if item.views:
-        stats.append(f"👁 {item.views}")
-    if item.favorites:
-        stats.append(f"❤️ {item.favorites}")
-    if item.seller_rating:
-        stats.append(f"⭐ {item.seller_rating}")
-    if stats:
-        lines.append(" ".join(stats))
-
-    # Location
     if item.location:
         lines.append(f"📍 {item.location}")
 
-    # Full URL
-    lines.append(f"🔗 {item.url}")
+    lines.append(item.url)
 
-    # Description
     if item.description:
-        lines.append(f"\n<i>{item.description}</i>")
+        lines.append(f"\n{item.description}")
 
-    # Seller
-    if item.seller_name:
-        lines.append(f"👤 {item.seller_name}")
-
-    # Date
     date_str = item.published_date or now
-    lines.append(f"📅 {date_str}")
+    lines.append(f"\n📅 {date_str}")
 
     return "\n".join(lines)
 

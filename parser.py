@@ -485,83 +485,82 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         end = id_matches[i + 1].start() if i + 1 < len(id_matches) else start + 5000
         block = html[start:end]
 
-        # Title: first <a> with href containing the item ID or /item path
+        # Title — data-marker="item-title"
         title = "Объявление"
-        title_match = re.search(r'href="(/[^"]*?)"[^>]*?title="([^"]*)"', block)
+        url_path = None
+        title_match = re.search(r'data-marker="item-title"[^>]*>.*?href="([^"]*)"[^>]*>([^<]+)<', block, re.DOTALL)
         if not title_match:
-            # Try: text inside link that has href with path
-            title_match = re.search(r'href="(/[^"]*?)"[^>]*>([^<]{3,80})<', block)
-        if title_match:
+            title_match = re.search(r'data-marker="item-title"[^>]*title="([^"]*)"[^>]*href="([^"]*)"', block)
+            if title_match:
+                title = title_match.group(1).strip()
+                url_path = title_match.group(2)
+        if title_match and not url_path:
             url_path = title_match.group(1)
             title = title_match.group(2).strip()
-        else:
-            url_path = None
 
-        # Try to get URL from any link containing the avito_id
+        # Fallback: any link with the avito_id in href
         if not url_path:
             url_match = re.search(rf'href="(/[^"]*?{avito_id}[^"]*?)"', block)
             if url_match:
                 url_path = url_match.group(1)
+            # Also try getting title from any link with title attr
+            t_match = re.search(r'title="([^"]{5,80})"', block)
+            if t_match:
+                title = t_match.group(1).strip()
 
         # Clean URL — remove tracking query params
         if url_path and "?" in url_path:
             url_path = url_path.split("?")[0]
-
         item_url = f"https://www.avito.ru{url_path}" if url_path else f"https://www.avito.ru/{avito_id}"
 
-        # Price: look for price patterns (digits + ₽ or "руб")
+        # Price — data-marker="item-price-value"
         price = "Цена не указана"
-        price_match = re.search(r'(\d[\d\s]*\d)\s*₽', block)
+        price_match = re.search(r'data-marker="item-price-value"[^>]*>([^<]+)<', block)
         if not price_match:
-            price_match = re.search(r'data-marker="item-price"[^>]*>([^<]+)<', block)
+            price_match = re.search(r'data-marker="item-price"[^>]*>.*?(\d[\d\s]*\d)\s*₽', block, re.DOTALL)
         if not price_match:
-            price_match = re.search(r'price[^>]*>([^<]*\d[^<]*)<', block, re.IGNORECASE)
+            price_match = re.search(r'(\d[\d\s]*\d)\s*₽', block)
         if price_match:
             price = price_match.group(1).strip()
-            if not price.endswith('₽'):
+            if '₽' not in price:
                 price += ' ₽'
 
-        # Location — look for specific Avito geo markers
+        # Location — data-marker="item-location"
         location = None
-        loc_match = re.search(r'data-marker="item-address"[^>]*>([^<]{3,60})<', block)
+        loc_match = re.search(r'data-marker="item-location"[^>]*>([^<]+)<', block)
         if not loc_match:
-            loc_match = re.search(r'class="[^"]*geo-address[^"]*"[^>]*>([^<]{3,60})<', block)
-        if not loc_match:
-            loc_match = re.search(r'class="[^"]*item-address[^"]*"[^>]*>([^<]{3,60})<', block)
-        if not loc_match:
-            # Look for city patterns like "Москва, район" but NOT the title
-            loc_match = re.search(r'>([А-Я][а-яё]+(?:,\s*[А-Яа-яё\s]+(?:район|р-н|обл|край))[^<]{0,30})<', block)
-        if loc_match:
-            loc_text = loc_match.group(1).strip()
-            # Verify it's not the title repeated
-            if loc_text != title and len(loc_text) < 60:
-                location = loc_text
+            # Try nested text inside item-location container
+            loc_container = re.search(r'data-marker="item-location"(.*?)</div>', block, re.DOTALL)
+            if loc_container:
+                # Get all text content
+                loc_texts = re.findall(r'>([^<]{2,})<', loc_container.group(1))
+                if loc_texts:
+                    location = ", ".join(t.strip() for t in loc_texts if t.strip())
+        else:
+            location = loc_match.group(1).strip()
 
-        # Image — try multiple sources for lazy-loaded images
+        # Image — from img.avito.st CDN
         image_url = None
-        # 1. data-src (lazy loaded)
-        img_match = re.search(r'data-src="(https://[^"]*\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.IGNORECASE)
-        # 2. Regular src with avito CDN
+        img_match = re.search(r'(?:src|data-src)="(https://\d+\.img\.avito\.st/image/[^"]+)"', block)
         if not img_match:
-            img_match = re.search(r'src="(https://(?:\d+\.)?avito\.st/[^"]+)"', block, re.IGNORECASE)
-        # 3. Any image src with common image CDN patterns
-        if not img_match:
-            img_match = re.search(r'(?:src|data-src)="(https://[^"]*(?:/items|/images|/thumbs)[^"]*)"', block, re.IGNORECASE)
+            img_match = re.search(r'(?:src|data-src)="(https://[^"]*avito\.st/[^"]+)"', block)
         if img_match:
             image_url = img_match.group(1)
 
-        # Description — snippet text from the listing card
+        # Description — look for text content that's not title/price/location
         description = None
+        # Try data-marker="item-description" first (may not exist on list view)
         desc_match = re.search(r'data-marker="item-description"[^>]*>([^<]{5,})<', block)
-        if not desc_match:
-            # Look for long text blocks that aren't title/price/location
-            for text_match in re.finditer(r'>([^<]{30,200})<', block):
-                text = text_match.group(1).strip()
-                if text != title and text != price and text != location:
-                    description = text[:200]
-                    break
-        else:
+        if desc_match:
             description = desc_match.group(1).strip()[:200]
+
+        # Date
+        pub_date = None
+        date_match = re.search(r'data-marker="item-date/wrapper"[^>]*>.*?datetime="([^"]+)"', block, re.DOTALL)
+        if not date_match:
+            date_match = re.search(r'data-marker="item-date"[^>]*>([^<]+)<', block)
+        if date_match:
+            pub_date = date_match.group(1).strip()
 
         items.append(AvitoItem(
             avito_id=avito_id,
@@ -571,28 +570,16 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             image_url=image_url,
             location=location,
             description=description,
+            published_date=pub_date,
         ))
 
-    # Log first item + raw block for debugging
-    if items and id_matches:
+    # Log first item for debugging
+    if items:
         first = items[0]
-        # Log first block raw HTML (truncated) to see real structure
-        start = id_matches[0].start()
-        end = id_matches[1].start() if len(id_matches) > 1 else start + 3000
-        first_block = html[start:end]
-        # Extract all class names and data-markers from block
-        markers = re.findall(r'data-marker="([^"]+)"', first_block)
-        classes = re.findall(r'class="([^"]*item[^"]*)"', first_block, re.IGNORECASE)
-        img_srcs = re.findall(r'(?:src|data-src)="(https://[^"]{10,80})', first_block)
-
-        logger.info("HTML first item: id=%s title='%s' price='%s' url=%s img=%s desc=%s loc=%s",
-                     first.avito_id, first.title[:40], first.price[:20],
-                     first.url[:60], "yes" if first.image_url else "no",
-                     "yes" if first.description else "no",
-                     first.location[:30] if first.location else "no")
-        logger.info("HTML block markers: %s", markers[:15])
-        logger.info("HTML block item-classes: %s", classes[:10])
-        logger.info("HTML block img srcs: %s", img_srcs[:5])
+        logger.info("HTML item[0]: id=%s title='%s' price='%s' loc='%s' img=%s url=%s",
+                     first.avito_id, first.title[:50], first.price[:20],
+                     first.location or "-", "yes" if first.image_url else "no",
+                     first.url[:70])
 
     return items if items else None
 
