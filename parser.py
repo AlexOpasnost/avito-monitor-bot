@@ -797,11 +797,16 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             else:
                 location = loc_match.group(1).strip()
 
-        # Image — from img.avito.st CDN
+        # Image — from img.avito.st CDN or any image source
         image_url = None
         img_match = re.search(r'(?:src|data-src)="(https://\d+\.img\.avito\.st/image/[^"]+)"', block)
         if not img_match:
             img_match = re.search(r'(?:src|data-src)="(https://[^"]*avito\.st/[^"]+)"', block)
+        if not img_match:
+            # slider-image marker contains URL in its value
+            img_match = re.search(r'data-marker="slider-image/image-(https://[^"]+)"', block)
+        if not img_match:
+            img_match = re.search(r'(?:src|data-src)="(https://[^"]*\.(?:jpg|jpeg|webp|png)(?:\?[^"]*)?)"', block)
         if img_match:
             image_url = img_match.group(1)
 
@@ -827,6 +832,11 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             if re.search(r'(?:недел|месяц|год)', listing_date):
                 continue
 
+        # Convert listing date to absolute
+        from datetime import timezone as tz, timedelta
+        msk = tz(timedelta(hours=3))
+        converted_date = _convert_relative_date(listing_date, msk) if listing_date else None
+
         items.append(AvitoItem(
             avito_id=avito_id,
             title=title,
@@ -835,7 +845,7 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             image_url=image_url,
             location=location,
             description=description,
-            published_date=listing_date,
+            published_date=converted_date,
         ))
 
     # Log first item for debugging
