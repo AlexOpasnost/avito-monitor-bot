@@ -562,13 +562,27 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if desc_match:
             description = desc_match.group(1).strip()[:200]
 
-        # Date
+        # Date — extract from <time datetime="..."> inside item-date
         pub_date = None
-        date_match = re.search(r'data-marker="item-date/wrapper"[^>]*>.*?datetime="([^"]+)"', block, re.DOTALL)
-        if not date_match:
-            date_match = re.search(r'data-marker="item-date"[^>]*>([^<]+)<', block)
+        # 1. ISO datetime attribute (exact time)
+        date_match = re.search(r'<time[^>]*datetime="([^"]+)"', block)
         if date_match:
-            pub_date = date_match.group(1).strip()
+            try:
+                from datetime import datetime as dt, timezone as tz, timedelta
+                iso = date_match.group(1).strip()
+                msk = tz(timedelta(hours=3))
+                parsed = dt.fromisoformat(iso.replace("Z", "+00:00"))
+                pub_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
+            except Exception:
+                pub_date = date_match.group(1)
+        # 2. Fallback: text inside date marker
+        if not pub_date:
+            date_text = re.search(r'data-marker="item-date[^"]*"[^>]*>([^<]+)<', block)
+            if date_text:
+                text = date_text.group(1).strip()
+                # Only use if it's an actual date, not relative
+                if any(c.isdigit() for c in text) and ("назад" not in text):
+                    pub_date = text
 
         items.append(AvitoItem(
             avito_id=avito_id,
