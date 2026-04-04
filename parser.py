@@ -780,21 +780,47 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
 
         # Extract item attributes (Состояние, Бренд, Размер, etc.)
         attrs = {}
-        # Method 1: data-marker="item-params" section
-        params_section = re.search(r'data-marker="item-view/item-params"(.*?)</(?:ul|div)>', html, re.DOTALL)
-        if params_section:
-            for param in re.finditer(r'>([^<]+):\s*</[^>]+>\s*<[^>]+>([^<]+)<', params_section.group(1)):
-                key = param.group(1).strip()
-                val = param.group(2).strip()
-                attrs[key] = val
-        # Method 2: individual param items
+
+        # Find all data-markers on detail page for debugging (first item only)
+        all_markers = re.findall(r'data-marker="([^"]*param[^"]*)"', html, re.IGNORECASE)
+        if not all_markers:
+            all_markers = re.findall(r'data-marker="([^"]*item[^"]*)"', html, re.IGNORECASE)
+
+        # Search for "Состояние" text on the page
+        condition_search = re.search(r'(Состояние.{0,100})', html)
+        brand_search = re.search(r'(Бренд.{0,100})', html)
+
+        # Try multiple attribute extraction methods
+        # Method 1: key-value pairs near "Состояние", "Бренд" etc
+        for attr_name in ["Состояние", "Бренд", "Размер", "Цвет", "Тип"]:
+            m = re.search(rf'{attr_name}[^<]*</[^>]+>\s*<[^>]+>([^<]+)<', html)
+            if not m:
+                m = re.search(rf'{attr_name}:\s*([^<,]+)', html)
+            if m:
+                attrs[attr_name] = m.group(1).strip()
+
+        # Method 2: JSON in __initialData__ on detail page
         if not attrs:
-            for param in re.finditer(r'class="[^"]*params-paramsList__item[^"]*"[^>]*>.*?<span[^>]*>([^<]+)</span>.*?<span[^>]*>([^<]+)</span>', html, re.DOTALL):
-                attrs[param.group(1).strip().rstrip(':')] = param.group(2).strip()
+            init_match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+            if init_match:
+                try:
+                    init_raw = unquote(init_match.group(1))
+                    for attr_name, json_key in [("Состояние", "condition"), ("Бренд", "brand")]:
+                        m = re.search(rf'"{json_key}[^"]*"\s*:\s*"([^"]+)"', init_raw, re.IGNORECASE)
+                        if m:
+                            attrs[attr_name] = m.group(1)
+                except Exception:
+                    pass
 
         if attrs:
-            logger.info("Item %s attrs: %s", item.avito_id,
-                        {k: v for k, v in list(attrs.items())[:6]})
+            logger.info("Item %s attrs: %s", item.avito_id, attrs)
+        else:
+            # Log what we found for debugging
+            logger.info("Item %s NO attrs. markers=%s cond=%s brand=%s",
+                        item.avito_id,
+                        all_markers[:5],
+                        condition_search.group(1)[:60] if condition_search else "not found",
+                        brand_search.group(1)[:60] if brand_search else "not found")
 
         logger.info("Enriched %s: date=%s views=%s seller=%s desc=%d chars",
                      item.avito_id,
