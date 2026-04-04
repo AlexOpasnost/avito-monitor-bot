@@ -14,6 +14,32 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
+# City slug → display name (extracted from URL path)
+_CITY_MAP = {
+    "moskva": "Москва", "sankt-peterburg": "Санкт-Петербург",
+    "novosibirsk": "Новосибирск", "ekaterinburg": "Екатеринбург",
+    "kazan": "Казань", "nizhniy_novgorod": "Нижний Новгород",
+    "chelyabinsk": "Челябинск", "samara": "Самара", "omsk": "Омск",
+    "rostov-na-donu": "Ростов-на-Дону", "ufa": "Уфа",
+    "krasnoyarsk": "Красноярск", "voronezh": "Воронеж", "perm": "Пермь",
+    "volgograd": "Волгоград", "krasnodar": "Краснодар", "tyumen": "Тюмень",
+    "saratov": "Саратов", "tolyatti": "Тольятти", "izhevsk": "Ижевск",
+    "barnaul": "Барнаул", "vladivostok": "Владивосток", "irkutsk": "Иркутск",
+    "habarovsk": "Хабаровск", "yaroslavl": "Ярославль", "tomsk": "Томск",
+    "orenburg": "Оренбург", "novokuznetsk": "Новокузнецк", "ryazan": "Рязань",
+    "naberezhnye_chelny": "Набережные Челны", "kirov": "Киров",
+    "sevastopol": "Севастополь", "simferopol": "Симферополь",
+    "kaliningrad": "Калининград", "bryansk": "Брянск", "tula": "Тула",
+    "kursk": "Курск", "stavropol": "Ставрополь", "ulyanovsk": "Ульяновск",
+    "tver": "Тверь", "magnitogorsk": "Магнитогорск", "sochi": "Сочи",
+    "smolensk": "Смоленск", "murmansk": "Мурманск", "orel": "Орёл",
+    "belgorod": "Белгород", "vladimir": "Владимир", "cheboksary": "Чебоксары",
+    "kaluga": "Калуга", "surgut": "Сургут", "arhangelsk": "Архангельск",
+    "penza": "Пенза", "lipetsk": "Липецк", "tambov": "Тамбов",
+    "kemerovo": "Кемерово", "astrahan": "Астрахань", "engels": "Энгельс",
+    "kerch": "Керчь", "all": "Вся Россия",
+}
+
 # Persistent session — reuse cookies across requests
 _session: cloudscraper.CloudScraper | None = None
 _session_created_at: float = 0
@@ -533,19 +559,23 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             if '₽' not in price:
                 price += ' ₽'
 
-        # Location — data-marker="item-location"
+        # Location — extract from URL path (most reliable)
         location = None
-        loc_match = re.search(r'data-marker="item-location"[^>]*>([^<]+)<', block)
-        if not loc_match:
-            # Try nested text inside item-location container
-            loc_container = re.search(r'data-marker="item-location"(.*?)</div>', block, re.DOTALL)
-            if loc_container:
-                # Get all text content
-                loc_texts = re.findall(r'>([^<]{2,})<', loc_container.group(1))
-                if loc_texts:
-                    location = ", ".join(t.strip() for t in loc_texts if t.strip())
-        else:
-            location = loc_match.group(1).strip()
+        if url_path:
+            city_slug = url_path.strip("/").split("/")[0] if url_path else None
+            if city_slug:
+                location = _CITY_MAP.get(city_slug)
+        # Also try data-marker
+        if not location:
+            loc_match = re.search(r'data-marker="item-location"[^>]*>([^<]+)<', block)
+            if not loc_match:
+                loc_container = re.search(r'data-marker="item-location"(.*?)</div>', block, re.DOTALL)
+                if loc_container:
+                    loc_texts = re.findall(r'>([^<]{2,})<', loc_container.group(1))
+                    if loc_texts:
+                        location = ", ".join(t.strip() for t in loc_texts if t.strip() and t.strip() != title)
+            else:
+                location = loc_match.group(1).strip()
 
         # Image — from img.avito.st CDN
         image_url = None
@@ -562,9 +592,9 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if desc_match:
             description = desc_match.group(1).strip()[:200]
 
-        # Date — extract from <time datetime="..."> inside item-date
+        # Date — extract from multiple sources
         pub_date = None
-        # 1. ISO datetime attribute (exact time)
+        # 1. ISO datetime from <time> tag
         date_match = re.search(r'<time[^>]*datetime="([^"]+)"', block)
         if date_match:
             try:
@@ -575,14 +605,14 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
                 pub_date = parsed.astimezone(msk).strftime("%H:%M:%S %d.%m.%Y")
             except Exception:
                 pub_date = date_match.group(1)
-        # 2. Fallback: text inside date marker
+        # 2. Text inside item-date marker (any text — "Вчера", "4 апреля", etc)
         if not pub_date:
-            date_text = re.search(r'data-marker="item-date[^"]*"[^>]*>([^<]+)<', block)
-            if date_text:
-                text = date_text.group(1).strip()
-                # Only use if it's an actual date, not relative
-                if any(c.isdigit() for c in text) and ("назад" not in text):
-                    pub_date = text
+            date_container = re.search(r'data-marker="item-date[^"]*"(.*?)</div>', block, re.DOTALL)
+            if date_container:
+                date_texts = re.findall(r'>([^<]+)<', date_container.group(1))
+                date_str = " ".join(t.strip() for t in date_texts if t.strip())
+                if date_str:
+                    pub_date = date_str
 
         items.append(AvitoItem(
             avito_id=avito_id,
