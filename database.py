@@ -209,6 +209,19 @@ class Database:
             )
         await self._execute(_op)
 
+    async def reactivate_all(self, user_id: int) -> int:
+        """Reactivate all paused subscriptions. Returns count reactivated."""
+        async def _op(conn):
+            result = await conn.execute(
+                "UPDATE subscriptions SET is_active = TRUE, error_count = 0 "
+                "WHERE user_id = $1 AND is_active = FALSE",
+                user_id,
+            )
+            # Extract count from "UPDATE N"
+            return int(result.split()[-1])
+        return await self._execute(_op)
+
+
     async def increment_error(self, sub_id: int, error_msg: str):
         async def _op(conn):
             row = await conn.fetchrow(

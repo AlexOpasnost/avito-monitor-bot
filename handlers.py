@@ -203,18 +203,30 @@ async def cmd_start(message: Message):
         message.from_user.id,
         message.from_user.username,
     )
-    await message.answer(
-        "👋 Привет! Я мониторю объявления на Авито.\n\n"
-        "📌 Как пользоваться:\n"
-        "1. Открой Авито, настрой поиск (город, категория, цена)\n"
-        "2. Скопируй ссылку на страницу поиска\n"
-        "3. Отправь мне эту ссылку\n\n"
-        f"Можно отслеживать до {config.max_subscriptions} ссылок одновременно.\n\n"
-        "📋 Команды:\n"
-        "/list — активные отслеживания\n"
-        "/delete — удалить отслеживание\n"
-        "/stop — остановить всё",
-    )
+
+    # Reactivate paused subscriptions
+    reactivated = await db.reactivate_all(user_id)
+
+    if reactivated > 0:
+        await message.answer(
+            f"▶️ Возобновлено {reactivated} отслеживаний!\n\n"
+            "📋 /list — посмотреть активные\n"
+            "❌ /delete — удалить ненужные\n"
+            "⏸ /stop — приостановить всё",
+        )
+    else:
+        await message.answer(
+            "👋 Привет! Я мониторю объявления на Авито.\n\n"
+            "📌 Как пользоваться:\n"
+            "1. Открой Авито, настрой поиск (город, категория, цена)\n"
+            "2. Скопируй ссылку на страницу поиска\n"
+            "3. Отправь мне эту ссылку\n\n"
+            f"Можно отслеживать до {config.max_subscriptions} ссылок одновременно.\n\n"
+            "📋 Команды:\n"
+            "/list — активные отслеживания\n"
+            "/delete — удалить отслеживание\n"
+            "/stop — приостановить всё",
+        )
 
 
 @router.message(Command("profile"))
@@ -342,7 +354,10 @@ async def cmd_stop(message: Message):
         message.from_user.username,
     )
     await db.deactivate_all(user_id)
-    await message.answer("⏹ Все отслеживания остановлены.")
+    await message.answer(
+        "⏸ Все отслеживания приостановлены.\n"
+        "Ссылки сохранены — нажми /start чтобы возобновить."
+    )
 
 
 @router.message(F.text)
