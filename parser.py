@@ -212,6 +212,36 @@ def _is_blocked(html: str, status_code: int) -> tuple[bool, str]:
     return (False, "")
 
 
+def _extract_url_filters(url: str) -> dict:
+    """Extract explicit filters from Avito search URL query params."""
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    filters = {}
+    if "pmin" in qs:
+        try:
+            filters["pmin"] = int(qs["pmin"][0])
+        except ValueError:
+            pass
+    if "pmax" in qs:
+        try:
+            filters["pmax"] = int(qs["pmax"][0])
+        except ValueError:
+            pass
+    return filters
+
+
+def _parse_price_number(price_str: str) -> int | None:
+    """Extract numeric price from string like '4 700 ₽'."""
+    digits = re.sub(r'[^\d]', '', price_str)
+    if digits:
+        try:
+            return int(digits)
+        except ValueError:
+            pass
+    return None
+
+
 async def parse_listings(url: str, max_retries: int = 5) -> list[AvitoItem] | None:
     """Fetch Avito listings. Strategy:
     1. Use cloudscraper session with cookies (warm up on avito.ru first)
@@ -243,6 +273,28 @@ async def parse_listings(url: str, max_retries: int = 5) -> list[AvitoItem] | No
                 wait = 5 + attempt * 5  # 5s, 10s, 15s
                 await asyncio.sleep(random.uniform(wait, wait + 5))
                 continue
+
+            # Apply price filter from URL params
+            if items:
+                url_filters = _extract_url_filters(url)
+                if url_filters.get("pmin") or url_filters.get("pmax"):
+                    before = len(items)
+                    filtered = []
+                    for item in items:
+                        price_num = _parse_price_number(item.price)
+                        if price_num is None:
+                            filtered.append(item)  # Keep if can't parse price
+                            continue
+                        if url_filters.get("pmin") and price_num < url_filters["pmin"]:
+                            continue
+                        if url_filters.get("pmax") and price_num > url_filters["pmax"]:
+                            continue
+                        filtered.append(item)
+                    items = filtered
+                    if before != len(items):
+                        logger.info("Price filter: %d → %d items (pmin=%s pmax=%s)",
+                                    before, len(items),
+                                    url_filters.get("pmin"), url_filters.get("pmax"))
 
             return items
 
@@ -725,6 +777,24 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
             loc_match = re.search(r'class="style-item-address[^"]*"[^>]*>.*?>([^<]{3,60})<', html, re.DOTALL)
         if loc_match:
             item.location = loc_match.group(1).strip()
+
+        # Extract item attributes (Состояние, Бренд, Размер, etc.)
+        attrs = {}
+        # Method 1: data-marker="item-params" section
+        params_section = re.search(r'data-marker="item-view/item-params"(.*?)</(?:ul|div)>', html, re.DOTALL)
+        if params_section:
+            for param in re.finditer(r'>([^<]+):\s*</[^>]+>\s*<[^>]+>([^<]+)<', params_section.group(1)):
+                key = param.group(1).strip()
+                val = param.group(2).strip()
+                attrs[key] = val
+        # Method 2: individual param items
+        if not attrs:
+            for param in re.finditer(r'class="[^"]*params-paramsList__item[^"]*"[^>]*>.*?<span[^>]*>([^<]+)</span>.*?<span[^>]*>([^<]+)</span>', html, re.DOTALL):
+                attrs[param.group(1).strip().rstrip(':')] = param.group(2).strip()
+
+        if attrs:
+            logger.info("Item %s attrs: %s", item.avito_id,
+                        {k: v for k, v in list(attrs.items())[:6]})
 
         logger.info("Enriched %s: date=%s views=%s seller=%s desc=%d chars",
                      item.avito_id,

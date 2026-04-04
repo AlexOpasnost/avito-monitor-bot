@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -46,7 +47,12 @@ def format_notification(item: AvitoItem) -> str:
     url = _clean_url(item.url)
 
     lines = []
-    lines.append(f"<b>{item.title}</b>")
+    # Remove city suffix from title ("Футболка Nike в Москве" → "Футболка Nike")
+    title = item.title
+    if item.location:
+        title = re.sub(rf'\s+в\s+{re.escape(item.location)}е?$', '', title, flags=re.IGNORECASE)
+        title = re.sub(r'\s+в\s+[А-Яа-яё\-]+е?$', '', title)  # "в Челябинске" etc.
+    lines.append(f"<b>{title}</b>")
     lines.append(f"💰 <b>{item.price}</b>")
 
     # Stats line
