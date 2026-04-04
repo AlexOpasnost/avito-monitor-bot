@@ -180,7 +180,7 @@ class Database:
     async def get_active_subscriptions(self) -> list[asyncpg.Record]:
         async def _op(conn):
             return await conn.fetch(
-                "SELECT s.id, s.url, s.user_id, u.telegram_id "
+                "SELECT s.id, s.url, s.user_id, s.last_checked_at, u.telegram_id "
                 "FROM subscriptions s "
                 "JOIN users u ON u.id = s.user_id "
                 "WHERE s.is_active = TRUE"

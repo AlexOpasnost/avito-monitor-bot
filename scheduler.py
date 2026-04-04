@@ -53,24 +53,29 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
     """Send new items to a single subscription."""
     sub_id = sub["id"]
     telegram_id = sub["telegram_id"]
+    is_first_scan = sub.get("last_checked_at") is None
+
+    # First scan: mark all existing items as seen WITHOUT sending
+    if is_first_scan:
+        for item in items:
+            if item.avito_id:
+                await db.mark_item_sent(sub_id, item.avito_id)
+        logger.info("First scan for sub #%d: marked %d items as seen (no notifications)",
+                     sub_id, len(items))
+        return
 
     new_count = 0
     for item in items:
         if not item.avito_id:
             continue
 
-        still_active = await db.is_subscription_active(sub_id)
-        if not still_active:
-            logger.info("Sub #%d deactivated, stopping", sub_id)
-            return
-
         already_sent = await db.is_item_sent(sub_id, item.avito_id)
         if already_sent:
             continue
 
-        still_active2 = await db.is_subscription_active(sub_id)
-        if not still_active2:
-            logger.info("Sub #%d deactivated before send, stopping", sub_id)
+        still_active = await db.is_subscription_active(sub_id)
+        if not still_active:
+            logger.info("Sub #%d deactivated, stopping", sub_id)
             return
 
         # Fetch full details from item page (date, description, views, seller)
