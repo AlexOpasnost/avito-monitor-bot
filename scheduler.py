@@ -11,6 +11,24 @@ from config import config
 logger = logging.getLogger(__name__)
 
 
+def _is_too_old(date_str: str, max_days: int = 2) -> bool:
+    """Check if published date is older than max_days."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        msk = timezone(timedelta(hours=3))
+        now = datetime.now(msk)
+        # Try parsing "HH:MM:SS DD.MM.YYYY"
+        parsed = datetime.strptime(date_str, "%H:%M:%S %d.%m.%Y").replace(tzinfo=msk)
+        return (now - parsed).days >= max_days
+    except ValueError:
+        try:
+            # Try "DD.MM.YYYY"
+            parsed = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=msk)
+            return (now - parsed).days >= max_days
+        except ValueError:
+            return False  # Can't parse — don't filter
+
+
 def _clean_url(url: str) -> str:
     """Ensure URL is valid for Telegram buttons."""
     if not url:
@@ -98,6 +116,12 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
         # Fetch full details from item page (date, description, views, seller)
         item = await enrich_item(item)
         await asyncio.sleep(1)  # Don't hammer Avito
+
+        # Skip items older than 2 days by actual publish date
+        if item.published_date and _is_too_old(item.published_date, max_days=2):
+            logger.info("Skipping old item %s (published %s)", item.avito_id, item.published_date)
+            await db.mark_item_sent(sub_id, item.avito_id)  # Don't send again
+            continue
 
         text = format_notification(item)
         keyboard = make_item_keyboard(item)
