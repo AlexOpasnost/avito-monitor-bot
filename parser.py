@@ -493,6 +493,88 @@ def _extract_json_object(html: str, start: int) -> str | None:
     return None
 
 
+_MONTHS = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+
+def _convert_relative_date(raw: str, msk) -> str:
+    """Convert Avito relative date to absolute datetime string.
+    '5 минут назад' → '14:25:00 04.04.2026'
+    'Вчера в 10:41' → '10:41:00 03.04.2026'
+    '25 марта в 18:17' → '18:17:00 25.03.2026'
+    """
+    from datetime import datetime as dt, timedelta
+
+    now = dt.now(msk)
+
+    # "X минут назад"
+    m = re.match(r'(\d+)\s*минут', raw)
+    if m:
+        result = now - timedelta(minutes=int(m.group(1)))
+        return result.strftime("%H:%M:%S %d.%m.%Y")
+
+    # "X час(а/ов) назад"
+    m = re.match(r'(\d+)\s*час', raw)
+    if m:
+        result = now - timedelta(hours=int(m.group(1)))
+        return result.strftime("%H:%M:%S %d.%m.%Y")
+
+    # "X дн(я/ей) назад"
+    m = re.match(r'(\d+)\s*(?:день|дня|дней)', raw)
+    if m:
+        result = now - timedelta(days=int(m.group(1)))
+        return result.strftime("%H:%M:%S %d.%m.%Y")
+
+    # "Сегодня в HH:MM"
+    m = re.match(r'[Сс]егодня\s*в?\s*(\d{1,2}):(\d{2})', raw)
+    if m:
+        result = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0)
+        return result.strftime("%H:%M:%S %d.%m.%Y")
+
+    # "Вчера в HH:MM"
+    m = re.match(r'[Вв]чера\s*в?\s*(\d{1,2}):(\d{2})', raw)
+    if m:
+        result = (now - timedelta(days=1)).replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0)
+        return result.strftime("%H:%M:%S %d.%m.%Y")
+
+    # "25 марта в 18:17"
+    m = re.match(r'(\d{1,2})\s+(\w+)\s+в\s+(\d{1,2}):(\d{2})', raw)
+    if m:
+        day = int(m.group(1))
+        month = _MONTHS.get(m.group(2).lower())
+        hour, minute = int(m.group(3)), int(m.group(4))
+        if month:
+            year = now.year
+            try:
+                result = dt(year, month, day, hour, minute, 0, tzinfo=msk)
+                if result > now:  # Must be last year
+                    result = dt(year - 1, month, day, hour, minute, 0, tzinfo=msk)
+                return result.strftime("%H:%M:%S %d.%m.%Y")
+            except ValueError:
+                pass
+
+    # "25 марта" (no time)
+    m = re.match(r'(\d{1,2})\s+(\w+)$', raw.strip())
+    if m:
+        day = int(m.group(1))
+        month = _MONTHS.get(m.group(2).lower())
+        if month:
+            year = now.year
+            try:
+                result = dt(year, month, day, 0, 0, 0, tzinfo=msk)
+                if result > now:
+                    result = dt(year - 1, month, day, 0, 0, 0, tzinfo=msk)
+                return result.strftime("%d.%m.%Y")
+            except ValueError:
+                pass
+
+    # Already good or unknown format — return as-is if not "назад"
+    return raw
+
+
 async def enrich_item(item: AvitoItem) -> AvitoItem:
     """Fetch individual item page to get full details: exact date, description, views, seller."""
     proxy = _get_proxy()
@@ -557,19 +639,13 @@ def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
 
         # 4. Text near item ID: "№ 8109418734 · 26 марта в 18:17"
         if not item.published_date:
-            # Pattern: date text after item number, like "26 марта в 18:17" or "Вчера в 12:30"
             date_text_match = re.search(
                 rf'№\s*{re.escape(item.avito_id)}[^<]*?·\s*([^·<]+?)(?:\s*·|\s*<)',
                 html
             )
-            if not date_text_match:
-                # Alt: any "DD month в HH:MM" pattern
-                date_text_match = re.search(
-                    r'(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(?:в\s+)?\d{1,2}:\d{2})',
-                    html
-                )
             if date_text_match:
-                item.published_date = date_text_match.group(1).strip()
+                raw_date = date_text_match.group(1).strip()
+                item.published_date = _convert_relative_date(raw_date, msk)
 
         # Description
         desc_match = re.search(r'data-marker="item-view/item-description"[^>]*>(.*?)</div>', html, re.DOTALL)
