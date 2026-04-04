@@ -508,8 +508,8 @@ async def enrich_item(item: AvitoItem) -> AvitoItem:
 def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
     """Fetch item detail page and extract rich info."""
     try:
-        session = _get_or_create_session(proxy)
-        resp = session.get(item.url, proxies=_make_proxies(proxy), timeout=20)
+        scraper = _get_session(proxy)
+        resp = scraper.get(item.url, proxies=_make_proxies(proxy), timeout=20)
 
         if resp.status_code != 200:
             return item
