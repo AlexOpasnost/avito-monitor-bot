@@ -350,8 +350,8 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
         proxies = _make_proxies(proxy)
 
         # Log the URL being fetched (verify f= param preserved)
-        has_f = "f=" in url
-        logger.info("Fetching: %s (f= param: %s)", url[:120], "YES" if has_f else "NO")
+        has_f = "?f=" in url or "&f=" in url
+        logger.info("Fetching: %s (f= param: %s)", url[:150], "YES" if has_f else "NO")
 
         resp = scraper.get(
             url,

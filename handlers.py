@@ -18,11 +18,29 @@ AVITO_URL_PATTERN = re.compile(
 
 def _validate_avito_url(text: str) -> str | None:
     """Extract and validate Avito URL from message text."""
+    from urllib.parse import urlparse, parse_qs, urlencode
     text = text.strip()
     match = AVITO_URL_PATTERN.search(text)
-    if match:
-        return match.group(0)
-    return None
+    if not match:
+        return None
+
+    url = match.group(0)
+
+    # Clean URL: keep only useful params (f=, q=, pmin, pmax, s, user, bt)
+    # Remove context=, slocation=, etc. (tracking garbage)
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    clean_params = {}
+    for key in ["f", "q", "pmin", "pmax", "s", "user", "bt", "cd"]:
+        if key in qs:
+            clean_params[key] = qs[key][0]
+
+    clean_query = urlencode(clean_params) if clean_params else ""
+    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if clean_query:
+        clean_url += f"?{clean_query}"
+
+    return clean_url
 
 
 AVITO_CATEGORIES = {
