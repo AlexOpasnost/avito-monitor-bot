@@ -768,7 +768,112 @@ def item_matches_whitelist(item: AvitoItem, whitelist: dict) -> bool:
 
 
 def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
-    """Fetch item detail page and extract rich info."""
+    """Fetch item details via mobile API (clean JSON) with HTML fallback."""
+    # Try mobile API first — returns clean params with labels
+    api_result = _fetch_via_item_api(item, proxy)
+    if api_result:
+        return api_result
+
+    # Fallback to HTML scraping
+    return _fetch_item_details_html(item, proxy)
+
+
+def _fetch_via_item_api(item: AvitoItem, proxy: str | None) -> AvitoItem | None:
+    """Fetch item details from m.avito.ru/api/15/items/{id}."""
+    try:
+        import requests as std_requests
+        resp = std_requests.get(
+            f"https://m.avito.ru/api/15/items/{item.avito_id}",
+            proxies=_make_proxies(proxy),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+                "key": "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir",
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+
+        d = resp.json()
+
+        # Extract params with labels → store as _attrs
+        params = {}
+        for p in d.get("params", []):
+            name = p.get("name", "")
+            value = p.get("value", "")
+            if name and value:
+                params[name] = value
+
+        if params:
+            item._attrs = params
+            logger.info("API item %s params: %s", item.avito_id, {k: v for k, v in list(params.items())[:6]})
+
+        # Title
+        if d.get("title"):
+            item.title = d["title"]
+
+        # Price
+        price_val = d.get("price", {})
+        if isinstance(price_val, dict):
+            val = price_val.get("value")
+            if val:
+                item.price = f"{int(val):,} ₽".replace(",", " ")
+
+        # Images
+        images = d.get("images", [])
+        if images and isinstance(images[0], dict):
+            item.image_url = images[0].get("864x648") or images[0].get("636x476") or images[0].get("url")
+
+        # Description
+        desc = d.get("description", "")
+        if desc and len(desc) > 5:
+            item.description = desc[:300]
+
+        # URL
+        if d.get("url"):
+            item.url = "https://www.avito.ru" + d["url"] if not d["url"].startswith("http") else d["url"]
+
+        # Location
+        loc = d.get("location", {})
+        if isinstance(loc, dict):
+            item.location = loc.get("name", "")
+
+        # Seller
+        seller = d.get("seller", {})
+        if isinstance(seller, dict) and seller.get("name"):
+            item.seller_name = seller["name"]
+
+        # Date
+        from datetime import datetime as dt, timezone as tz, timedelta
+        msk = tz(timedelta(hours=3))
+        ts = d.get("time") or d.get("sortTimeStamp")
+        if ts and isinstance(ts, (int, float)) and ts > 1000000000:
+            if ts > 1_000_000_000_000:
+                ts = ts // 1000
+            item.published_date = dt.fromtimestamp(ts, msk).strftime("%H:%M:%S %d.%m.%Y")
+
+        # Views
+        stats = d.get("stats", {})
+        if isinstance(stats, dict):
+            views = stats.get("views")
+            if views is not None:
+                item.views = str(views)
+
+        logger.info("Enriched(API) %s: date=%s views=%s seller=%s desc=%d params=%d",
+                     item.avito_id, item.published_date or "-",
+                     item.views or "-", item.seller_name or "-",
+                     len(item.description) if item.description else 0,
+                     len(params))
+        return item
+
+    except Exception as e:
+        logger.debug("Item API failed for %s: %s", item.avito_id, e)
+        return None
+
+
+def _fetch_item_details_html(item: AvitoItem, proxy: str | None) -> AvitoItem:
+    """Fallback: fetch item detail page HTML and extract info."""
     try:
         scraper = _get_session(proxy)
         resp = scraper.get(item.url, proxies=_make_proxies(proxy), timeout=20)
