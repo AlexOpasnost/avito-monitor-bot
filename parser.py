@@ -937,13 +937,38 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if checked_filters:
             logger.info("CHECKED filters: %s", checked_filters)
 
-        # Also dump one checkbox block for debugging (first checked one)
-        first_cb = re.search(r'data-marker="params\[\d+\]/checkbox/\d+"[^>]*checked[^>]*>(.*?)</label>', html, re.DOTALL | re.IGNORECASE)
-        if not first_cb:
-            first_cb = re.search(r'(data-marker="params\[\d+\]/checkbox/\d+".{0,400})', html, re.DOTALL)
+        # Find applied filter chips/tags at the top of results
+        # These show text like "Nike", "Новое с биркой", "от 1000 ₽"
+        applied_chips = []
+        # Method 1: applied-filters markers
+        for chip_match in re.finditer(r'data-marker="applied-filters[^"]*"[^>]*>(.*?)</(?:span|div|button)>', html, re.DOTALL):
+            texts = re.findall(r'>([^<]{2,40})<', chip_match.group(1))
+            applied_chips.extend([t.strip() for t in texts if t.strip() and t.strip() != '×'])
+
+        # Method 2: filter chips near "Выбранные фильтры" or reset button
+        if not applied_chips:
+            chips_section = re.search(r'(?:params\[\d+\]-reset|Сбросить|Выбранные)(.*?)(?:data-marker="search-filters"|catalog-serp)', html, re.DOTALL)
+            if chips_section:
+                chip_texts = re.findall(r'>([А-Яа-яёA-Za-z][^<]{2,40})<', chips_section.group(1))
+                applied_chips = [t.strip() for t in chip_texts if t.strip() not in ('Сбросить', 'Показать', 'Ещё')]
+
+        # Method 3: look for text inside toggle buttons that are "on"
+        if not applied_chips:
+            for toggle in re.finditer(r'data-marker="params\[\d+\]/checkbox/toggle"[^>]*value="(\d+)"(.*?)</div>\s*</div>', html, re.DOTALL):
+                # Get text from surrounding divs
+                block = toggle.group(2)
+                texts = re.findall(r'>([А-Яа-яёA-Za-z][^<]{2,40})<', block)
+                if texts:
+                    applied_chips.extend([t.strip() for t in texts])
+
+        if applied_chips:
+            logger.info("Applied filter values: %s", applied_chips[:20])
+
+        # Dump HTML around first checkbox for structure analysis
+        first_cb = re.search(r'(data-marker="params\[\d+\]/checkbox/toggle"[^>]*value="\d+".{0,500})', html, re.DOTALL)
         if first_cb:
-            sample = first_cb.group(1)[:250].replace('\n', ' ').replace('\r', '')
-            logger.info("Checkbox sample HTML: %s", sample)
+            sample = first_cb.group(1)[:400].replace('\n', ' ').replace('\r', '')
+            logger.info("Toggle checkbox+context: %s", sample)
     else:
         # Fallback: use first 60% of page (results are at top, recommendations at bottom)
         search_html = html[:int(len(html) * 0.6)]
