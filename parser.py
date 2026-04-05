@@ -886,6 +886,23 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
                 serp_end = pos
         search_html = html[serp_start:serp_end]
         logger.info("SERP container: %d chars (full page: %d)", len(search_html), len(html))
+
+        # Find active filters on the search page
+        # Look for filter-related markers and selected values
+        filter_markers = re.findall(r'data-marker="([^"]*(?:filter|param|chip)[^"]*)"', html, re.IGNORECASE)
+        if filter_markers:
+            logger.info("Filter markers found: %s", filter_markers[:15])
+
+        # Look for "applied filters" / chips / selected values
+        # Avito shows active filters as "chips" (tags) at the top
+        chips = re.findall(r'data-marker="applied-filters/item[^"]*"[^>]*>.*?>([^<]{2,40})<', html, re.DOTALL)
+        if chips:
+            logger.info("Applied filter chips: %s", chips[:10])
+
+        # Search for any element with "selected" or "checked" in filter area
+        selected = re.findall(r'(?:checked|selected|active)[^>]*>([^<]{2,40})<', html[:500000])
+        if selected:
+            logger.info("Selected/checked values: %s", [s.strip() for s in selected[:15]])
     else:
         # Fallback: use first 60% of page (results are at top, recommendations at bottom)
         search_html = html[:int(len(html) * 0.6)]
