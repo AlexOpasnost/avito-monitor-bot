@@ -793,9 +793,12 @@ def _fetch_via_item_api(item: AvitoItem, proxy: str | None) -> AvitoItem | None:
             timeout=15,
         )
         if resp.status_code != 200:
+            logger.warning("Item API HTTP %d for %s: %s", resp.status_code, item.avito_id, resp.text[:200])
             return None
 
         d = resp.json()
+        logger.info("Item API OK for %s: keys=%s params=%d",
+                     item.avito_id, list(d.keys())[:8], len(d.get("params", [])))
 
         # Extract params with labels → store as _attrs
         params = {}
@@ -868,7 +871,7 @@ def _fetch_via_item_api(item: AvitoItem, proxy: str | None) -> AvitoItem | None:
         return item
 
     except Exception as e:
-        logger.debug("Item API failed for %s: %s", item.avito_id, e)
+        logger.warning("Item API failed for %s: %s", item.avito_id, e)
         return None
 
 
