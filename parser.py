@@ -350,8 +350,15 @@ def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | 
         proxies = _make_proxies(proxy)
 
         # Log the URL being fetched (verify f= param preserved)
-        has_f = "?f=" in url or "&f=" in url
-        logger.info("Fetching: %s (f= param: %s)", url[:150], "YES" if has_f else "NO")
+        from urllib.parse import urlparse, parse_qs
+        parsed_url = urlparse(url)
+        url_qs = parse_qs(parsed_url.query)
+        has_f = "f" in url_qs  # Proper check: f is an actual query parameter
+        has_context = "context" in url_qs
+        if has_context and not has_f:
+            logger.warning("URL has context= but NO f= — filters NOT applied! URL: %s", url[:150])
+        else:
+            logger.info("Fetching: %s (f= param: %s)", url[:150], "YES" if has_f else "NO")
 
         resp = scraper.get(
             url,

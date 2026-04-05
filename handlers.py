@@ -403,6 +403,19 @@ async def handle_url(message: Message):
         message.from_user.username,
     )
 
+    # Warn if URL has no filters
+    from urllib.parse import urlparse, parse_qs
+    url_qs = parse_qs(urlparse(url).query)
+    if "context" in url_qs and "f" not in url_qs:
+        await message.answer(
+            "⚠️ Эта ссылка не содержит фильтров.\n\n"
+            "Открой Авито, выбери фильтры (бренд, состояние, цену), "
+            "затем скопируй ссылку из адресной строки.\n"
+            "Правильная ссылка содержит <code>?f=</code> в URL.",
+            parse_mode="HTML",
+        )
+        return
+
     sub_id = await db.add_subscription(user_id, url)
     if sub_id is None:
         await message.answer(
