@@ -997,15 +997,24 @@ def _fetch_item_details_html(item: AvitoItem, proxy: str | None) -> AvitoItem:
         # Look for patterns: "title":"Бренд" near "description":"Nike"
         attrs = {}
 
-        # Method 1: find "param-info" blocks with title+description
+        # Method 1: "description":"value" BEFORE "title":"Label" (Avito's actual format)
         for m in re.finditer(
-            r'"title"\s*:\s*"([^"]{2,30})"[^}]{0,300}"description"\s*:\s*"([^"]{1,50})"',
+            r'"description"\s*:\s*"([^"]{1,50})"[^}]{0,200}"title"\s*:\s*"([^"]{2,30})"',
+            html[:500000]
+        ):
+            desc = m.group(1).strip()
+            title = m.group(2).strip()
+            if title not in attrs and title not in ("Авито", "Объявление", "Показать", "Ещё", ""):
+                attrs[title] = desc
+
+        # Method 1b: "title":"Label" BEFORE "description":"value" (alternative order)
+        for m in re.finditer(
+            r'"title"\s*:\s*"([^"]{2,30})"[^}]{0,200}"description"\s*:\s*"([^"]{1,50})"',
             html[:500000]
         ):
             title = m.group(1).strip()
             desc = m.group(2).strip()
-            # Skip generic/navigation titles
-            if title not in attrs and title not in ("Авито", "Объявление", "Показать", "Ещё"):
+            if title not in attrs and title not in ("Авито", "Объявление", "Показать", "Ещё", ""):
                 attrs[title] = desc
 
         # Method 2: known attribute labels → next "description" value
