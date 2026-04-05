@@ -147,6 +147,10 @@ class Database:
             await conn.execute(
                 "UPDATE subscriptions SET deleted = TRUE WHERE is_active = FALSE AND deleted = FALSE"
             )
+            # Filter whitelist: JSON dict of allowed attribute values per subscription
+            await conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS filter_whitelist TEXT"
+            )
             logger.info("Migrations applied")
         except Exception as e:
             logger.debug("Migration note: %s", e)
@@ -283,6 +287,24 @@ class Database:
             )
         await self._execute(_op)
 
+    # --- Filter Whitelist ---
+
+    async def save_filter_whitelist(self, sub_id: int, json_str: str):
+        """Save filter whitelist JSON string for a subscription."""
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE subscriptions SET filter_whitelist = $2 WHERE id = $1",
+                sub_id, json_str,
+            )
+        await self._execute(_op)
+
+    async def get_filter_whitelist(self, sub_id: int) -> str | None:
+        """Get filter whitelist JSON string for a subscription, or None."""
+        async def _op(conn):
+            return await conn.fetchval(
+                "SELECT filter_whitelist FROM subscriptions WHERE id = $1", sub_id
+            )
+        return await self._execute(_op)
 
     # --- Profile / Stats ---
 

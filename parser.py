@@ -716,6 +716,57 @@ async def enrich_item(item: AvitoItem) -> AvitoItem:
         return item
 
 
+async def build_filter_whitelist(items: list[AvitoItem], proxy: str | None = None) -> dict:
+    """Build a whitelist of allowed attribute values from the first 10 items.
+
+    Enriches each item to extract _attrs, then collects the unique set of values
+    for each attribute name across all items.
+
+    Returns dict like {'Бренд': ['Nike', 'Adidas'], 'Состояние': ['Новое с биркой']}
+    """
+    whitelist: dict[str, set] = {}
+    sample = items[:10]
+
+    for i, item in enumerate(sample):
+        enriched = await enrich_item(item)
+        attrs = getattr(enriched, '_attrs', {})
+        for attr_name, attr_value in attrs.items():
+            if attr_name not in whitelist:
+                whitelist[attr_name] = set()
+            whitelist[attr_name].add(attr_value)
+        if i < len(sample) - 1:
+            await asyncio.sleep(2)
+
+    # Convert sets to sorted lists for JSON serialization
+    result = {k: sorted(v) for k, v in whitelist.items()}
+    logger.info("Built filter whitelist from %d items: %s", len(sample), result)
+    return result
+
+
+def item_matches_whitelist(item: AvitoItem, whitelist: dict) -> bool:
+    """Check if item's attributes match the whitelist.
+
+    For each attribute in whitelist: if item has that attribute,
+    its value must be in the allowed set. If item doesn't have the
+    attribute, skip (don't filter on missing attrs).
+
+    Returns True if all present attributes match, False otherwise.
+    """
+    item_attrs = getattr(item, '_attrs', {})
+    if not item_attrs or not whitelist:
+        return True
+
+    for attr_name, allowed_values in whitelist.items():
+        if attr_name in item_attrs:
+            if item_attrs[attr_name] not in allowed_values:
+                logger.info(
+                    "Whitelist mismatch for %s: %s='%s' not in %s",
+                    item.avito_id, attr_name, item_attrs[attr_name], allowed_values,
+                )
+                return False
+    return True
+
+
 def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
     """Fetch item detail page and extract rich info."""
     try:

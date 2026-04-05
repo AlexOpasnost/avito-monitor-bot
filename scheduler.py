@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 
@@ -6,7 +7,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from database import db
-from parser import parse_listings, enrich_item, AvitoItem
+from parser import parse_listings, enrich_item, AvitoItem, build_filter_whitelist, item_matches_whitelist
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -97,14 +98,36 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem], url_f
     is_first_scan = sub.get("last_checked_at") is None
     url_filters = url_filters or {}
 
-    # First scan: mark all existing items as seen WITHOUT sending
+    # First scan: mark all existing items as seen WITHOUT sending + build whitelist
     if is_first_scan:
         for item in items:
             if item.avito_id:
                 await db.mark_item_sent(sub_id, item.avito_id)
         logger.info("First scan for sub #%d: marked %d items as seen (no notifications)",
                      sub_id, len(items))
+
+        # Build filter whitelist from first scan items
+        try:
+            whitelist = await build_filter_whitelist(items)
+            if whitelist:
+                await db.save_filter_whitelist(sub_id, json.dumps(whitelist, ensure_ascii=False))
+                logger.info("Sub #%d: saved filter whitelist: %s", sub_id, whitelist)
+            else:
+                logger.info("Sub #%d: no attributes found, no whitelist saved", sub_id)
+        except Exception as e:
+            logger.warning("Sub #%d: failed to build whitelist: %s", sub_id, e)
+
         return
+
+    # Load filter whitelist for subsequent scans
+    whitelist = None
+    try:
+        wl_json = await db.get_filter_whitelist(sub_id)
+        if wl_json:
+            whitelist = json.loads(wl_json)
+            logger.debug("Sub #%d: loaded whitelist with %d attrs", sub_id, len(whitelist))
+    except Exception as e:
+        logger.warning("Sub #%d: failed to load whitelist: %s", sub_id, e)
 
     MAX_NEW_PER_CYCLE = 5  # Limit to avoid proxy overload
 
@@ -146,6 +169,12 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem], url_f
                             item.avito_id, item_attrs["Состояние"], url_filters["condition"])
                 await db.mark_item_sent(sub_id, item.avito_id)
                 continue
+
+        # Check item against saved whitelist
+        if whitelist and not item_matches_whitelist(item, whitelist):
+            logger.info("Skipping %s: does not match whitelist", item.avito_id)
+            await db.mark_item_sent(sub_id, item.avito_id)
+            continue
 
         text = format_notification(item)
         keyboard = make_item_keyboard(item)
