@@ -995,6 +995,48 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if checked_filters:
             logger.info("CHECKED filters: %s", checked_filters)
 
+        # Extract filters from preloadedState_.layout.sidebar (182KB JSON)
+        # This contains the FULL filter panel with names and selected values
+        for var_pattern in [r'window\.__preloadedState_\s*=\s*', r'window\.__preloadedState__\s*=\s*']:
+            var_match = re.search(var_pattern, html)
+            if var_match:
+                try:
+                    js_data = _parse_js_value(html, var_match.end())
+                    if js_data and isinstance(js_data, dict):
+                        sidebar = js_data.get("layout", {}).get("sidebar")
+                        if sidebar:
+                            sidebar_json = json.dumps(sidebar, ensure_ascii=False)
+                            active_filters = {}
+
+                            # Find: "title":"Бренд" ... "checkedValues":["Nike","Adidas"]
+                            for gm in re.finditer(r'"title"\s*:\s*"([^"]+)".*?"checkedValues"\s*:\s*\[([^\]]*)\]', sidebar_json[:50000], re.DOTALL):
+                                title = gm.group(1)
+                                vals = re.findall(r'"([^"]+)"', gm.group(2))
+                                if vals:
+                                    active_filters[title] = vals
+
+                            # Alt: items with isChecked + label
+                            if not active_filters:
+                                for im in re.finditer(r'"label"\s*:\s*"([^"]+)"[^}]{0,200}"isChecked"\s*:\s*true', sidebar_json[:100000]):
+                                    active_filters.setdefault("_checked", []).append(im.group(1))
+                                for im in re.finditer(r'"isChecked"\s*:\s*true[^}]{0,200}"label"\s*:\s*"([^"]+)"', sidebar_json[:100000]):
+                                    active_filters.setdefault("_checked", []).append(im.group(1))
+
+                            if active_filters:
+                                logger.info("SIDEBAR FILTERS: %s", active_filters)
+                            else:
+                                # Debug: show sidebar structure
+                                if isinstance(sidebar, dict):
+                                    logger.info("Sidebar keys: %s", list(sidebar.keys())[:10])
+                                elif isinstance(sidebar, list):
+                                    first = sidebar[0] if sidebar else {}
+                                    logger.info("Sidebar list[%d], first keys: %s", len(sidebar),
+                                               list(first.keys())[:10] if isinstance(first, dict) else "?")
+                                logger.info("Sidebar sample: %s", sidebar_json[:400])
+                except Exception as e:
+                    logger.warning("Sidebar parse error: %s", e)
+                break
+
         # Find applied filter chips/tags at the top of results
         # These show text like "Nike", "Новое с биркой", "от 1000 ₽"
         applied_chips = []
