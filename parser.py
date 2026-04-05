@@ -899,10 +899,34 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         if chips:
             logger.info("Applied filter chips: %s", chips[:10])
 
-        # Search for any element with "selected" or "checked" in filter area
-        selected = re.findall(r'(?:checked|selected|active)[^>]*>([^<]{2,40})<', html[:500000])
-        if selected:
-            logger.info("Selected/checked values: %s", [s.strip() for s in selected[:15]])
+        # Extract checked checkbox labels from filter sidebar
+        # Pattern: checkbox marker → find checked state + label text nearby
+        checked_filters = {}
+        # Find all filter param groups
+        param_groups = re.findall(r'data-marker="params\[(\d+)\]/checkbox/(\d+)"(.*?)</(?:label|div|li)>', html, re.DOTALL)
+        for param_id, value_id, block in param_groups:
+            # Check if this checkbox is checked/selected
+            is_checked = ('checked' in block.lower() or
+                         'aria-checked="true"' in block or
+                         'isChecked' in block or
+                         'active' in block.lower())
+            # Extract label text
+            label_match = re.search(r'>([^<]{2,40})<', block)
+            label = label_match.group(1).strip() if label_match else f"id:{value_id}"
+
+            if is_checked:
+                if param_id not in checked_filters:
+                    checked_filters[param_id] = []
+                checked_filters[param_id].append(label)
+
+        if checked_filters:
+            logger.info("CHECKED filters: %s", checked_filters)
+        else:
+            # Fallback: dump first checkbox block to see HTML structure
+            first_cb = re.search(r'(data-marker="params\[\d+\]/checkbox/\d+".{0,500})', html, re.DOTALL)
+            if first_cb:
+                sample = first_cb.group(1)[:300].replace('\n', ' ')
+                logger.info("Checkbox HTML sample: %s", sample)
     else:
         # Fallback: use first 60% of page (results are at top, recommendations at bottom)
         search_html = html[:int(len(html) * 0.6)]
