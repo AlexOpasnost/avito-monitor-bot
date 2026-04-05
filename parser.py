@@ -900,33 +900,50 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
             logger.info("Applied filter chips: %s", chips[:10])
 
         # Extract checked checkbox labels from filter sidebar
-        # Pattern: checkbox marker → find checked state + label text nearby
         checked_filters = {}
-        # Find all filter param groups
-        param_groups = re.findall(r'data-marker="params\[(\d+)\]/checkbox/(\d+)"(.*?)</(?:label|div|li)>', html, re.DOTALL)
-        for param_id, value_id, block in param_groups:
-            # Check if this checkbox is checked/selected
+        # Find checkbox markers and capture 300 chars after for label
+        for cb_match in re.finditer(r'data-marker="params\[(\d+)\]/checkbox/(\d+)"', html):
+            param_id = cb_match.group(1)
+            value_id = cb_match.group(2)
+            # Get 300 chars around the marker to find checked state + label
+            start = max(0, cb_match.start() - 100)
+            end = min(len(html), cb_match.end() + 300)
+            block = html[start:end]
+
             is_checked = ('checked' in block.lower() or
                          'aria-checked="true"' in block or
-                         'isChecked' in block or
-                         'active' in block.lower())
-            # Extract label text
-            label_match = re.search(r'>([^<]{2,40})<', block)
-            label = label_match.group(1).strip() if label_match else f"id:{value_id}"
+                         '"isChecked":true' in block or
+                         'iva-checkbox-checked' in block)
+            if not is_checked:
+                continue
 
-            if is_checked:
-                if param_id not in checked_filters:
-                    checked_filters[param_id] = []
+            # Find label: text in spans/divs after the checkbox
+            # Skip very short text (1 char) and HTML entities
+            label = None
+            after_marker = html[cb_match.end():cb_match.end() + 300]
+            for text_match in re.finditer(r'>([^<]{2,50})<', after_marker):
+                txt = text_match.group(1).strip()
+                if txt and not txt.startswith('id:') and len(txt) > 1:
+                    label = txt
+                    break
+            if not label:
+                label = f"val:{value_id}"
+
+            if param_id not in checked_filters:
+                checked_filters[param_id] = []
+            if label not in checked_filters[param_id]:
                 checked_filters[param_id].append(label)
 
         if checked_filters:
             logger.info("CHECKED filters: %s", checked_filters)
-        else:
-            # Fallback: dump first checkbox block to see HTML structure
-            first_cb = re.search(r'(data-marker="params\[\d+\]/checkbox/\d+".{0,500})', html, re.DOTALL)
-            if first_cb:
-                sample = first_cb.group(1)[:300].replace('\n', ' ')
-                logger.info("Checkbox HTML sample: %s", sample)
+
+        # Also dump one checkbox block for debugging (first checked one)
+        first_cb = re.search(r'data-marker="params\[\d+\]/checkbox/\d+"[^>]*checked[^>]*>(.*?)</label>', html, re.DOTALL | re.IGNORECASE)
+        if not first_cb:
+            first_cb = re.search(r'(data-marker="params\[\d+\]/checkbox/\d+".{0,400})', html, re.DOTALL)
+        if first_cb:
+            sample = first_cb.group(1)[:250].replace('\n', ' ').replace('\r', '')
+            logger.info("Checkbox sample HTML: %s", sample)
     else:
         # Fallback: use first 60% of page (results are at top, recommendations at bottom)
         search_html = html[:int(len(html) * 0.6)]
