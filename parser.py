@@ -993,25 +993,48 @@ def _fetch_item_details_html(item: AvitoItem, proxy: str | None) -> AvitoItem:
         if loc_match:
             item.location = loc_match.group(1).strip()
 
-        # Extract item attributes from JSON on detail page
-        # Format: "Состояние"...{"attributeId":115539,...,"description":"Новое"}
+        # Extract ALL item attributes from embedded JSON on detail page
+        # Look for patterns: "title":"Бренд" near "description":"Nike"
         attrs = {}
-        for attr_label in ["Состояние", "Бренд", "Размер", "Цвет", "Тип"]:
-            # Find label, then grab the next "description":"value" after it
-            m = re.search(
-                rf'{attr_label}.*?"description"\s*:\s*"([^"]+)"',
-                html[:500000], re.DOTALL
-            )
-            if m:
-                val = m.group(1).strip()
-                # Skip if value is too long (grabbed wrong field)
-                if len(val) < 50:
-                    attrs[attr_label] = val
+
+        # Method 1: find "param-info" blocks with title+description
+        for m in re.finditer(
+            r'"title"\s*:\s*"([^"]{2,30})"[^}]{0,300}"description"\s*:\s*"([^"]{1,50})"',
+            html[:500000]
+        ):
+            title = m.group(1).strip()
+            desc = m.group(2).strip()
+            # Skip generic/navigation titles
+            if title not in attrs and title not in ("Авито", "Объявление", "Показать", "Ещё"):
+                attrs[title] = desc
+
+        # Method 2: known attribute labels → next "description" value
+        if not attrs:
+            for attr_label in ["Состояние", "Бренд", "Размер", "Цвет", "Тип", "Память",
+                                "Диагональ", "Операционная система", "Модель"]:
+                m = re.search(
+                    rf'{attr_label}.*?"description"\s*:\s*"([^"]+)"',
+                    html[:500000], re.DOTALL
+                )
+                if m:
+                    val = m.group(1).strip()
+                    if len(val) < 50:
+                        attrs[attr_label] = val
+
+        # Method 3: find "name":"X","value":"Y" patterns (API-like structure in HTML)
+        if not attrs:
+            for m in re.finditer(r'"name"\s*:\s*"([^"]{2,30})"\s*,\s*"value"\s*:\s*"([^"]{1,50})"', html[:500000]):
+                attrs[m.group(1)] = m.group(2)
 
         if attrs:
-            logger.info("Item %s attrs: %s", item.avito_id, attrs)
+            logger.info("Item %s attrs: %s", item.avito_id, {k: v for k, v in list(attrs.items())[:8]})
+        else:
+            # Debug: find any "title"+"description" pair
+            sample = re.search(r'"title"\s*:\s*"([^"]+)"[^}]{0,200}"description"\s*:\s*"([^"]+)"', html[:200000])
+            if sample:
+                logger.info("Item %s no attrs but found: title=%s desc=%s",
+                           item.avito_id, sample.group(1)[:30], sample.group(2)[:30])
 
-        # Store attrs for filtering (used by scheduler)
         item._attrs = attrs
 
         logger.info("Enriched %s: date=%s views=%s seller=%s desc=%d chars",
