@@ -810,21 +810,41 @@ async def build_filter_whitelist(items: list[AvitoItem], proxy: str | None = Non
     Returns dict like {'Бренд': ['Nike', 'Adidas'], 'Состояние': ['Новое с биркой']}
     """
     whitelist: dict[str, set] = {}
-    sample = items[:10]
+    total = len(items)
+    enriched_count = 0
+    failed_count = 0
 
-    for i, item in enumerate(sample):
-        enriched = await enrich_item(item)
-        attrs = getattr(enriched, '_attrs', {})
-        for attr_name, attr_value in attrs.items():
-            if attr_name not in whitelist:
-                whitelist[attr_name] = set()
-            whitelist[attr_name].add(attr_value)
-        if i < len(sample) - 1:
-            await asyncio.sleep(2)
+    for i, item in enumerate(items):
+        try:
+            enriched = await enrich_item(item)
+            attrs = getattr(enriched, '_attrs', {})
+            if attrs:
+                enriched_count += 1
+                for attr_name, attr_value in attrs.items():
+                    if attr_name not in whitelist:
+                        whitelist[attr_name] = set()
+                    whitelist[attr_name].add(attr_value)
+            else:
+                failed_count += 1
+        except Exception as e:
+            failed_count += 1
+            logger.debug("Whitelist enrich error for %s: %s", item.avito_id, e)
+
+        # Brief pause every item, longer pause every 10
+        if i < total - 1:
+            if (i + 1) % 10 == 0:
+                await asyncio.sleep(3)
+                logger.info("Whitelist progress: %d/%d enriched, %d failed", enriched_count, i + 1, failed_count)
+            else:
+                await asyncio.sleep(1)
 
     # Convert sets to sorted lists for JSON serialization
     result = {k: sorted(v) for k, v in whitelist.items()}
-    logger.info("Built filter whitelist from %d items: %s", len(sample), result)
+    logger.info("Built filter whitelist from %d/%d items (%d failed): %d attributes",
+                enriched_count, total, failed_count, len(result))
+    for attr, values in result.items():
+        logger.info("  Whitelist %s: %d values %s", attr, len(values),
+                     values[:10] if len(values) <= 10 else values[:8] + ['...'])
     return result
 
 
