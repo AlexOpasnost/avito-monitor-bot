@@ -801,20 +801,52 @@ async def enrich_item(item: AvitoItem) -> AvitoItem:
         return item
 
 
-async def build_filter_whitelist(items: list[AvitoItem], proxy: str | None = None) -> dict:
-    """Build a whitelist of allowed attribute values from the first 10 items.
+async def build_filter_whitelist(items: list[AvitoItem], sub_url: str = "") -> dict:
+    """Build whitelist from ALL items across multiple pages.
 
-    Enriches each item to extract _attrs, then collects the unique set of values
-    for each attribute name across all items.
+    1. Use items from page 1 (already loaded)
+    2. Load pages 2-3 for more items
+    3. Enrich all items → extract attrs → build whitelist
 
     Returns dict like {'Бренд': ['Nike', 'Adidas'], 'Состояние': ['Новое с биркой']}
     """
+    all_items = list(items)
+
+    # Load additional pages to get more items/brands
+    if sub_url:
+        proxy = _get_proxy()
+        for page_num in [2, 3]:
+            try:
+                # Add page parameter to URL
+                sep = "&" if "?" in sub_url else "?"
+                page_url = f"{sub_url}{sep}p={page_num}"
+                logger.info("Whitelist: loading page %d: %s", page_num, page_url[:80])
+
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, lambda u=page_url: _fetch_with_session(u, proxy)
+                )
+                page_items, blocked = result
+                if page_items and not blocked:
+                    all_items.extend(page_items)
+                    logger.info("Whitelist: page %d added %d items (total: %d)",
+                                page_num, len(page_items), len(all_items))
+                else:
+                    logger.info("Whitelist: page %d returned no items or blocked", page_num)
+                    break
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.warning("Whitelist page %d error: %s", page_num, e)
+                break
+
     whitelist: dict[str, set] = {}
-    total = len(items)
     enriched_count = 0
     failed_count = 0
+    total = len(all_items)
 
-    for i, item in enumerate(items):
+    logger.info("Whitelist: enriching %d items total...", total)
+
+    for i, item in enumerate(all_items):
         try:
             enriched = await enrich_item(item)
             attrs = getattr(enriched, '_attrs', {})
@@ -830,15 +862,14 @@ async def build_filter_whitelist(items: list[AvitoItem], proxy: str | None = Non
             failed_count += 1
             logger.debug("Whitelist enrich error for %s: %s", item.avito_id, e)
 
-        # Brief pause every item, longer pause every 10
         if i < total - 1:
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 20 == 0:
                 await asyncio.sleep(3)
-                logger.info("Whitelist progress: %d/%d enriched, %d failed", enriched_count, i + 1, failed_count)
+                logger.info("Whitelist progress: %d/%d enriched, %d failed",
+                            enriched_count, i + 1, failed_count)
             else:
                 await asyncio.sleep(1)
 
-    # Convert sets to sorted lists for JSON serialization
     result = {k: sorted(v) for k, v in whitelist.items()}
     logger.info("Built filter whitelist from %d/%d items (%d failed): %d attributes",
                 enriched_count, total, failed_count, len(result))

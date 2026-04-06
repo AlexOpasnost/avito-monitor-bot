@@ -108,7 +108,7 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem], url_f
 
         # Build filter whitelist from first scan items
         try:
-            whitelist = await build_filter_whitelist(items)
+            whitelist = await build_filter_whitelist(items, sub_url=sub["url"])
             if whitelist:
                 await db.save_filter_whitelist(sub_id, json.dumps(whitelist, ensure_ascii=False))
                 logger.info("Sub #%d: saved filter whitelist: %s", sub_id, whitelist)
