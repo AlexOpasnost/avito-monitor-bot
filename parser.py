@@ -768,13 +768,7 @@ def item_matches_whitelist(item: AvitoItem, whitelist: dict) -> bool:
 
 
 def _fetch_item_details(item: AvitoItem, proxy: str | None) -> AvitoItem:
-    """Fetch item details via mobile API (clean JSON) with HTML fallback."""
-    # Try mobile API first — returns clean params with labels
-    api_result = _fetch_via_item_api(item, proxy)
-    if api_result:
-        return api_result
-
-    # Fallback to HTML scraping
+    """Fetch item detail page and extract rich info."""
     return _fetch_item_details_html(item, proxy)
 
 
@@ -1038,11 +1032,15 @@ def _fetch_item_details_html(item: AvitoItem, proxy: str | None) -> AvitoItem:
         if attrs:
             logger.info("Item %s attrs: %s", item.avito_id, {k: v for k, v in list(attrs.items())[:8]})
         else:
-            # Debug: find any "title"+"description" pair
-            sample = re.search(r'"title"\s*:\s*"([^"]+)"[^}]{0,200}"description"\s*:\s*"([^"]+)"', html[:200000])
-            if sample:
-                logger.info("Item %s no attrs but found: title=%s desc=%s",
-                           item.avito_id, sample.group(1)[:30], sample.group(2)[:30])
+            # Debug: dump raw HTML around known attribute words
+            for kw in ["Состояние", "Бренд", "Память"]:
+                idx = html.find(kw)
+                if idx > 0:
+                    raw = html[max(0,idx-100):idx+150].replace('\n',' ')
+                    logger.info("Item %s RAW [%s] at %d: ...%s...", item.avito_id, kw, idx, raw)
+                    break
+            else:
+                logger.info("Item %s: no known attribute words found in HTML (%d bytes)", item.avito_id, len(html))
 
         item._attrs = attrs
 
