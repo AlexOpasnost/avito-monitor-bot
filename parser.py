@@ -987,47 +987,29 @@ def _fetch_item_details_html(item: AvitoItem, proxy: str | None) -> AvitoItem:
         if loc_match:
             item.location = loc_match.group(1).strip()
 
-        # Extract ALL item attributes from embedded JSON on detail page
-        # Look for patterns: "title":"Бренд" near "description":"Nike"
+        # Extract item attributes from rendered HTML
+        # Real Avito format: <span>Бренд<span>: </span></span>Apple</p>
         attrs = {}
 
-        # Method 1: "description":"value" BEFORE "title":"Label" (Avito's actual format)
+        # Method 1: <span>Label<span>: </span></span>Value</p>
         for m in re.finditer(
-            r'"description"\s*:\s*"([^"]{1,50})"[^}]{0,200}"title"\s*:\s*"([^"]{2,30})"',
-            html[:500000]
+            r'>([А-Яа-яёA-Za-z][^<]{1,30})<span>:\s*</span></span>([^<]{1,60})<',
+            html
         ):
-            desc = m.group(1).strip()
-            title = m.group(2).strip()
-            if title not in attrs and title not in ("Авито", "Объявление", "Показать", "Ещё", ""):
-                attrs[title] = desc
+            label = m.group(1).strip()
+            value = m.group(2).strip()
+            if label and value and len(value) < 50:
+                attrs[label] = value
 
-        # Method 1b: "title":"Label" BEFORE "description":"value" (alternative order)
+        # Method 1b: value inside <a> tag (linked attrs like Модель)
         for m in re.finditer(
-            r'"title"\s*:\s*"([^"]{2,30})"[^}]{0,200}"description"\s*:\s*"([^"]{1,50})"',
-            html[:500000]
+            r'>([А-Яа-яёA-Za-z][^<]{1,30})<span>:\s*</span></span>\s*<a[^>]*>([^<]{1,60})<',
+            html
         ):
-            title = m.group(1).strip()
-            desc = m.group(2).strip()
-            if title not in attrs and title not in ("Авито", "Объявление", "Показать", "Ещё", ""):
-                attrs[title] = desc
-
-        # Method 2: known attribute labels → next "description" value
-        if not attrs:
-            for attr_label in ["Состояние", "Бренд", "Размер", "Цвет", "Тип", "Память",
-                                "Диагональ", "Операционная система", "Модель"]:
-                m = re.search(
-                    rf'{attr_label}.*?"description"\s*:\s*"([^"]+)"',
-                    html[:500000], re.DOTALL
-                )
-                if m:
-                    val = m.group(1).strip()
-                    if len(val) < 50:
-                        attrs[attr_label] = val
-
-        # Method 3: find "name":"X","value":"Y" patterns (API-like structure in HTML)
-        if not attrs:
-            for m in re.finditer(r'"name"\s*:\s*"([^"]{2,30})"\s*,\s*"value"\s*:\s*"([^"]{1,50})"', html[:500000]):
-                attrs[m.group(1)] = m.group(2)
+            label = m.group(1).strip()
+            value = m.group(2).strip()
+            if label and value and label not in attrs and len(value) < 50:
+                attrs[label] = value
 
         if attrs:
             logger.info("Item %s attrs: %s", item.avito_id, {k: v for k, v in list(attrs.items())[:8]})
