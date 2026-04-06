@@ -801,52 +801,26 @@ async def enrich_item(item: AvitoItem) -> AvitoItem:
         return item
 
 
-async def build_filter_whitelist(items: list[AvitoItem], sub_url: str = "") -> dict:
-    """Build whitelist from ALL items across multiple pages.
+async def build_filter_whitelist(items: list[AvitoItem]) -> dict:
+    """Build whitelist by enriching first 15 items from page 1 (already loaded).
 
-    1. Use items from page 1 (already loaded)
-    2. Load pages 2-3 for more items
-    3. Enrich all items → extract attrs → build whitelist
+    Only keeps attributes with <=15 unique values (low-cardinality).
+    High-cardinality attrs like Бренд (50+ brands) are skipped —
+    trusted to Avito's server-side f= filter instead.
 
-    Returns dict like {'Бренд': ['Nike', 'Adidas'], 'Состояние': ['Новое с биркой']}
+    Returns dict like {'Состояние': ['Новое', 'Новое с биркой'], 'Цвет': ['Белый', 'Чёрный']}
     """
-    all_items = list(items)
+    MAX_ENRICH = 15
+    MAX_UNIQUE_VALUES = 15
 
-    # Load additional pages to get more items/brands
-    if sub_url:
-        proxy = _get_proxy()
-        for page_num in [2, 3]:
-            try:
-                # Add page parameter to URL
-                sep = "&" if "?" in sub_url else "?"
-                page_url = f"{sub_url}{sep}p={page_num}"
-                logger.info("Whitelist: loading page %d: %s", page_num, page_url[:80])
-
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, lambda u=page_url: _fetch_with_session(u, proxy)
-                )
-                page_items, blocked = result
-                if page_items and not blocked:
-                    all_items.extend(page_items)
-                    logger.info("Whitelist: page %d added %d items (total: %d)",
-                                page_num, len(page_items), len(all_items))
-                else:
-                    logger.info("Whitelist: page %d returned no items or blocked", page_num)
-                    break
-                await asyncio.sleep(3)
-            except Exception as e:
-                logger.warning("Whitelist page %d error: %s", page_num, e)
-                break
-
+    sample = items[:MAX_ENRICH]
     whitelist: dict[str, set] = {}
     enriched_count = 0
     failed_count = 0
-    total = len(all_items)
 
-    logger.info("Whitelist: enriching %d items total...", total)
+    logger.info("Whitelist: enriching %d/%d items from page 1...", len(sample), len(items))
 
-    for i, item in enumerate(all_items):
+    for i, item in enumerate(sample):
         try:
             enriched = await enrich_item(item)
             attrs = getattr(enriched, '_attrs', {})
@@ -862,21 +836,26 @@ async def build_filter_whitelist(items: list[AvitoItem], sub_url: str = "") -> d
             failed_count += 1
             logger.debug("Whitelist enrich error for %s: %s", item.avito_id, e)
 
-        if i < total - 1:
-            if (i + 1) % 20 == 0:
-                await asyncio.sleep(3)
-                logger.info("Whitelist progress: %d/%d enriched, %d failed",
-                            enriched_count, i + 1, failed_count)
-            else:
-                await asyncio.sleep(1)
+        if i < len(sample) - 1:
+            await asyncio.sleep(1)
 
-    result = {k: sorted(v) for k, v in whitelist.items()}
-    logger.info("Built filter whitelist from %d/%d items (%d failed): %d attributes",
-                enriched_count, total, failed_count, len(result))
-    for attr, values in result.items():
-        logger.info("  Whitelist %s: %d values %s", attr, len(values),
-                     values[:10] if len(values) <= 10 else values[:8] + ['...'])
-    return result
+    # Remove high-cardinality attributes — too many values to whitelist reliably
+    kept = {}
+    skipped = {}
+    for attr_name, values in whitelist.items():
+        if len(values) <= MAX_UNIQUE_VALUES:
+            kept[attr_name] = sorted(values)
+        else:
+            skipped[attr_name] = len(values)
+
+    logger.info("Built filter whitelist from %d/%d items (%d failed): %d attributes kept, %d skipped",
+                enriched_count, len(sample), failed_count, len(kept), len(skipped))
+    for attr, values in kept.items():
+        logger.info("  Whitelist KEEP %s: %d values %s", attr, len(values), values[:10])
+    for attr, count in skipped.items():
+        logger.info("  Whitelist SKIP %s: %d unique values (too many)", attr, count)
+
+    return kept
 
 
 def item_matches_whitelist(item: AvitoItem, whitelist: dict) -> bool:
@@ -1201,130 +1180,8 @@ def _extract_from_html_items(html: str) -> list[AvitoItem] | None:
         search_html = html[serp_start:serp_end]
         logger.info("SERP container: %d chars (full page: %d)", len(search_html), len(html))
 
-        # Find active filters on the search page
-        # Look for filter-related markers and selected values
-        filter_markers = re.findall(r'data-marker="([^"]*(?:filter|param|chip)[^"]*)"', html, re.IGNORECASE)
-        if filter_markers:
-            logger.info("Filter markers found: %s", filter_markers[:15])
-
-        # Look for "applied filters" / chips / selected values
-        # Avito shows active filters as "chips" (tags) at the top
-        chips = re.findall(r'data-marker="applied-filters/item[^"]*"[^>]*>.*?>([^<]{2,40})<', html, re.DOTALL)
-        if chips:
-            logger.info("Applied filter chips: %s", chips[:10])
-
-        # Extract checked checkbox labels from filter sidebar
-        checked_filters = {}
-        # Find checkbox markers and capture 300 chars after for label
-        for cb_match in re.finditer(r'data-marker="params\[(\d+)\]/checkbox/(\d+)"', html):
-            param_id = cb_match.group(1)
-            value_id = cb_match.group(2)
-            # Get 300 chars around the marker to find checked state + label
-            start = max(0, cb_match.start() - 100)
-            end = min(len(html), cb_match.end() + 300)
-            block = html[start:end]
-
-            is_checked = ('checked' in block.lower() or
-                         'aria-checked="true"' in block or
-                         '"isChecked":true' in block or
-                         'iva-checkbox-checked' in block)
-            if not is_checked:
-                continue
-
-            # Find label: text in spans/divs after the checkbox
-            # Skip very short text (1 char) and HTML entities
-            label = None
-            after_marker = html[cb_match.end():cb_match.end() + 300]
-            for text_match in re.finditer(r'>([^<]{2,50})<', after_marker):
-                txt = text_match.group(1).strip()
-                if txt and not txt.startswith('id:') and len(txt) > 1:
-                    label = txt
-                    break
-            if not label:
-                label = f"val:{value_id}"
-
-            if param_id not in checked_filters:
-                checked_filters[param_id] = []
-            if label not in checked_filters[param_id]:
-                checked_filters[param_id].append(label)
-
-        if checked_filters:
-            logger.info("CHECKED filters: %s", checked_filters)
-
-        # Extract filters from preloadedState_.layout.sidebar (182KB JSON)
-        # This contains the FULL filter panel with names and selected values
-        for var_pattern in [r'window\.__preloadedState_\s*=\s*', r'window\.__preloadedState__\s*=\s*']:
-            var_match = re.search(var_pattern, html)
-            if var_match:
-                try:
-                    js_data = _parse_js_value(html, var_match.end())
-                    if js_data and isinstance(js_data, dict):
-                        sidebar = js_data.get("layout", {}).get("sidebar")
-                        if sidebar:
-                            sidebar_json = json.dumps(sidebar, ensure_ascii=False)
-                            active_filters = {}
-
-                            # Find: "title":"Бренд" ... "checkedValues":["Nike","Adidas"]
-                            for gm in re.finditer(r'"title"\s*:\s*"([^"]+)".*?"checkedValues"\s*:\s*\[([^\]]*)\]', sidebar_json[:50000], re.DOTALL):
-                                title = gm.group(1)
-                                vals = re.findall(r'"([^"]+)"', gm.group(2))
-                                if vals:
-                                    active_filters[title] = vals
-
-                            # Alt: items with isChecked + label
-                            if not active_filters:
-                                for im in re.finditer(r'"label"\s*:\s*"([^"]+)"[^}]{0,200}"isChecked"\s*:\s*true', sidebar_json[:100000]):
-                                    active_filters.setdefault("_checked", []).append(im.group(1))
-                                for im in re.finditer(r'"isChecked"\s*:\s*true[^}]{0,200}"label"\s*:\s*"([^"]+)"', sidebar_json[:100000]):
-                                    active_filters.setdefault("_checked", []).append(im.group(1))
-
-                            if active_filters:
-                                logger.info("SIDEBAR FILTERS: %s", active_filters)
-                            else:
-                                # Debug: show sidebar structure
-                                if isinstance(sidebar, dict):
-                                    logger.info("Sidebar keys: %s", list(sidebar.keys())[:10])
-                                elif isinstance(sidebar, list):
-                                    first = sidebar[0] if sidebar else {}
-                                    logger.info("Sidebar list[%d], first keys: %s", len(sidebar),
-                                               list(first.keys())[:10] if isinstance(first, dict) else "?")
-                                logger.info("Sidebar sample: %s", sidebar_json[:400])
-                except Exception as e:
-                    logger.warning("Sidebar parse error: %s", e)
-                break
-
-        # Find applied filter chips/tags at the top of results
-        # These show text like "Nike", "Новое с биркой", "от 1000 ₽"
-        applied_chips = []
-        # Method 1: applied-filters markers
-        for chip_match in re.finditer(r'data-marker="applied-filters[^"]*"[^>]*>(.*?)</(?:span|div|button)>', html, re.DOTALL):
-            texts = re.findall(r'>([^<]{2,40})<', chip_match.group(1))
-            applied_chips.extend([t.strip() for t in texts if t.strip() and t.strip() != '×'])
-
-        # Method 2: filter chips near "Выбранные фильтры" or reset button
-        if not applied_chips:
-            chips_section = re.search(r'(?:params\[\d+\]-reset|Сбросить|Выбранные)(.*?)(?:data-marker="search-filters"|catalog-serp)', html, re.DOTALL)
-            if chips_section:
-                chip_texts = re.findall(r'>([А-Яа-яёA-Za-z][^<]{2,40})<', chips_section.group(1))
-                applied_chips = [t.strip() for t in chip_texts if t.strip() not in ('Сбросить', 'Показать', 'Ещё')]
-
-        # Method 3: look for text inside toggle buttons that are "on"
-        if not applied_chips:
-            for toggle in re.finditer(r'data-marker="params\[\d+\]/checkbox/toggle"[^>]*value="(\d+)"(.*?)</div>\s*</div>', html, re.DOTALL):
-                # Get text from surrounding divs
-                block = toggle.group(2)
-                texts = re.findall(r'>([А-Яа-яёA-Za-z][^<]{2,40})<', block)
-                if texts:
-                    applied_chips.extend([t.strip() for t in texts])
-
-        if applied_chips:
-            logger.info("Applied filter values: %s", applied_chips[:20])
-
-        # Dump HTML around first checkbox for structure analysis
-        first_cb = re.search(r'(data-marker="params\[\d+\]/checkbox/toggle"[^>]*value="\d+".{0,500})', html, re.DOTALL)
-        if first_cb:
-            sample = first_cb.group(1)[:400].replace('\n', ' ').replace('\r', '')
-            logger.info("Toggle checkbox+context: %s", sample)
+        # Note: filter sidebar labels are rendered by JS and NOT in the HTML.
+        # Whitelist is built via item enrichment in build_filter_whitelist() instead.
     else:
         # Fallback: use first 60% of page (results are at top, recommendations at bottom)
         search_html = html[:int(len(html) * 0.6)]
