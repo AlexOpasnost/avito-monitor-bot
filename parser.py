@@ -303,8 +303,17 @@ async def parse_listings(url: str, max_retries: int = 5) -> list[AvitoItem] | No
                 )
                 _invalidate_session()
                 await rotate_ip()
-                # Progressive backoff: wait longer on each retry
-                wait = 5 + attempt * 5  # 5s, 10s, 15s
+
+                # After 2 failed attempts, try Playwright + captcha solver
+                if attempt >= 2:
+                    logger.info("Trying Playwright captcha solver...")
+                    pw_result = await _fetch_with_playwright(url, proxy)
+                    if pw_result:
+                        items_pw, blocked_pw = pw_result
+                        if not blocked_pw and items_pw is not None:
+                            return items_pw
+
+                wait = 5 + attempt * 5
                 await asyncio.sleep(random.uniform(wait, wait + 5))
                 continue
 
@@ -341,6 +350,82 @@ async def parse_listings(url: str, max_retries: int = 5) -> list[AvitoItem] | No
 
     logger.error("All %d attempts failed for %s", max_retries, url[:60])
     return None
+
+
+async def _fetch_with_playwright(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool] | None:
+    """Fallback: use Playwright headless browser to solve captcha and fetch page."""
+    try:
+        from playwright.async_api import async_playwright
+        from captcha_solver import solve_geetest_on_page
+
+        proxy_config = None
+        if proxy:
+            # Parse proxy URL: http://user:pass@host:port
+            import re as _re
+            m = _re.match(r'https?://([^:]+):([^@]+)@([^:]+):(\d+)', proxy)
+            if m:
+                proxy_config = {
+                    "server": f"http://{m.group(3)}:{m.group(4)}",
+                    "username": m.group(1),
+                    "password": m.group(2),
+                }
+
+        async with async_playwright() as p:
+            launch_args = {"headless": True}
+            if proxy_config:
+                launch_args["proxy"] = proxy_config
+
+            browser = await p.chromium.launch(**launch_args)
+            page = await browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            )
+
+            try:
+                # First visit main page
+                await page.goto("https://www.avito.ru/", timeout=20000, wait_until="domcontentloaded")
+                title = await page.title()
+
+                if "проблема" in title.lower() or "ограничен" in title.lower():
+                    logger.info("Playwright: blocked, attempting captcha solve...")
+                    solved = await solve_geetest_on_page(page)
+                    if not solved:
+                        logger.warning("Playwright: captcha solve failed")
+                        await browser.close()
+                        return None
+
+                # Now fetch the actual search page
+                await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
+
+                html = await page.content()
+                title = await page.title()
+                logger.info("Playwright: page loaded, size=%d, title=%s", len(html), title[:50])
+
+                if "проблема" in title.lower():
+                    await browser.close()
+                    return (None, True)
+
+                # Parse items from HTML (reuse existing extractors)
+                items = _extract_from_html_items(html)
+                if items:
+                    logger.info("Playwright: extracted %d items", len(items))
+                    await browser.close()
+                    return (items, False)
+
+                await browser.close()
+                return ([], False)
+
+            except Exception as e:
+                logger.error("Playwright page error: %s", e)
+                await browser.close()
+                return None
+
+    except ImportError:
+        logger.debug("Playwright not installed, skipping captcha solver")
+        return None
+    except Exception as e:
+        logger.error("Playwright error: %s", e)
+        return None
 
 
 def _fetch_with_session(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
