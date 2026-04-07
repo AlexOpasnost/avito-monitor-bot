@@ -26,6 +26,9 @@ def _validate_avito_url(text: str) -> str | None:
 
     url = match.group(0)
 
+    # Fix Telegram URL mangling: ~ back to + (base64url encoding)
+    url = url.replace("~", "+")
+
     # Clean URL: keep only useful params (f=, q=, pmin, pmax, s, user, bt)
     # Remove context=, slocation=, etc. (tracking garbage)
     parsed = urlparse(url)

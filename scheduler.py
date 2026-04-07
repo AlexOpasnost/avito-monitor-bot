@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import re
 
@@ -7,7 +6,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from database import db
-from parser import parse_listings, enrich_item, AvitoItem, build_filter_whitelist, item_matches_whitelist
+from parser import parse_listings, enrich_item, AvitoItem
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -91,43 +90,20 @@ def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
     ])
 
 
-async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem], url_filters: dict = None):
+async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
     """Send new items to a single subscription."""
     sub_id = sub["id"]
     telegram_id = sub["telegram_id"]
     is_first_scan = sub.get("last_checked_at") is None
-    url_filters = url_filters or {}
 
-    # First scan: mark all existing items as seen WITHOUT sending + build whitelist
+    # First scan: mark all existing items as seen WITHOUT sending
     if is_first_scan:
         for item in items:
             if item.avito_id:
                 await db.mark_item_sent(sub_id, item.avito_id)
         logger.info("First scan for sub #%d: marked %d items as seen (no notifications)",
                      sub_id, len(items))
-
-        # Build filter whitelist from first scan items
-        try:
-            whitelist = await build_filter_whitelist(items)
-            if whitelist:
-                await db.save_filter_whitelist(sub_id, json.dumps(whitelist, ensure_ascii=False))
-                logger.info("Sub #%d: saved filter whitelist: %s", sub_id, whitelist)
-            else:
-                logger.info("Sub #%d: no attributes found, no whitelist saved", sub_id)
-        except Exception as e:
-            logger.warning("Sub #%d: failed to build whitelist: %s", sub_id, e)
-
         return
-
-    # Load filter whitelist for subsequent scans
-    whitelist = None
-    try:
-        wl_json = await db.get_filter_whitelist(sub_id)
-        if wl_json:
-            whitelist = json.loads(wl_json)
-            logger.debug("Sub #%d: loaded whitelist with %d attrs", sub_id, len(whitelist))
-    except Exception as e:
-        logger.warning("Sub #%d: failed to load whitelist: %s", sub_id, e)
 
     MAX_NEW_PER_CYCLE = 5  # Limit to avoid proxy overload
 
@@ -156,23 +132,6 @@ async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem], url_f
         # Skip items older than 2 days by actual publish date
         if item.published_date and _is_too_old(item.published_date, max_days=2):
             logger.info("Skipping old item %s (published %s)", item.avito_id, item.published_date)
-            await db.mark_item_sent(sub_id, item.avito_id)
-            continue
-
-        # Check item attributes against URL filters
-        item_attrs = getattr(item, '_attrs', {})
-        if url_filters.get("condition") and item_attrs.get("Состояние"):
-            expected = url_filters["condition"].lower()
-            actual = item_attrs["Состояние"].lower()
-            if expected not in actual and actual not in expected:
-                logger.info("Skipping %s: condition '%s' != filter '%s'",
-                            item.avito_id, item_attrs["Состояние"], url_filters["condition"])
-                await db.mark_item_sent(sub_id, item.avito_id)
-                continue
-
-        # Check item against saved whitelist
-        if whitelist and not item_matches_whitelist(item, whitelist):
-            logger.info("Skipping %s: does not match whitelist", item.avito_id)
             await db.mark_item_sent(sub_id, item.avito_id)
             continue
 
@@ -259,9 +218,7 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
                             break
                         try:
                             await db.reset_errors(sub["id"])
-                            from parser import _extract_url_filters
-                            sub_url_filters = _extract_url_filters(sub["url"])
-                            await notify_subscription(bot, sub, items, sub_url_filters)
+                            await notify_subscription(bot, sub, items)
                         except Exception as e:
                             logger.error("Error sub #%d: %s", sub["id"], e)
         except Exception as e:
