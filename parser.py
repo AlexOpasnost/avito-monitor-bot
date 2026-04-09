@@ -31,17 +31,41 @@ class AvitoItem:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def fetch_search_items(url: str, proxy: str | None) -> list[AvitoItem] | None:
-    """Try mobile API first, fall back to HTML hydration JSON."""
-    items = await _fetch_mobile_api(url, proxy)
-    if items is not None:
-        logger.debug("[api] fetched %d items for %s", len(items), url[:80])
-        return items
+async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) -> list[AvitoItem] | None:
+    """Try mobile API first, fall back to HTML hydration JSON.
+    Rotates IP and retries on blocks (429/403)."""
+    import asyncio
 
-    items = await _fetch_hydration_json(url, proxy)
-    if items is not None:
-        logger.debug("[html] fetched %d items for %s", len(items), url[:80])
-    return items
+    for attempt in range(max_retries):
+        # Try mobile API
+        items, blocked = await _fetch_mobile_api(url, proxy)
+        if items is not None:
+            logger.info("[api] fetched %d items for %s", len(items), url[:80])
+            return items
+
+        if not blocked:
+            # API didn't return items but wasn't blocked — try HTML fallback on same IP
+            items, blocked_html = await _fetch_hydration_json(url, proxy)
+            if items is not None:
+                logger.info("[html] fetched %d items for %s", len(items), url[:80])
+                return items
+            blocked = blocked or blocked_html
+
+        if not blocked:
+            # Neither worked but no block — give up
+            return None
+
+        # Blocked — rotate IP and retry
+        logger.warning("Blocked (attempt %d/%d), rotating IP", attempt + 1, max_retries)
+        rotated = await rotate_ip()
+        if rotated:
+            # Wait for new IP to stabilize
+            await asyncio.sleep(5)
+        else:
+            await asyncio.sleep(10)
+
+    logger.error("All %d attempts blocked for %s", max_retries, url[:80])
+    return None
 
 
 async def rotate_ip() -> bool:
@@ -75,8 +99,9 @@ async def check_proxy_ip() -> str | None:
 # Mobile API
 # ---------------------------------------------------------------------------
 
-async def _fetch_mobile_api(url: str, proxy: str | None) -> list[AvitoItem] | None:
-    """Fetch via the Avito mobile API. Returns None on failure (caller falls back)."""
+async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
+    """Fetch via the Avito mobile API. Returns (items, blocked).
+    blocked=True means IP is rate-limited/banned."""
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
@@ -88,13 +113,7 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> list[AvitoItem] | No
         "sort": "date",
     }
 
-    # Path-based hints: {location}/{category}/...
-    path_parts = [p for p in parsed.path.strip("/").split("/") if p]
-    if path_parts:
-        # We pass the full path so the API routes to the right catalog
-        params["path"] = "/" + "/".join(path_parts)
-
-    # Pass canonical filter params through
+    # Pass canonical filter params through (no path — it breaks the API)
     if "f" in qs:
         params["f"] = qs["f"][0]
     if "q" in qs:
@@ -103,10 +122,6 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> list[AvitoItem] | No
         params["priceMin"] = qs["pmin"][0]
     if "pmax" in qs:
         params["priceMax"] = qs["pmax"][0]
-    if "s" in qs:
-        params["sort"] = qs["s"][0]
-    if "user" in qs:
-        params["user"] = qs["user"][0]
 
     try:
         async with httpx.AsyncClient(proxy=proxy, timeout=30, http2=False) as client:
@@ -120,13 +135,17 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> list[AvitoItem] | No
                     "Referer": "https://m.avito.ru/",
                 },
             )
+            # Block detection
+            if resp.status_code in (429, 403):
+                logger.warning("[api] BLOCKED %d for %s", resp.status_code, url[:80])
+                return None, True
             if resp.status_code != 200:
                 logger.debug("[api] HTTP %d for %s", resp.status_code, url[:80])
-                return None
+                return None, False
             try:
                 data = resp.json()
             except Exception:
-                return None
+                return None, False
             items_raw = (data.get("result") or {}).get("items") or []
             items: list[AvitoItem] = []
             for raw in items_raw:
@@ -137,10 +156,10 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> list[AvitoItem] | No
                     items.append(_parse_api_item(val))
                 except Exception as e:
                     logger.debug("parse item err: %s", e)
-            return items
+            return (items if items else None), False
     except Exception as e:
         logger.debug("[api] exception: %s", e)
-        return None
+        return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +172,8 @@ _HYDRATION_RE = re.compile(
 )
 
 
-async def _fetch_hydration_json(url: str, proxy: str | None) -> list[AvitoItem] | None:
+async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
+    """Fetch HTML + extract hydration JSON. Returns (items, blocked)."""
     try:
         async with httpx.AsyncClient(
             proxy=proxy, timeout=60, follow_redirects=False,
@@ -170,24 +190,35 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> list[AvitoItem] 
                     "Accept-Language": "ru-RU,ru;q=0.9",
                 },
             )
+            # Block detection
+            if resp.status_code in (429, 403):
+                logger.warning("[html] BLOCKED %d for %s", resp.status_code, url[:80])
+                return None, True
+            if resp.status_code in (301, 302, 303, 307, 308):
+                logger.warning("[html] REDIRECT %d (block) for %s", resp.status_code, url[:80])
+                return None, True
             if resp.status_code != 200:
                 logger.debug("[html] HTTP %d for %s", resp.status_code, url[:80])
-                return None
+                return None, False
             html = resp.text
+            # Check for Avito block page in HTML
+            if "проблема с ip" in html.lower() or "доступ ограничен" in html.lower():
+                logger.warning("[html] BLOCKED (IP problem) for %s", url[:80])
+                return None, True
     except Exception as e:
         logger.debug("[html] exception: %s", e)
-        return None
+        return None, False
 
     match = _HYDRATION_RE.search(html)
     if not match:
-        return None
+        return None, False
 
     try:
         raw_json = html_lib.unescape(match.group(1))
         data = orjson.loads(raw_json)
     except Exception as e:
         logger.debug("[html] json parse err: %s", e)
-        return None
+        return None, False
 
     # Walk the state tree: common paths
     state = data.get("state") or data
@@ -204,7 +235,7 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> list[AvitoItem] 
             items.append(_parse_api_item(val))
         except Exception as e:
             logger.debug("parse html item err: %s", e)
-    return items if items else None
+    return (items if items else None), False
 
 
 # ---------------------------------------------------------------------------
