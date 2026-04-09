@@ -1,233 +1,209 @@
+"""Per-subscription async scheduler."""
 import asyncio
 import logging
-import re
+import random
+import time
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from database import db
-from parser import parse_listings, enrich_item, AvitoItem
 from config import config
+from database import db
+from parser import AvitoItem, fetch_search_items
 
 logger = logging.getLogger(__name__)
 
-
-def _is_too_old(date_str: str, max_days: int = 2) -> bool:
-    """Check if published date is older than max_days."""
-    from datetime import datetime, timezone, timedelta
-    try:
-        msk = timezone(timedelta(hours=3))
-        now = datetime.now(msk)
-        # Try parsing "HH:MM:SS DD.MM.YYYY"
-        parsed = datetime.strptime(date_str, "%H:%M:%S %d.%m.%Y").replace(tzinfo=msk)
-        return (now - parsed).days >= max_days
-    except ValueError:
-        try:
-            # Try "DD.MM.YYYY"
-            parsed = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=msk)
-            return (now - parsed).days >= max_days
-        except ValueError:
-            return False  # Can't parse — don't filter
-
-
-def _clean_url(url: str) -> str:
-    """Ensure URL is valid for Telegram buttons."""
-    if not url:
-        return "https://www.avito.ru"
-    if not url.startswith("http"):
-        url = "https://www.avito.ru" + url
-    # Remove query params
-    if "?" in url:
-        url = url.split("?")[0]
-    return url
-
-
-def format_notification(item: AvitoItem) -> str:
-    """Format item notification — AvtoRinger style."""
-    url = _clean_url(item.url)
-
-    lines = []
-    # Remove city suffix from title ("Футболка Nike в Москве" → "Футболка Nike")
-    title = item.title
-    if item.location:
-        title = re.sub(rf'\s+в\s+{re.escape(item.location)}е?$', '', title, flags=re.IGNORECASE)
-        title = re.sub(r'\s+в\s+[А-Яа-яё\-]+е?$', '', title)  # "в Челябинске" etc.
-    lines.append(f"<b>{title}</b>")
-    lines.append(f"💰 <b>{item.price}</b>")
-
-    # Stats line
-    stats = []
-    if item.views:
-        stats.append(f"👁 {item.views}")
-    if item.seller_rating:
-        stats.append(f"⭐ {item.seller_rating}")
-    if stats:
-        lines.append(" ".join(stats))
-
-    if item.location:
-        lines.append(f"📍 {item.location}")
-
-    lines.append(f"🔗 <a href=\"{url}\">{url.split('/')[-1][:40]}</a>")
-
-    if item.description:
-        lines.append(f"\n<i>{item.description}</i>")
-
-    if item.seller_name:
-        seller = item.seller_name
-        if seller.lower() not in ("подписаться", "профиль"):
-            lines.append(f"👤 {seller}")
-
-    if item.published_date:
-        lines.append(f"📅 {item.published_date}")
-
-    return "\n".join(lines)
-
-
-def make_item_keyboard(item: AvitoItem) -> InlineKeyboardMarkup:
-    url = _clean_url(item.url)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=url)],
-    ])
-
-
-async def notify_subscription(bot: Bot, sub: dict, items: list[AvitoItem]):
-    """Send new items to a single subscription."""
-    sub_id = sub["id"]
-    telegram_id = sub["telegram_id"]
-    is_first_scan = sub.get("last_checked_at") is None
-
-    # First scan: mark all existing items as seen WITHOUT sending
-    if is_first_scan:
-        for item in items:
-            if item.avito_id:
-                await db.mark_item_sent(sub_id, item.avito_id)
-        logger.info("First scan for sub #%d: marked %d items as seen (no notifications)",
-                     sub_id, len(items))
-        return
-
-    MAX_NEW_PER_CYCLE = 5  # Limit to avoid proxy overload
-
-    new_count = 0
-    for item in items:
-        if not item.avito_id:
-            continue
-
-        already_sent = await db.is_item_sent(sub_id, item.avito_id)
-        if already_sent:
-            continue
-
-        if new_count >= MAX_NEW_PER_CYCLE:
-            # Mark remaining as seen, send on next cycles
-            break
-
-        still_active = await db.is_subscription_active(sub_id)
-        if not still_active:
-            logger.info("Sub #%d deactivated, stopping", sub_id)
-            return
-
-        # Fetch full details from item page (date, description, views, seller)
-        item = await enrich_item(item)
-        await asyncio.sleep(2)  # Don't hammer proxy
-
-        # Skip items older than 2 days by actual publish date
-        if item.published_date and _is_too_old(item.published_date, max_days=2):
-            logger.info("Skipping old item %s (published %s)", item.avito_id, item.published_date)
-            await db.mark_item_sent(sub_id, item.avito_id)
-            continue
-
-        text = format_notification(item)
-        keyboard = make_item_keyboard(item)
-
-        sent = False
-        for attempt in range(2):
-            try:
-                if item.image_url and attempt == 0:
-                    caption = text if len(text) <= 1024 else text[:1020] + "..."
-                    await bot.send_photo(
-                        telegram_id, photo=item.image_url,
-                        caption=caption, parse_mode="HTML",
-                        reply_markup=keyboard,
-                    )
-                else:
-                    await bot.send_message(
-                        telegram_id, text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                        reply_markup=keyboard,
-                    )
-                sent = True
-                break
-            except Exception as e:
-                logger.warning("Send attempt %d failed: %s", attempt + 1, e)
-                if attempt == 0:
-                    await asyncio.sleep(0.5)
-
-        if sent:
-            await db.mark_item_sent(sub_id, item.avito_id)
-            new_count += 1
-
-    if new_count > 0:
-        logger.info("Sent %d new items for sub #%d", new_count, sub_id)
+MSK = timezone(timedelta(hours=3))
+MAX_ITEMS_PER_CYCLE = 10
+MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
 
 
 async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
-    logger.info("Scheduler started (interval: %ds)", config.parse_interval)
-    await asyncio.sleep(5)
+    logger.info(
+        "Scheduler started (interval=%ds, max_concurrent=%d)",
+        config.parse_interval, config.max_concurrent_requests,
+    )
+
+    sem = asyncio.Semaphore(config.max_concurrent_requests)
+    tasks: dict[int, asyncio.Task] = {}
 
     while not stop_event.is_set():
         try:
             subs = await db.get_active_subscriptions()
-            if subs:
-                # Deduplicate: group subscriptions by URL, parse each URL once
-                from collections import defaultdict
-                url_groups: dict[str, list[dict]] = defaultdict(list)
-                for sub in subs:
-                    url_groups[sub["url"]].append(sub)
+        except Exception as e:
+            logger.error("Failed to load subs: %s", e)
+            subs = []
 
-                logger.info(
-                    "Checking %d subscriptions (%d unique URLs)",
-                    len(subs), len(url_groups),
+        active_ids = {s["id"] for s in subs}
+
+        # Cancel tasks for removed/finished subscriptions
+        for sid in list(tasks):
+            if sid not in active_ids or tasks[sid].done():
+                if not tasks[sid].done():
+                    tasks[sid].cancel()
+                tasks.pop(sid, None)
+
+        # Spawn new tasks
+        for sub in subs:
+            if sub["id"] not in tasks:
+                tasks[sub["id"]] = asyncio.create_task(
+                    _sub_loop(dict(sub), bot, sem, stop_event)
                 )
 
-                for url, group_subs in url_groups.items():
-                    if stop_event.is_set():
-                        break
-
-                    items = await parse_listings(url)
-
-                    if items is None:
-                        for sub in group_subs:
-                            try:
-                                deactivated = await db.increment_error(
-                                    sub["id"], "Parse failed or blocked"
-                                )
-                                if deactivated:
-                                    try:
-                                        await bot.send_message(
-                                            sub["telegram_id"],
-                                            f"⚠️ Отслеживание #{sub['id']} остановлено — слишком много ошибок.",
-                                        )
-                                    except Exception:
-                                        pass
-                            except Exception as e:
-                                logger.error("Error incrementing error sub #%d: %s", sub["id"], e)
-                        continue
-
-                    for sub in group_subs:
-                        if stop_event.is_set():
-                            break
-                        try:
-                            await db.reset_errors(sub["id"])
-                            await notify_subscription(bot, sub, items)
-                        except Exception as e:
-                            logger.error("Error sub #%d: %s", sub["id"], e)
-        except Exception as e:
-            logger.error("Scheduler error: %s", e)
-
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=config.parse_interval)
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
             break
         except asyncio.TimeoutError:
             pass
 
+    # Shutdown: cancel all subscription tasks
+    logger.info("Scheduler stopping, cancelling %d tasks", len(tasks))
+    for t in tasks.values():
+        t.cancel()
+    for t in tasks.values():
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
     logger.info("Scheduler stopped")
+
+
+async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asyncio.Event):
+    """One loop per subscription."""
+    # Stagger startup so we don't hit Avito from all tasks at once
+    await asyncio.sleep(random.uniform(0, 30))
+    logger.info("Sub #%d loop started", sub["id"])
+
+    while not stop_event.is_set():
+        try:
+            proxy = config.proxy_list[0] if config.proxy_list else None
+            async with sem:
+                items = await fetch_search_items(sub["url"], proxy)
+
+            if items is None:
+                logger.warning("Sub #%d: parse failed (None)", sub["id"])
+                await db.increment_error(sub["id"], "Parse failed")
+            else:
+                await _process_items(sub, items, bot)
+                await db.update_last_checked(sub["id"])
+                # Update in-memory last_checked_at so next cycle is not a "first scan"
+                sub["last_checked_at"] = datetime.now(timezone.utc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Sub #%d loop error", sub["id"])
+            try:
+                await db.increment_error(sub["id"], str(e)[:200])
+            except Exception:
+                pass
+
+        # Jittered sleep
+        wait = max(10, config.parse_interval + random.uniform(-8, 8))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Sub #%d loop stopped", sub["id"])
+
+
+async def _process_items(sub: dict, items: list[AvitoItem], bot: Bot):
+    is_first_scan = sub.get("last_checked_at") is None
+
+    if is_first_scan:
+        ids = [i.avito_id for i in items if i.avito_id]
+        await db.mark_items_sent_batch(sub["id"], ids)
+        logger.info("Sub #%d first scan: marked %d items as seen", sub["id"], len(ids))
+        return
+
+    # Find new items
+    new_items: list[AvitoItem] = []
+    for item in items:
+        if not item.avito_id:
+            continue
+        if not await db.is_item_sent(sub["id"], item.avito_id):
+            new_items.append(item)
+
+    if not new_items:
+        return
+
+    # Filter by age (skip items older than 2 days)
+    now_ts = int(time.time())
+    cutoff = now_ts - MAX_AGE_SECONDS
+    fresh = [
+        i for i in new_items
+        if not i.published_timestamp or i.published_timestamp >= cutoff
+    ]
+
+    # Limit per cycle
+    to_send = fresh[:MAX_ITEMS_PER_CYCLE]
+
+    logger.info(
+        "Sub #%d: %d new, %d fresh, %d to send",
+        sub["id"], len(new_items), len(fresh), len(to_send),
+    )
+
+    sent_ids: set[str] = set()
+    for item in to_send:
+        try:
+            await _send_notification(bot, sub, item)
+            sent_ids.add(item.avito_id)
+            await db.mark_item_sent(sub["id"], item.avito_id)
+        except Exception as e:
+            logger.warning("Send failed for %s: %s", item.avito_id, e)
+        await asyncio.sleep(0.5)
+
+    # Mark everything else (too old or beyond the per-cycle limit) as seen
+    leftover_ids = [
+        i.avito_id for i in new_items
+        if i.avito_id and i.avito_id not in sent_ids
+    ]
+    if leftover_ids:
+        await db.mark_items_sent_batch(sub["id"], leftover_ids)
+
+
+async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
+    text = _format_notification(item)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=item.url)],
+    ])
+    if item.image_url:
+        caption = text if len(text) <= 1024 else text[:1020] + "..."
+        try:
+            await bot.send_photo(
+                sub["telegram_id"], photo=item.image_url,
+                caption=caption, parse_mode="HTML", reply_markup=keyboard,
+            )
+            return
+        except Exception as e:
+            logger.debug("send_photo failed (%s), fallback to text", e)
+
+    await bot.send_message(
+        sub["telegram_id"], text,
+        parse_mode="HTML", reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+def _format_notification(item: AvitoItem) -> str:
+    lines = [f"<b>{_escape(item.title)}</b>"]
+    lines.append(f"💰 <b>{_escape(item.price)}</b>")
+    if item.location:
+        lines.append(f"📍 {_escape(item.location)}")
+    lines.append(f"🔗 {item.url}")
+    if item.description:
+        lines.append(f"\n<i>{_escape(item.description)}</i>")
+    if item.seller_name:
+        lines.append(f"\n👤 {_escape(item.seller_name)}")
+    if item.published_timestamp:
+        dt = datetime.fromtimestamp(item.published_timestamp, MSK)
+        lines.append(f"📅 {dt.strftime('%H:%M %d.%m.%Y')}")
+    return "\n".join(lines)
+
+
+def _escape(s: str) -> str:
+    if not s:
+        return ""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

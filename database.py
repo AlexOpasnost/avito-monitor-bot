@@ -1,3 +1,4 @@
+import asyncio
 import asyncpg
 import logging
 from datetime import datetime, timezone
@@ -12,14 +13,12 @@ class Database:
         self.pool: asyncpg.Pool | None = None
 
     async def connect(self):
-        import asyncio
-        # Step 1: wake up Neon with direct connection
+        # Step 1: wake up PG (Neon/Railway) with direct connection
         for attempt in range(10):
             try:
                 conn = await asyncpg.connect(config.database_url, timeout=30)
                 await conn.fetchval("SELECT 1")
-                logger.info("Neon is awake (attempt %d)", attempt + 1)
-                # Create tables using direct connection (more stable)
+                logger.info("DB is awake (attempt %d)", attempt + 1)
                 exists = await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='users')"
                 )
@@ -28,7 +27,6 @@ class Database:
                     await self._create_tables_on_conn(conn)
                 else:
                     logger.info("Tables already exist")
-                # Always run migrations
                 await self._run_migrations(conn)
                 await conn.close()
                 break
@@ -36,9 +34,8 @@ class Database:
                 logger.warning("DB wake attempt %d/10: %s", attempt + 1, e)
                 await asyncio.sleep(5)
         else:
-            raise RuntimeError("Failed to connect to Neon after 10 attempts")
+            raise RuntimeError("Failed to connect to DB after 10 attempts")
 
-        # Step 2: create pool (Neon is already awake)
         self.pool = await self._create_pool()
         logger.info("Database pool created")
 
@@ -52,35 +49,12 @@ class Database:
             max_inactive_connection_lifetime=30,
         )
 
-    async def _get_conn(self):
-        """Get a working connection, recreating pool if needed."""
-        try:
-            conn = await self.pool.acquire()
-            # Quick health check
-            await conn.fetchval("SELECT 1")
-            return conn
-        except Exception:
-            logger.warning("DB pool dead, reconnecting...")
-            try:
-                await self.pool.close()
-            except Exception:
-                pass
-            self.pool = await self._create_pool()
-            return await self.pool.acquire()
-
-    async def _release_conn(self, conn):
-        try:
-            await self.pool.release(conn)
-        except Exception:
-            pass
-
     async def _execute(self, coro_fn):
         """Execute a DB operation with automatic reconnect on failure."""
-        import asyncio
         for attempt in range(3):
             conn = None
             try:
-                conn = await asyncio.wait_for(self._get_conn(), timeout=10)
+                conn = await asyncio.wait_for(self.pool.acquire(), timeout=10)
                 return await asyncio.wait_for(coro_fn(conn), timeout=30)
             except (asyncpg.ConnectionDoesNotExistError,
                     asyncpg.InterfaceError,
@@ -88,9 +62,11 @@ class Database:
                     asyncio.TimeoutError) as e:
                 logger.warning("DB error (attempt %d/3): %s", attempt + 1, e)
                 if conn:
-                    await self._release_conn(conn)
+                    try:
+                        await self.pool.release(conn)
+                    except Exception:
+                        pass
                     conn = None
-                # Quick pool recreate
                 try:
                     await asyncio.wait_for(self.pool.close(), timeout=5)
                 except Exception:
@@ -99,7 +75,10 @@ class Database:
                 await asyncio.sleep(1)
             finally:
                 if conn:
-                    await self._release_conn(conn)
+                    try:
+                        await self.pool.release(conn)
+                    except Exception:
+                        pass
         raise RuntimeError("DB operation failed after 3 attempts")
 
     async def close(self):
@@ -107,7 +86,6 @@ class Database:
             await self.pool.close()
 
     async def _create_tables_on_conn(self, conn):
-        """Create tables using a direct connection (not pool)."""
         await conn.execute("""CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT UNIQUE NOT NULL,
@@ -119,10 +97,12 @@ class Database:
             user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             url TEXT NOT NULL,
             is_active BOOLEAN DEFAULT TRUE,
+            deleted BOOLEAN DEFAULT FALSE,
             error_count INT DEFAULT 0,
             last_error TEXT,
             last_checked_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ DEFAULT NOW()
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            filter_whitelist TEXT
         )""")
         await conn.execute("""CREATE TABLE IF NOT EXISTS sent_items (
             id SERIAL PRIMARY KEY,
@@ -131,23 +111,21 @@ class Database:
             sent_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(subscription_id, avito_id)
         )""")
-        await conn.execute("""CREATE INDEX IF NOT EXISTS idx_subscriptions_active
-            ON subscriptions(is_active) WHERE is_active = TRUE""")
-        await conn.execute("""CREATE INDEX IF NOT EXISTS idx_sent_items_lookup
-            ON sent_items(subscription_id, avito_id)""")
-        logger.info("Tables created successfully")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subscriptions_active "
+            "ON subscriptions(is_active) WHERE is_active = TRUE"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sent_items_lookup "
+            "ON sent_items(subscription_id, avito_id)"
+        )
 
     async def _run_migrations(self, conn):
-        """Run schema migrations (safe to call multiple times)."""
+        """Safe-to-rerun migrations."""
         try:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE"
             )
-            # Mark all currently inactive subs as deleted (one-time cleanup)
-            await conn.execute(
-                "UPDATE subscriptions SET deleted = TRUE WHERE is_active = FALSE AND deleted = FALSE"
-            )
-            # Filter whitelist: JSON dict of allowed attribute values per subscription
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS filter_whitelist TEXT"
             )
@@ -176,7 +154,8 @@ class Database:
     async def add_subscription(self, user_id: int, url: str) -> int | None:
         async def _op(conn):
             count = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND is_active = TRUE",
+                "SELECT COUNT(*) FROM subscriptions "
+                "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
                 user_id,
             )
             if count >= config.max_subscriptions:
@@ -188,7 +167,7 @@ class Database:
             return row["id"]
         return await self._execute(_op)
 
-    async def get_user_subscriptions(self, user_id: int) -> list[asyncpg.Record]:
+    async def get_user_subscriptions(self, user_id: int):
         async def _op(conn):
             return await conn.fetch(
                 "SELECT id, url, is_active, created_at, last_checked_at, error_count "
@@ -198,41 +177,34 @@ class Database:
             )
         return await self._execute(_op)
 
-    async def get_active_subscriptions(self) -> list[asyncpg.Record]:
+    async def get_active_subscriptions(self):
         async def _op(conn):
             return await conn.fetch(
                 "SELECT s.id, s.url, s.user_id, s.last_checked_at, u.telegram_id "
                 "FROM subscriptions s "
                 "JOIN users u ON u.id = s.user_id "
-                "WHERE s.is_active = TRUE"
+                "WHERE s.is_active = TRUE AND s.deleted = FALSE"
             )
         return await self._execute(_op)
 
-    async def is_subscription_active(self, sub_id: int) -> bool:
-        async def _op(conn):
-            return await conn.fetchval(
-                "SELECT is_active FROM subscriptions WHERE id = $1", sub_id
-            ) or False
-        return await self._execute(_op)
-
     async def deactivate_subscription(self, sub_id: int):
-        """Mark subscription as deleted (won't be restored by /start)."""
         async def _op(conn):
             await conn.execute(
-                "UPDATE subscriptions SET is_active = FALSE, deleted = TRUE WHERE id = $1", sub_id
+                "UPDATE subscriptions SET is_active = FALSE, deleted = TRUE WHERE id = $1",
+                sub_id,
             )
         await self._execute(_op)
 
     async def deactivate_all(self, user_id: int):
         async def _op(conn):
             await conn.execute(
-                "UPDATE subscriptions SET is_active = FALSE WHERE user_id = $1 AND is_active = TRUE",
+                "UPDATE subscriptions SET is_active = FALSE "
+                "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
                 user_id,
             )
         await self._execute(_op)
 
     async def reactivate_all(self, user_id: int) -> int:
-        """Reactivate paused (not deleted) subscriptions. Reset last_checked for first-scan."""
         async def _op(conn):
             result = await conn.execute(
                 "UPDATE subscriptions SET is_active = TRUE, error_count = 0, "
@@ -243,8 +215,16 @@ class Database:
             return int(result.split()[-1])
         return await self._execute(_op)
 
+    async def update_last_checked(self, sub_id: int):
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE subscriptions SET last_checked_at = $2, error_count = 0, last_error = NULL "
+                "WHERE id = $1",
+                sub_id, datetime.now(timezone.utc),
+            )
+        await self._execute(_op)
 
-    async def increment_error(self, sub_id: int, error_msg: str):
+    async def increment_error(self, sub_id: int, error_msg: str) -> bool:
         async def _op(conn):
             row = await conn.fetchrow(
                 "UPDATE subscriptions SET error_count = error_count + 1, last_error = $2 "
@@ -259,21 +239,13 @@ class Database:
             return False
         return await self._execute(_op)
 
-    async def reset_errors(self, sub_id: int):
-        async def _op(conn):
-            await conn.execute(
-                "UPDATE subscriptions SET error_count = 0, last_error = NULL, "
-                "last_checked_at = $2 WHERE id = $1",
-                sub_id, datetime.now(timezone.utc),
-            )
-        await self._execute(_op)
-
     # --- Sent Items ---
 
     async def is_item_sent(self, sub_id: int, avito_id: str) -> bool:
         async def _op(conn):
             return await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM sent_items WHERE subscription_id = $1 AND avito_id = $2)",
+                "SELECT EXISTS(SELECT 1 FROM sent_items "
+                "WHERE subscription_id = $1 AND avito_id = $2)",
                 sub_id, avito_id,
             )
         return await self._execute(_op)
@@ -287,24 +259,16 @@ class Database:
             )
         await self._execute(_op)
 
-    # --- Filter Whitelist ---
-
-    async def save_filter_whitelist(self, sub_id: int, json_str: str):
-        """Save filter whitelist JSON string for a subscription."""
+    async def mark_items_sent_batch(self, sub_id: int, avito_ids: list[str]):
+        if not avito_ids:
+            return
         async def _op(conn):
-            await conn.execute(
-                "UPDATE subscriptions SET filter_whitelist = $2 WHERE id = $1",
-                sub_id, json_str,
+            await conn.executemany(
+                "INSERT INTO sent_items (subscription_id, avito_id) VALUES ($1, $2) "
+                "ON CONFLICT DO NOTHING",
+                [(sub_id, aid) for aid in avito_ids if aid],
             )
         await self._execute(_op)
-
-    async def get_filter_whitelist(self, sub_id: int) -> str | None:
-        """Get filter whitelist JSON string for a subscription, or None."""
-        async def _op(conn):
-            return await conn.fetchval(
-                "SELECT filter_whitelist FROM subscriptions WHERE id = $1", sub_id
-            )
-        return await self._execute(_op)
 
     # --- Profile / Stats ---
 
@@ -314,10 +278,13 @@ class Database:
                 "SELECT telegram_id, username, created_at FROM users WHERE id = $1", user_id
             )
             total_subs = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1", user_id
+                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND deleted = FALSE",
+                user_id,
             )
             active_subs = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND is_active = TRUE", user_id
+                "SELECT COUNT(*) FROM subscriptions "
+                "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
+                user_id,
             )
             total_found = await conn.fetchval(
                 "SELECT COUNT(*) FROM sent_items si "
@@ -338,15 +305,16 @@ class Database:
             }
         return await self._execute(_op)
 
-
     async def get_admin_stats(self) -> dict:
         async def _op(conn):
             total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
             active_subs = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE is_active = TRUE"
+                "SELECT COUNT(*) FROM subscriptions "
+                "WHERE is_active = TRUE AND deleted = FALSE"
             )
             unique_urls = await conn.fetchval(
-                "SELECT COUNT(DISTINCT url) FROM subscriptions WHERE is_active = TRUE"
+                "SELECT COUNT(DISTINCT url) FROM subscriptions "
+                "WHERE is_active = TRUE AND deleted = FALSE"
             )
             total_sent = await conn.fetchval("SELECT COUNT(*) FROM sent_items")
             last_checked = await conn.fetchval(
