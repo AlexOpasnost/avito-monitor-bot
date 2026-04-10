@@ -244,38 +244,132 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
         logger.debug("[html] exception: %s", e)
         return None, False
 
+    # Method 1: data-mfe-state hydration JSON (modern Avito)
     match = _HYDRATION_RE.search(html)
-    if not match:
-        return None, False
-
-    try:
-        raw_json = html_lib.unescape(match.group(1))
-        data = orjson.loads(raw_json)
-    except Exception as e:
-        logger.debug("[html] json parse err: %s", e)
-        return None, False
-
-    # Walk the state tree: common paths
-    state = data.get("state") or data
-    catalog = (state.get("data") or {}).get("catalog") or state.get("catalog") or {}
-    items_raw = catalog.get("items") or []
-    items: list[AvitoItem] = []
-    for raw in items_raw:
-        if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
-            continue
-        val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
-        if not isinstance(val, dict):
-            continue
+    if match:
         try:
-            items.append(_parse_api_item(val))
+            raw_json = html_lib.unescape(match.group(1))
+            data = orjson.loads(raw_json)
+            state = data.get("state") or data
+            catalog = (state.get("data") or {}).get("catalog") or state.get("catalog") or {}
+            items_raw = catalog.get("items") or []
+            items: list[AvitoItem] = []
+            for raw in items_raw:
+                if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
+                    continue
+                val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
+                if not isinstance(val, dict):
+                    continue
+                try:
+                    items.append(_parse_api_item(val))
+                except Exception:
+                    pass
+            if items:
+                logger.info("[html] parsed %d items from mfe-state", len(items))
+                return items, False
         except Exception as e:
-            logger.debug("parse html item err: %s", e)
-    return (items if items else None), False
+            logger.debug("[html] mfe-state parse err: %s", e)
+
+    # Method 2: __initialData__ (URL-encoded JSON in older Avito pages)
+    from urllib.parse import unquote
+    init_match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+    if init_match:
+        try:
+            raw_json = unquote(init_match.group(1))
+            data = orjson.loads(raw_json)
+            items = _extract_items_from_json(data)
+            if items:
+                logger.info("[html] parsed %d items from __initialData__", len(items))
+                return items, False
+        except Exception as e:
+            logger.debug("[html] __initialData__ parse err: %s", e)
+
+    # Method 3: __preloadedState_ (another JSON variant)
+    for var_name in ['__preloadedState_', '__preloadedState__']:
+        ps_match = re.search(rf'window\.{var_name}\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+        if ps_match:
+            try:
+                raw_json = unquote(ps_match.group(1))
+                data = orjson.loads(raw_json)
+                items = _extract_items_from_json(data)
+                if items:
+                    logger.info("[html] parsed %d items from %s", len(items), var_name)
+                    return items, False
+            except Exception:
+                pass
+
+    # Method 4: data-item-id from HTML (last resort)
+    item_ids = re.findall(r'data-item-id="(\d+)"', html)
+    if len(item_ids) >= 3:
+        items = []
+        for item_id in item_ids:
+            # Extract minimal info: title from nearby link
+            idx = html.find(f'data-item-id="{item_id}"')
+            block = html[idx:idx + 3000] if idx >= 0 else ""
+            title_m = re.search(r'title="([^"]{5,80})"', block)
+            title = title_m.group(1) if title_m else f"Объявление {item_id}"
+            # Skip junk titles
+            if "избранное" in title.lower() or "сравнение" in title.lower():
+                title_m2 = re.search(r'href="[^"]*"[^>]*>([^<]{5,80})<', block)
+                title = title_m2.group(1).strip() if title_m2 else f"Объявление {item_id}"
+            url_m = re.search(rf'href="(/[^"]*?{item_id}[^"]*?)"', block)
+            url_path = url_m.group(1).split("?")[0] if url_m else f"/{item_id}"
+            price_m = re.search(r'(\d[\d\s]*\d)\s*₽', block)
+            price = (price_m.group(1).strip() + " ₽") if price_m else ""
+            items.append(AvitoItem(
+                avito_id=item_id, title=title, price=price, price_value=None,
+                url=f"https://www.avito.ru{url_path}",
+                image_url=None, location=None, description=None,
+                seller_name=None, published_timestamp=None,
+            ))
+        logger.info("[html] parsed %d items from data-item-id", len(items))
+        return items, False
+
+    logger.warning("[html] no items found in HTML (size=%d)", len(html))
+    return None, False
 
 
 # ---------------------------------------------------------------------------
 # Item parsing
 # ---------------------------------------------------------------------------
+
+def _extract_items_from_json(data: dict) -> list[AvitoItem]:
+    """Recursively find items array in a nested JSON structure."""
+    # Try common paths
+    for path in [
+        lambda d: d.get("items", []),
+        lambda d: d.get("catalog", {}).get("items", []),
+        lambda d: d.get("results", []),
+    ]:
+        items_raw = path(data)
+        if isinstance(items_raw, list) and len(items_raw) >= 3:
+            items = []
+            for raw in items_raw:
+                if not isinstance(raw, dict):
+                    continue
+                val = raw.get("value", raw) if "value" in raw else raw
+                if not isinstance(val, dict):
+                    continue
+                # Must have id + urlPath or price (real listing, not category)
+                if not (val.get("id") or val.get("itemId")):
+                    continue
+                if not (val.get("urlPath") or val.get("price") or val.get("priceDetailed")):
+                    continue
+                try:
+                    items.append(_parse_api_item(val))
+                except Exception:
+                    pass
+            if items:
+                return items
+
+    # Recurse into dict values
+    for key, val in data.items():
+        if isinstance(val, dict) and len(str(val)) > 1000:
+            result = _extract_items_from_json(val)
+            if result:
+                return result
+    return []
+
 
 def _parse_api_item(val: dict) -> AvitoItem:
     avito_id = str(val.get("id") or val.get("itemId") or "")
