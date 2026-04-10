@@ -335,8 +335,22 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
                 logger.info("[html] parsed %d items from %s", len(items), var_name)
                 return items, False
             else:
-                logger.info("[html] %s found but no items extracted (keys: %s)",
-                           var_name, list(data.keys())[:8] if isinstance(data, dict) else "?")
+                # Log deeper structure to find where items hide
+                keys_info = list(data.keys())[:8] if isinstance(data, dict) else "?"
+                logger.info("[html] %s found but no items (keys: %s)", var_name, keys_info)
+                # Dig into first-level values
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            sub_keys = list(v.keys())[:8]
+                            size = len(str(v))
+                            if size > 5000:
+                                logger.info("[html]   %s.%s (%d chars): %s", var_name, k, size, sub_keys)
+                                # Try second level
+                                for k2, v2 in v.items():
+                                    if isinstance(v2, dict) and len(str(v2)) > 5000:
+                                        logger.info("[html]     %s.%s.%s (%d chars): %s",
+                                                   var_name, k, k2, len(str(v2)), list(v2.keys())[:8])
         except Exception as e:
             logger.debug("[html] %s parse error: %s", var_name, e)
 
