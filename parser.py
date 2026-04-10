@@ -285,19 +285,60 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
         except Exception as e:
             logger.debug("[html] __initialData__ parse err: %s", e)
 
-    # Method 3: __preloadedState_ (another JSON variant)
-    for var_name in ['__preloadedState_', '__preloadedState__']:
-        ps_match = re.search(rf'window\.{var_name}\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
-        if ps_match:
-            try:
-                raw_json = unquote(ps_match.group(1))
-                data = orjson.loads(raw_json)
-                items = _extract_items_from_json(data)
-                if items:
-                    logger.info("[html] parsed %d items from %s", len(items), var_name)
-                    return items, False
-            except Exception:
-                pass
+    # Method 3: __preloadedState__ or __mfe__ (URL-encoded JSON in quotes)
+    for var_name in ['__preloadedState__', '__preloadedState_', '__mfe__']:
+        marker = f'window.{var_name}'
+        idx = html.find(marker)
+        if idx < 0:
+            continue
+        # Find the opening quote after =
+        eq_idx = html.find('=', idx)
+        if eq_idx < 0:
+            continue
+        # Skip whitespace after =
+        start = eq_idx + 1
+        while start < len(html) and html[start] in ' \t\n\r':
+            start += 1
+        if start >= len(html):
+            continue
+
+        try:
+            if html[start] == '"':
+                # URL-encoded string: "...encoded..."
+                end = html.find('";', start + 1)
+                if end < 0:
+                    end = html.find('"', start + 1)
+                if end > start:
+                    encoded = html[start + 1:end]
+                    decoded = unquote(encoded)
+                    data = orjson.loads(decoded)
+            elif html[start] == '{':
+                # Raw JSON object — find matching }
+                depth = 0
+                i = start
+                while i < min(len(html), start + 5_000_000):
+                    if html[i] == '{':
+                        depth += 1
+                    elif html[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            data = orjson.loads(html[start:i + 1])
+                            break
+                    i += 1
+                else:
+                    continue
+            else:
+                continue
+
+            items = _extract_items_from_json(data)
+            if items:
+                logger.info("[html] parsed %d items from %s", len(items), var_name)
+                return items, False
+            else:
+                logger.info("[html] %s found but no items extracted (keys: %s)",
+                           var_name, list(data.keys())[:8] if isinstance(data, dict) else "?")
+        except Exception as e:
+            logger.debug("[html] %s parse error: %s", var_name, e)
 
     # Debug: what JS vars and scripts are on the page?
     js_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
