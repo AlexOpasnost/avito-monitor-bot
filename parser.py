@@ -57,9 +57,9 @@ async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) 
 
         # Blocked — rotate IP and retry
         logger.warning("Blocked (attempt %d/%d), rotating IP", attempt + 1, max_retries)
+        _invalidate_session()
         rotated = await rotate_ip()
         if rotated:
-            # Wait for new IP to stabilize
             await asyncio.sleep(5)
         else:
             await asyncio.sleep(10)
@@ -166,6 +166,52 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
 # HTML fallback (hydration JSON)
 # ---------------------------------------------------------------------------
 
+_cs_session = None
+_cs_created = 0.0
+
+
+def _get_cloudscraper(proxy: str | None):
+    """Get or create a cloudscraper session (reuse for cookies)."""
+    import time
+    global _cs_session, _cs_created
+    now = time.time()
+    if _cs_session and (now - _cs_created) < 300:
+        return _cs_session
+    import cloudscraper
+    s = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+    )
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    # Warmup: visit main page for cookies
+    try:
+        r = s.get("https://www.avito.ru/", proxies=proxies, timeout=20)
+        logger.info("[html] warmup: HTTP %d, %d cookies", r.status_code, len(s.cookies))
+    except Exception as e:
+        logger.warning("[html] warmup failed: %s", e)
+    _cs_session = s
+    _cs_created = now
+    return s
+
+
+def _fetch_html_sync(url: str, proxy: str | None) -> tuple[int, str] | None:
+    """Fetch Avito HTML with cloudscraper (sync, runs in thread)."""
+    try:
+        s = _get_cloudscraper(proxy)
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = s.get(url, proxies=proxies, timeout=60, allow_redirects=False)
+        return resp.status_code, resp.text
+    except Exception as e:
+        logger.debug("[html] sync fetch error: %s", e)
+        return None
+
+
+def _invalidate_session():
+    """Reset cloudscraper session (after IP rotation)."""
+    global _cs_session, _cs_created
+    _cs_session = None
+    _cs_created = 0.0
+
+
 _HYDRATION_RE = re.compile(
     r'<script[^>]*data-mfe-state="true"[^>]*>([^<]+)</script>',
     re.IGNORECASE,
@@ -173,38 +219,27 @@ _HYDRATION_RE = re.compile(
 
 
 async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
-    """Fetch HTML + extract hydration JSON. Returns (items, blocked)."""
+    """Fetch HTML with cloudscraper (bypasses WAF) + extract hydration JSON."""
+    import asyncio
     try:
-        async with httpx.AsyncClient(
-            proxy=proxy, timeout=60, follow_redirects=False,
-        ) as client:
-            resp = await client.get(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml",
-                    "Accept-Language": "ru-RU,ru;q=0.9",
-                },
-            )
-            # Block detection
-            if resp.status_code in (429, 403):
-                logger.warning("[html] BLOCKED %d for %s", resp.status_code, url[:80])
-                return None, True
-            if resp.status_code in (301, 302, 303, 307, 308):
-                logger.warning("[html] REDIRECT %d (block) for %s", resp.status_code, url[:80])
-                return None, True
-            if resp.status_code != 200:
-                logger.debug("[html] HTTP %d for %s", resp.status_code, url[:80])
-                return None, False
-            html = resp.text
-            # Check for Avito block page in HTML
-            if "проблема с ip" in html.lower() or "доступ ограничен" in html.lower():
-                logger.warning("[html] BLOCKED (IP problem) for %s", url[:80])
-                return None, True
+        loop = asyncio.get_running_loop()
+        resp_data = await loop.run_in_executor(None, lambda: _fetch_html_sync(url, proxy))
+        if resp_data is None:
+            return None, False
+        status, html = resp_data
+        if status in (429, 403):
+            logger.warning("[html] BLOCKED %d for %s", status, url[:80])
+            return None, True
+        if status in (301, 302, 303, 307, 308):
+            logger.warning("[html] REDIRECT %d (block) for %s", status, url[:80])
+            return None, True
+        if status != 200:
+            logger.debug("[html] HTTP %d for %s", status, url[:80])
+            return None, False
+        if "проблема с ip" in html.lower() or "доступ ограничен" in html.lower():
+            logger.warning("[html] BLOCKED (IP problem) for %s", url[:80])
+            return None, True
+        logger.info("[html] Page loaded: %d, size=%d", status, len(html))
     except Exception as e:
         logger.debug("[html] exception: %s", e)
         return None, False
