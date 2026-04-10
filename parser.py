@@ -298,6 +298,12 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
             except Exception:
                 pass
 
+    # Debug: what JS vars and scripts are on the page?
+    js_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
+    mfe_scripts = re.findall(r'data-mfe-state', html[:50000])
+    logger.info("[html] JS vars: %s, mfe-state tags: %d, page size: %d",
+                js_vars[:5], len(mfe_scripts), len(html))
+
     # Method 4: data-item-id from HTML (last resort)
     item_ids = re.findall(r'data-item-id="(\d+)"', html)
     if len(item_ids) >= 3:
