@@ -101,20 +101,20 @@ async def check_proxy_ip() -> str | None:
 # ---------------------------------------------------------------------------
 
 async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
-    """Fetch via the Avito mobile API. Returns (items, blocked).
-    blocked=True means IP is rate-limited/banned."""
+    """Fetch via the Avito mobile API using curl_cffi (Chrome TLS fingerprint).
+    Returns (items, blocked). blocked=True means IP is rate-limited/banned."""
+    import asyncio
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
+    api_url = "https://m.avito.ru/api/11/items"
     params = {
         "key": config.avito_api_key,
-        "locationId": "621540",  # Russia default
+        "locationId": "621540",
         "limit": "50",
         "display": "list",
         "sort": "date",
     }
-
-    # Pass canonical filter params through (no path — it breaks the API)
     if "f" in qs:
         params["f"] = qs["f"][0]
     if "q" in qs:
@@ -124,40 +124,52 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
     if "pmax" in qs:
         params["priceMax"] = qs["pmax"][0]
 
-    try:
-        async with httpx.AsyncClient(proxy=proxy, timeout=30, http2=False) as client:
-            resp = await client.get(
-                "https://m.avito.ru/api/11/items",
-                params=params,
+    def _do_request():
+        from curl_cffi import requests as curl_requests
+        from urllib.parse import urlencode
+        full_url = api_url + "?" + urlencode(params)
+        try:
+            resp = curl_requests.get(
+                full_url,
+                proxy=proxy,
+                impersonate="chrome",
                 headers={
-                    "User-Agent": config.user_agent,
                     "Accept": "application/json",
                     "Accept-Language": "ru-RU,ru;q=0.9",
                     "Referer": "https://m.avito.ru/",
                 },
+                timeout=30,
             )
-            # Block detection
-            if resp.status_code in (429, 403):
-                logger.warning("[api] BLOCKED %d for %s", resp.status_code, url[:80])
-                return None, True
-            if resp.status_code != 200:
-                logger.debug("[api] HTTP %d for %s", resp.status_code, url[:80])
-                return None, False
+            return resp.status_code, resp.text
+        except Exception as e:
+            logger.debug("[api] curl_cffi error: %s", e)
+            return 0, ""
+
+    try:
+        loop = asyncio.get_running_loop()
+        status, text = await loop.run_in_executor(None, _do_request)
+
+        if status in (429, 403):
+            logger.warning("[api] BLOCKED %d for %s", status, url[:80])
+            return None, True
+        if status != 200:
+            logger.debug("[api] HTTP %d for %s", status, url[:80])
+            return None, False
+
+        data = orjson.loads(text)
+        items_raw = (data.get("result") or {}).get("items") or []
+        items: list[AvitoItem] = []
+        for raw in items_raw:
+            if raw.get("type") != "item":
+                continue
+            val = raw.get("value") or {}
             try:
-                data = resp.json()
-            except Exception:
-                return None, False
-            items_raw = (data.get("result") or {}).get("items") or []
-            items: list[AvitoItem] = []
-            for raw in items_raw:
-                if raw.get("type") != "item":
-                    continue
-                val = raw.get("value") or {}
-                try:
-                    items.append(_parse_api_item(val))
-                except Exception as e:
-                    logger.debug("parse item err: %s", e)
-            return (items if items else None), False
+                items.append(_parse_api_item(val))
+            except Exception as e:
+                logger.debug("parse item err: %s", e)
+        if items:
+            logger.info("[api] SUCCESS: %d items from mobile API", len(items))
+        return (items if items else None), False
     except Exception as e:
         logger.debug("[api] exception: %s", e)
         return None, False
