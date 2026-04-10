@@ -125,14 +125,14 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
         params["priceMax"] = qs["pmax"][0]
 
     def _do_request():
-        from curl_cffi import requests as curl_requests
         from urllib.parse import urlencode
         full_url = api_url + "?" + urlencode(params)
         try:
-            resp = curl_requests.get(
+            scraper = _get_cloudscraper(proxy)
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            resp = scraper.get(
                 full_url,
-                proxy=proxy,
-                impersonate="chrome",
+                proxies=proxies,
                 headers={
                     "Accept": "application/json",
                     "Accept-Language": "ru-RU,ru;q=0.9",
@@ -142,7 +142,7 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
             )
             return resp.status_code, resp.text
         except Exception as e:
-            logger.debug("[api] curl_cffi error: %s", e)
+            logger.debug("[api] cloudscraper error: %s", e)
             return 0, ""
 
     try:
