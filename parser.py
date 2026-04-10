@@ -43,26 +43,27 @@ async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) 
             logger.info("[api] fetched %d items for %s", len(items), url[:80])
             return items
 
-        # ALWAYS try HTML fallback — even if API was blocked
-        # cloudscraper has different TLS fingerprint than httpx
-        logger.info("[api] failed (blocked=%s), trying HTML fallback...", api_blocked)
+        # API blocked — rotate IP FIRST, then try HTML with fresh IP + fresh session
+        if api_blocked:
+            logger.info("[api] blocked, rotating IP before HTML fallback...")
+            _invalidate_session()
+            await rotate_ip()
+            await asyncio.sleep(3)
+
+        # Try HTML fallback with (possibly fresh) IP
         items, html_blocked = await _fetch_hydration_json(url, proxy)
         if items is not None:
             logger.info("[html] fetched %d items for %s", len(items), url[:80])
             return items
 
         if not api_blocked and not html_blocked:
-            # Neither blocked, just no data — give up
             return None
 
-        # Both blocked — rotate IP and retry
-        logger.warning("Both methods blocked (attempt %d/%d), rotating IP", attempt + 1, max_retries)
-        _invalidate_session()
-        rotated = await rotate_ip()
-        if rotated:
+        if html_blocked:
+            logger.warning("HTML also blocked (attempt %d/%d), rotating IP again", attempt + 1, max_retries)
+            _invalidate_session()
+            await rotate_ip()
             await asyncio.sleep(5)
-        else:
-            await asyncio.sleep(10)
 
     logger.error("All %d attempts blocked for %s", max_retries, url[:80])
     return None
