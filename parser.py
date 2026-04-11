@@ -195,12 +195,17 @@ def _get_cloudscraper(proxy: str | None):
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    # Warmup: visit main page for cookies
+    # Warmup: visit BOTH domains for cookies
     try:
         r = s.get("https://www.avito.ru/", proxies=proxies, timeout=20)
-        logger.info("[html] warmup: HTTP %d, %d cookies", r.status_code, len(s.cookies))
+        logger.info("[html] warmup www: HTTP %d, %d cookies", r.status_code, len(s.cookies))
     except Exception as e:
-        logger.warning("[html] warmup failed: %s", e)
+        logger.warning("[html] warmup www failed: %s", e)
+    try:
+        r2 = s.get("https://m.avito.ru/", proxies=proxies, timeout=20)
+        logger.info("[html] warmup m: HTTP %d, %d cookies", r2.status_code, len(s.cookies))
+    except Exception as e:
+        logger.warning("[html] warmup m failed: %s", e)
     _cs_session = s
     _cs_created = now
     return s
@@ -257,31 +262,39 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
         logger.debug("[html] exception: %s", e)
         return None, False
 
-    # Method 1: data-mfe-state hydration JSON (modern Avito)
-    match = _HYDRATION_RE.search(html)
-    if match:
-        try:
-            raw_json = html_lib.unescape(match.group(1))
-            data = orjson.loads(raw_json)
-            state = data.get("state") or data
-            catalog = (state.get("data") or {}).get("catalog") or state.get("catalog") or {}
-            items_raw = catalog.get("items") or []
-            items: list[AvitoItem] = []
-            for raw in items_raw:
-                if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
-                    continue
-                val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
-                if not isinstance(val, dict):
-                    continue
-                try:
-                    items.append(_parse_api_item(val))
-                except Exception:
-                    pass
-            if items:
-                logger.info("[html] parsed %d items from mfe-state", len(items))
-                return items, False
-        except Exception as e:
-            logger.debug("[html] mfe-state parse err: %s", e)
+    # Method 1: data-mfe-state hydration JSON (Duff89 method — BeautifulSoup)
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for script in soup.select("script"):
+            if (script.get("type") == "mime/invalid"
+                and script.get("data-mfe-state") == "true"
+                and "sandbox" not in (script.text or "")):
+                data = orjson.loads(html_lib.unescape(script.text))
+                if data.get("i18n", {}).get("hasMessages", {}):
+                    catalog = data.get("state", {}).get("data", {}).get("catalog", {})
+                    items_raw = catalog.get("items") or []
+                    items: list[AvitoItem] = []
+                    for raw in items_raw:
+                        if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
+                            continue
+                        val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
+                        if not isinstance(val, dict):
+                            continue
+                        try:
+                            items.append(_parse_api_item(val))
+                        except Exception:
+                            pass
+                    if items:
+                        logger.info("[html] parsed %d items from mfe-state (Duff89 method)", len(items))
+                        return items, False
+                    else:
+                        logger.info("[html] mfe-state found (i18n OK) but catalog empty, keys: %s",
+                                   list(data.get("state", {}).get("data", {}).keys())[:8])
+    except ImportError:
+        logger.debug("[html] BeautifulSoup not installed, skipping mfe-state method")
+    except Exception as e:
+        logger.debug("[html] mfe-state parse err: %s", e)
 
     # Method 2: __initialData__ (URL-encoded JSON in older Avito pages)
     from urllib.parse import unquote
