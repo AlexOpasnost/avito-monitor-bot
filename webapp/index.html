@@ -662,26 +662,48 @@
     submitBtn.classList.add('loading');
     submitBtn.disabled = true;
 
-    // Small delay for UX feel
     setTimeout(function() {
+      var sent = false;
       try {
-        if (tg) {
+        if (tg && tg.sendData) {
           tg.sendData(JSON.stringify({ url: cleanedUrl }));
+          sent = true;
         }
       } catch (e) {
-        console.error('sendData error:', e);
+        // sendData failed — fall through to fallback
       }
 
-      // Show success regardless (sendData closes the app on its own,
-      // but show animation in case there's a delay)
-      overlay.classList.add('visible');
+      if (sent) {
+        overlay.classList.add('visible');
+        setTimeout(function() { if (tg) tg.close(); }, 1800);
+      } else {
+        // Fallback: copy URL to clipboard and show instructions
+        submitBtn.classList.remove('loading');
+        submitBtn.disabled = false;
 
-      // Close after animation
-      setTimeout(function() {
-        if (tg) tg.close();
-      }, 1800);
-    }, 600);
+        if (navigator.clipboard) {
+          navigator.clipboard.writeText(cleanedUrl).then(function() {
+            showFallbackMsg('Ссылка скопирована! Вставьте её в чат бота.');
+          }).catch(function() {
+            showFallbackMsg('Отправьте эту ссылку боту в чат:\n' + cleanedUrl);
+          });
+        } else {
+          showFallbackMsg('Отправьте эту ссылку боту в чат:\n' + cleanedUrl);
+        }
+
+        // Close webapp after delay so user sees the message
+        setTimeout(function() { if (tg) tg.close(); }, 3000);
+      }
+    }, 400);
   });
+
+  function showFallbackMsg(text) {
+    var el = document.createElement('div');
+    el.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg-primary);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;padding:24px;text-align:center;';
+    el.innerHTML = '<div style="font-size:40px;margin-bottom:16px">&#x1F4CB;</div>' +
+      '<div style="font-size:16px;font-weight:600;color:var(--text-primary);line-height:1.6;white-space:pre-line">' + text + '</div>';
+    document.body.appendChild(el);
+  }
 
 })();
 </script>
