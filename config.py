@@ -18,6 +18,7 @@ class Config:
     admin_id: int = 0
     # Avito mobile API
     avito_api_key: str = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
+    webapp_url: str = ""
     max_concurrent_requests: int = 3
     user_agent: str = (
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
@@ -37,6 +38,7 @@ class Config:
             telegram_api_url=os.getenv("TELEGRAM_API_URL", "https://api.telegram.org"),
             proxy_rotate_url=os.getenv("PROXY_ROTATE_URL", ""),
             admin_id=int(os.getenv("ADMIN_ID", "0")),
+            webapp_url=os.getenv("WEBAPP_URL", ""),
             max_concurrent_requests=int(os.getenv("MAX_CONCURRENT_REQUESTS", "3")),
         )
 

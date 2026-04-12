@@ -8,9 +8,11 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
+    ContentType,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    WebAppInfo,
 )
 
 from config import config
@@ -78,6 +80,16 @@ async def cmd_start(message: Message):
     )
     reactivated = await db.reactivate_all(user_id)
 
+    # Build WebApp button if URL is configured
+    webapp_keyboard = None
+    if config.webapp_url:
+        webapp_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Добавить отслеживание",
+                web_app=WebAppInfo(url=config.webapp_url),
+            )]
+        ])
+
     if reactivated > 0:
         await message.answer(
             f"▶️ <b>Возобновлено {reactivated} отслеживаний!</b>\n\n"
@@ -86,6 +98,7 @@ async def cmd_start(message: Message):
             "/delete — удалить\n"
             "/stop — пауза",
             parse_mode="HTML",
+            reply_markup=webapp_keyboard,
         )
     else:
         await message.answer(
@@ -94,11 +107,13 @@ async def cmd_start(message: Message):
             "1. Настрой поиск на Авито (город, категория, цена, фильтры)\n"
             "2. Скопируй ссылку\n"
             "3. Отправь сюда\n\n"
+            "Или нажми кнопку ниже — так ссылка не обрежется.\n\n"
             f"Лимит: {config.max_subscriptions} отслеживаний одновременно\n\n"
             "/list — мои отслеживания\n"
             "/profile — статистика\n"
             "/stop — пауза",
             parse_mode="HTML",
+            reply_markup=webapp_keyboard,
         )
 
 
@@ -232,6 +247,47 @@ async def cmd_stop(message: Message):
         "⏸ <b>Мониторинг приостановлен</b>\n\n"
         "Все ссылки сохранены. Нажми /start чтобы возобновить.",
         parse_mode="HTML",
+    )
+
+
+@router.message(F.content_type == ContentType.WEB_APP_DATA)
+async def handle_webapp_data(message: Message):
+    """Handle URL submitted via Telegram WebApp (already cleaned)."""
+    import json as _json
+
+    try:
+        data = _json.loads(message.web_app_data.data)
+    except (ValueError, TypeError):
+        await message.answer("⚠️ Ошибка: некорректные данные из WebApp.")
+        return
+
+    url = data.get("url", "").strip()
+    if not url or not _AVITO_URL_RE.match(url):
+        await message.answer(
+            "⚠️ Некорректная ссылка. Попробуйте ещё раз.",
+            parse_mode="HTML",
+        )
+        return
+
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+
+    sub_id = await db.add_subscription(user_id, url)
+    if sub_id is None:
+        await message.answer(
+            f"⚠️ Достигнут лимит — максимум {config.max_subscriptions} отслеживаний.\n"
+            "Удали лишние через /delete"
+        )
+        return
+
+    await message.answer(
+        f"✅ <b>Отслеживание #{sub_id} добавлено!</b>\n\n"
+        f"🔗 <a href=\"{url}\">Ваша ссылка на Авито</a>\n\n"
+        f"Проверяю каждую минуту. Как появится новое объявление — пришлю с фото, ценой и описанием.\n\n"
+        f"/list — все отслеживания  ·  /delete — удалить",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
 
 
