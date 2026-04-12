@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 test_page*.png
 .venv/
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+!.env.example
