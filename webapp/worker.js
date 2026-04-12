@@ -587,12 +587,10 @@ export default {
         if (mod) padded += '='.repeat(4 - mod);
         const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
         if (!raw.trimEnd().endsWith('}')) {
-          items.push(feedbackItem('error', 'Параметр фильтров обрезан — URL повреждён'));
-          showFeedback(items, tags);
-          inputCard.classList.add('has-error');
-          return;
+          items.push(feedbackItem('warning', 'Фильтры могут быть неполными — но попробуем'));
+        } else {
+          items.push(feedbackItem('success', 'Фильтры корректны'));
         }
-        items.push(feedbackItem('success', 'Фильтры корректны'));
 
         // Try to extract price info from JSON
         try {
