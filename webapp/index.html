@@ -457,270 +457,97 @@
 
 <script>
 (function() {
-  'use strict';
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
 
-  // --- Telegram WebApp init ---
-  const tg = window.Telegram && window.Telegram.WebApp;
-  if (tg) {
-    tg.ready();
-    tg.expand();
+  var urlInput = document.getElementById('urlInput');
+  var submitBtn = document.getElementById('submitBtn');
+  var overlay = document.getElementById('successOverlay');
+  var feedback = document.getElementById('feedback');
+  var inputCard = document.getElementById('inputCard');
 
-    // Apply Telegram theme if available
-    const tp = tg.themeParams;
-    if (tp) {
-      const root = document.documentElement.style;
-      if (tp.bg_color) root.setProperty('--bg-primary', tp.bg_color);
-      if (tp.secondary_bg_color) root.setProperty('--bg-card', tp.secondary_bg_color);
-      if (tp.text_color) root.setProperty('--text-primary', tp.text_color);
-      if (tp.hint_color) root.setProperty('--text-secondary', tp.hint_color);
-      if (tp.button_color) {
-        root.setProperty('--accent', tp.button_color);
-        root.setProperty('--accent-glow', tp.button_color + '40');
-      }
-      if (tp.button_text_color) {
-        // button text color available
-      }
-    }
-  }
-
-  // --- DOM refs ---
-  const inputCard  = document.getElementById('inputCard');
-  const urlInput   = document.getElementById('urlInput');
-  const feedback   = document.getElementById('feedback');
-  const parsedInfo = document.getElementById('parsedInfo');
-  const submitBtn  = document.getElementById('submitBtn');
-  const overlay    = document.getElementById('successOverlay');
-
-  const AVITO_RE = /^https?:\/\/(?:www\.|m\.)?avito\.ru\/\S+/i;
-  const KEEP_PARAMS = new Set(['f', 'q', 'pmin', 'pmax', 's', 'user', 'bt', 'cd']);
-
-  let cleanedUrl = '';
-  let isValid = false;
-
-  // --- Focus / blur styling ---
-  urlInput.addEventListener('focus', () => inputCard.classList.add('focused'));
-  urlInput.addEventListener('blur',  () => inputCard.classList.remove('focused'));
-
-  // --- Real-time validation on input ---
-  let debounceTimer;
-  let lastValue = '';
-
-  urlInput.addEventListener('input', () => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(validateUrl, 300);
-  });
-
-  urlInput.addEventListener('paste', () => {
-    setTimeout(validateUrl, 50);
-  });
-
-  urlInput.addEventListener('change', validateUrl);
-  urlInput.addEventListener('keyup', () => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(validateUrl, 300);
-  });
-
-  // iOS Telegram WebView may not fire input/paste events — poll as fallback
-  setInterval(function() {
-    var cur = urlInput.value;
-    if (cur !== lastValue) {
-      lastValue = cur;
-      validateUrl();
-    }
-  }, 500);
-
-  function validateUrl() {
-    const raw = urlInput.value.trim();
-    const items = [];
-    const tags = [];
-
-    inputCard.classList.remove('has-error', 'has-success');
-    feedback.classList.remove('visible');
-    parsedInfo.classList.remove('visible');
-    isValid = false;
-    cleanedUrl = '';
-    submitBtn.disabled = true;
-
-    if (!raw) {
+  // Enable button whenever textarea has avito.ru in it
+  function check() {
+    var val = urlInput.value || '';
+    var hasAvito = /avito\.ru/i.test(val);
+    submitBtn.disabled = !hasAvito;
+    inputCard.classList.toggle('has-success', hasAvito);
+    inputCard.classList.toggle('has-error', val.length > 5 && !hasAvito);
+    if (hasAvito) {
+      feedback.innerHTML = '<div class="feedback-item success"><span class="feedback-icon">&#x2705;</span><span>Ссылка распознана</span></div>';
+      feedback.classList.add('visible');
+    } else if (val.length > 5) {
+      feedback.innerHTML = '<div class="feedback-item error"><span class="feedback-icon">&#x274C;</span><span>Вставьте ссылку с avito.ru</span></div>';
+      feedback.classList.add('visible');
+    } else {
       feedback.innerHTML = '';
-      parsedInfo.innerHTML = '';
-      return;
-    }
-
-    // Fix Telegram mangling: replace ~ with -
-    let url = raw.replace(/~/g, '-');
-
-    // Check if it's an Avito URL
-    if (!AVITO_RE.test(url)) {
-      items.push(feedbackItem('error', 'Это не ссылка на Авито'));
-      showFeedback(items, []);
-      inputCard.classList.add('has-error');
-      return;
-    }
-
-    items.push(feedbackItem('success', 'Ссылка на Авито распознана'));
-
-    // Parse URL
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      items.push(feedbackItem('error', 'Некорректный формат URL'));
-      showFeedback(items, []);
-      inputCard.classList.add('has-error');
-      return;
-    }
-
-    // Extract category from path
-    const pathParts = parsed.pathname.split('/').filter(Boolean);
-    if (pathParts.length >= 2) {
-      const city = decodeURIComponent(pathParts[0]);
-      const category = decodeURIComponent(pathParts[1]);
-      tags.push({ icon: '&#x1F4CD;', text: city });
-      tags.push({ icon: '&#x1F4C1;', text: category });
-    }
-
-    // Clean params
-    const params = new URLSearchParams(parsed.search);
-    const cleanParams = new URLSearchParams();
-    for (const key of KEEP_PARAMS) {
-      if (params.has(key)) {
-        cleanParams.set(key, params.get(key));
-      }
-    }
-
-    // Check f= parameter
-    const fVal = params.get('f');
-    if (!fVal) {
-      items.push(feedbackItem('warning', 'Фильтры не обнаружены — будут показаны все объявления по ссылке'));
-    } else {
-      // Validate f= is complete (base64 decode, must end with })
-      try {
-        let padded = fVal;
-        const mod = padded.length % 4;
-        if (mod) padded += '='.repeat(4 - mod);
-        const raw = atob(padded.replace(/-/g, '+').replace(/_/g, '/'));
-        if (!raw.trimEnd().endsWith('}')) {
-          items.push(feedbackItem('warning', 'Фильтры могут быть неполными — но попробуем'));
-        } else {
-          items.push(feedbackItem('success', 'Фильтры корректны'));
-        }
-
-        // Try to extract price info from JSON
-        try {
-          // f= might have a prefix byte, try to find JSON start
-          const jsonStart = raw.indexOf('{');
-          if (jsonStart >= 0) {
-            const jsonStr = raw.substring(jsonStart);
-            const fObj = JSON.parse(jsonStr);
-            // Look for price keys in various formats
-            if (fObj && typeof fObj === 'object') {
-              for (const [k, v] of Object.entries(fObj)) {
-                if (v && typeof v === 'object' && v.from !== undefined) {
-                  tags.push({ icon: '&#x1F4B0;', text: 'от ' + Number(v.from).toLocaleString('ru') + ' ₽' });
-                }
-                if (v && typeof v === 'object' && v.to !== undefined) {
-                  tags.push({ icon: '&#x1F4B0;', text: 'до ' + Number(v.to).toLocaleString('ru') + ' ₽' });
-                }
-              }
-            }
-          }
-        } catch {
-          // JSON parse failed — ok, filters are still valid
-        }
-      } catch {
-        items.push(feedbackItem('warning', 'Не удалось проверить фильтры — но URL сохранён'));
-      }
-    }
-
-    // Check pmin/pmax
-    if (params.has('pmin')) tags.push({ icon: '&#x1F4B0;', text: 'от ' + Number(params.get('pmin')).toLocaleString('ru') + ' ₽' });
-    if (params.has('pmax')) tags.push({ icon: '&#x1F4B0;', text: 'до ' + Number(params.get('pmax')).toLocaleString('ru') + ' ₽' });
-    if (params.has('q'))    tags.push({ icon: '&#x1F50E;', text: params.get('q') });
-
-    // Build cleaned URL
-    const cleanQuery = cleanParams.toString();
-    cleanedUrl = parsed.origin + parsed.pathname;
-    if (cleanQuery) cleanedUrl += '?' + cleanQuery;
-
-    isValid = true;
-    submitBtn.disabled = false;
-    inputCard.classList.add('has-success');
-    showFeedback(items, tags);
-  }
-
-  function feedbackItem(type, text) {
-    const icons = { success: '&#x2705;', error: '&#x274C;', warning: '&#x26A0;' };
-    return '<div class="feedback-item ' + type + '">' +
-      '<span class="feedback-icon">' + icons[type] + '</span>' +
-      '<span>' + text + '</span></div>';
-  }
-
-  function showFeedback(items, tags) {
-    feedback.innerHTML = items.join('');
-    feedback.classList.toggle('visible', items.length > 0);
-
-    if (tags.length > 0) {
-      parsedInfo.innerHTML = tags.map(function(t) {
-        return '<span class="parsed-tag"><span class="tag-icon">' + t.icon + '</span>' + t.text + '</span>';
-      }).join('');
-      parsedInfo.classList.add('visible');
-    } else {
-      parsedInfo.innerHTML = '';
-      parsedInfo.classList.remove('visible');
+      feedback.classList.remove('visible');
     }
   }
 
-  // --- Submit ---
+  // Listen to everything + poll (iOS WebView sometimes misses events)
+  urlInput.addEventListener('input', check);
+  urlInput.addEventListener('paste', function() { setTimeout(check, 50); });
+  urlInput.addEventListener('change', check);
+  urlInput.addEventListener('keyup', check);
+  urlInput.addEventListener('focus', check);
+  setInterval(check, 400);
+
+  // Extract clean URL from text
+  function extractUrl(text) {
+    text = text.replace(/~/g, '-').replace(/[\n\r]/g, '');
+    var m = text.match(/https?:\/\/(?:www\.|m\.)?avito\.ru\/\S+/i);
+    return m ? m[0].replace(/[.,;)\]]+$/, '') : text.trim();
+  }
+
+  // Submit
   submitBtn.addEventListener('click', function() {
-    if (!isValid || !cleanedUrl) return;
+    var url = extractUrl(urlInput.value);
+    if (!url) return;
 
     submitBtn.classList.add('loading');
     submitBtn.disabled = true;
 
-    setTimeout(function() {
-      var sent = false;
+    // Try sendData (works only from KeyboardButton webapp)
+    var sent = false;
+    try {
+      if (tg && tg.sendData) {
+        tg.sendData(JSON.stringify({ url: url }));
+        sent = true;
+      }
+    } catch(e) {}
+
+    if (sent) {
+      overlay.classList.add('visible');
+      setTimeout(function() { if (tg) tg.close(); }, 1500);
+    } else {
+      // Fallback — copy to clipboard, user pastes in chat
+      var done = false;
       try {
-        if (tg && tg.sendData) {
-          tg.sendData(JSON.stringify({ url: cleanedUrl }));
-          sent = true;
-        }
-      } catch (e) {
-        // sendData failed — fall through to fallback
-      }
-
-      if (sent) {
-        overlay.classList.add('visible');
-        setTimeout(function() { if (tg) tg.close(); }, 1800);
-      } else {
-        // Fallback: copy URL to clipboard and show instructions
-        submitBtn.classList.remove('loading');
-        submitBtn.disabled = false;
-
         if (navigator.clipboard) {
-          navigator.clipboard.writeText(cleanedUrl).then(function() {
-            showFallbackMsg('Ссылка скопирована! Вставьте её в чат бота.');
-          }).catch(function() {
-            showFallbackMsg('Отправьте эту ссылку боту в чат:\n' + cleanedUrl);
-          });
-        } else {
-          showFallbackMsg('Отправьте эту ссылку боту в чат:\n' + cleanedUrl);
+          navigator.clipboard.writeText(url).then(function() {
+            showMsg('&#x2705; Ссылка скопирована!', 'Закройте окно и вставьте в чат бота');
+          }).catch(function() { showManual(url); });
+          done = true;
         }
-
-        // Close webapp after delay so user sees the message
-        setTimeout(function() { if (tg) tg.close(); }, 3000);
-      }
-    }, 400);
+      } catch(e) {}
+      if (!done) showManual(url);
+      setTimeout(function() { if (tg) tg.close(); }, 4000);
+    }
   });
 
-  function showFallbackMsg(text) {
-    var el = document.createElement('div');
-    el.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg-primary);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;padding:24px;text-align:center;';
-    el.innerHTML = '<div style="font-size:40px;margin-bottom:16px">&#x1F4CB;</div>' +
-      '<div style="font-size:16px;font-weight:600;color:var(--text-primary);line-height:1.6;white-space:pre-line">' + text + '</div>';
-    document.body.appendChild(el);
+  function showMsg(icon, text) {
+    overlay.querySelector('.success-checkmark').innerHTML = icon;
+    overlay.querySelector('.success-text').textContent = text;
+    overlay.querySelector('.success-subtext').textContent = '';
+    overlay.classList.add('visible');
   }
 
+  function showManual(url) {
+    var short = url.length > 60 ? url.substring(0, 60) + '...' : url;
+    showMsg('&#x1F4CB;', 'Отправьте ссылку боту в чат');
+    overlay.querySelector('.success-subtext').textContent = short;
+  }
 })();
 </script>
 </body>
