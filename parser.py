@@ -3,7 +3,7 @@ import html as html_lib
 import logging
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
 import orjson
@@ -101,32 +101,55 @@ async def check_proxy_ip() -> str | None:
 # ---------------------------------------------------------------------------
 
 async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
-    """Fetch via the Avito mobile API using curl_cffi (Chrome TLS fingerprint).
-    Returns (items, blocked). blocked=True means IP is rate-limited/banned."""
+    """Fetch via the Avito mobile API. Passes the user's URL path so location and
+    category are honored (not hardcoded). Returns (items, blocked)."""
     import asyncio
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
 
-    api_url = "https://m.avito.ru/api/11/items"
+    # Use the search endpoint that accepts a path/slug — this respects the
+    # city and category from the URL (e.g. /krasnodar/telefony) instead of
+    # falling back to a hardcoded location.
+    api_url = "https://m.avito.ru/api/9/items"
     params = {
         "key": config.avito_api_key,
-        "locationId": "621540",
         "limit": "50",
         "display": "list",
+        # forceLocation prevents Avito from "expanding" the search to nearby cities
+        "forceLocation": "true",
+        # s=104 = sort by date desc; carry user's sort if present
         "sort": "date",
     }
-    if "f" in qs:
-        params["f"] = qs["f"][0]
-    if "q" in qs:
-        params["query"] = qs["q"][0]
-    if "pmin" in qs:
-        params["priceMin"] = qs["pmin"][0]
-    if "pmax" in qs:
-        params["priceMax"] = qs["pmax"][0]
+
+    # Pass the path so the API knows the city + category from the URL
+    if parsed.path and parsed.path != "/":
+        params["url"] = parsed.path
+
+    # Forward all known filter params so the API receives the same intent as the
+    # web URL. Avito's API accepts most of these directly.
+    forward_keys = {
+        "f": "f",
+        "q": "query",
+        "pmin": "priceMin",
+        "pmax": "priceMax",
+        "user": "user",
+        "bt": "bt",
+        "cd": "cd",
+        "s": "sort",
+        "localPriority": "localPriority",
+        "radius": "radius",
+    }
+    for src, dst in forward_keys.items():
+        if src in qs and qs[src]:
+            params[dst] = qs[src][0]
+
+    # If the user URL has s=104 (sort by date), keep it as numeric;
+    # otherwise enforce date sorting.
+    if "s" in qs and qs["s"]:
+        params["sort"] = qs["s"][0]
 
     def _do_request():
-        from urllib.parse import urlencode
-        full_url = api_url + "?" + urlencode(params)
+        full_url = api_url + "?" + urlencode(params, doseq=False)
         try:
             scraper = _get_cloudscraper(proxy)
             proxies = {"http": proxy, "https": proxy} if proxy else None
@@ -135,8 +158,15 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
                 proxies=proxies,
                 headers={
                     "Accept": "application/json",
-                    "Accept-Language": "ru-RU,ru;q=0.9",
-                    "Referer": "https://m.avito.ru/",
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Referer": url,
+                    "Origin": "https://m.avito.ru",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Cache-Control": "no-cache",
                 },
                 timeout=30,
             )
@@ -159,8 +189,10 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
         data = orjson.loads(text)
         items_raw = (data.get("result") or {}).get("items") or []
         items: list[AvitoItem] = []
+        skipped = 0
         for raw in items_raw:
-            if raw.get("type") != "item":
+            if not _is_real_listing(raw):
+                skipped += 1
                 continue
             val = raw.get("value") or {}
             try:
@@ -168,11 +200,46 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
             except Exception as e:
                 logger.debug("parse item err: %s", e)
         if items:
-            logger.info("[api] SUCCESS: %d items from mobile API", len(items))
+            logger.info(
+                "[api] SUCCESS: %d items from mobile API (skipped %d promoted/non-item)",
+                len(items), skipped,
+            )
         return (items if items else None), False
     except Exception as e:
         logger.debug("[api] exception: %s", e)
         return None, False
+
+
+# Promoted/VIP item types and flags that should never be considered as
+# "results" for a filtered search.
+_NON_LISTING_TYPES = {
+    "xlItem", "vipItem", "vip", "topAdvertisement", "topAdvert", "topAd",
+    "premium", "promoted", "advertising", "ad", "banner", "snippet",
+    "recommendation", "recommendations", "similar", "alternative",
+}
+
+
+def _is_real_listing(raw: dict) -> bool:
+    """Return True only for normal search results — not promoted/VIP/recommended."""
+    if not isinstance(raw, dict):
+        return False
+    rtype = (raw.get("type") or "").strip()
+    if rtype and rtype != "item":
+        return False
+    val = raw.get("value") if isinstance(raw.get("value"), dict) else raw
+    if not isinstance(val, dict):
+        return False
+    # Avito flags promoted/highlighted items
+    for flag in ("isPromoted", "isHighlighted", "isVip", "isPremium",
+                 "isAdvertising", "promoted", "vip", "premium"):
+        if val.get(flag):
+            return False
+    # Some payloads put the same info under "settings" or "highlight"
+    settings = val.get("settings") or {}
+    if isinstance(settings, dict):
+        if settings.get("isHighlighted") or settings.get("isPromoted"):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +278,81 @@ def _get_cloudscraper(proxy: str | None):
     return s
 
 
+def _isolate_search_results(html: str) -> str:
+    """Cut the HTML down to just the main search results container.
+    Avito puts 'recommended' / 'similar' listings AFTER the main serp;
+    if we let regex see the whole page we get items from those blocks too."""
+    # Try the explicit serp marker first
+    start_markers = [
+        'data-marker="catalog-serp"',
+        'data-marker="catalog-list"',
+        'class="items-items',
+    ]
+    end_markers = [
+        'data-marker="recommendations',
+        'data-marker="rec-items',
+        'data-marker="similar',
+        'class="recommendations',
+        'class="similar',
+    ]
+
+    start = -1
+    for m in start_markers:
+        i = html.find(m)
+        if i >= 0:
+            start = i
+            break
+    if start < 0:
+        return html  # fallback — use whole page
+
+    # Find earliest end marker after start
+    end = len(html)
+    for m in end_markers:
+        i = html.find(m, start)
+        if 0 < i < end:
+            end = i
+    return html[start:end]
+
+
+def _ensure_sort_by_date(url: str) -> str:
+    """Make sure the search URL is sorted by date desc (s=104).
+    Without this, Avito may return 'recommended' ordering which mixes
+    in old/promoted listings."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if "s" not in qs:
+        qs["s"] = ["104"]
+    new_query = urlencode({k: v[0] for k, v in qs.items()})
+    return urlunparse(parsed._replace(query=new_query))
+
+
 def _fetch_html_sync(url: str, proxy: str | None) -> tuple[int, str] | None:
     """Fetch Avito HTML with cloudscraper (sync, runs in thread)."""
     try:
         s = _get_cloudscraper(proxy)
         proxies = {"http": proxy, "https": proxy} if proxy else None
-        resp = s.get(url, proxies=proxies, timeout=60, allow_redirects=False)
+        sorted_url = _ensure_sort_by_date(url)
+        resp = s.get(
+            sorted_url,
+            proxies=proxies,
+            timeout=60,
+            allow_redirects=False,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            },
+        )
         return resp.status_code, resp.text
     except Exception as e:
         logger.debug("[html] sync fetch error: %s", e)
@@ -272,11 +408,15 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
                 and "sandbox" not in (script.text or "")):
                 data = orjson.loads(html_lib.unescape(script.text))
                 if data.get("i18n", {}).get("hasMessages", {}):
+                    # IMPORTANT: only read from catalog.items — never from
+                    # "recommendations", "similar", or other adjacent blocks.
                     catalog = data.get("state", {}).get("data", {}).get("catalog", {})
                     items_raw = catalog.get("items") or []
                     items: list[AvitoItem] = []
+                    skipped = 0
                     for raw in items_raw:
-                        if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
+                        if not _is_real_listing(raw):
+                            skipped += 1
                             continue
                         val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
                         if not isinstance(val, dict):
@@ -286,7 +426,10 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
                         except Exception:
                             pass
                     if items:
-                        logger.info("[html] parsed %d items from mfe-state (Duff89 method)", len(items))
+                        logger.info(
+                            "[html] parsed %d items from catalog.items (skipped %d promoted)",
+                            len(items), skipped,
+                        )
                         return items, False
                     else:
                         logger.info("[html] mfe-state found (i18n OK) but catalog empty, keys: %s",
@@ -386,16 +529,24 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
                 js_vars[:5], len(mfe_scripts), len(html))
 
     # Method 4: data-item-id from HTML (last resort)
-    item_ids = re.findall(r'data-item-id="(\d+)"', html)
+    # IMPORTANT: limit the search area to the main search results container
+    # so we don't pick up items from "recommended" / "similar" blocks below.
+    serp_html = _isolate_search_results(html)
+    item_ids = re.findall(r'data-item-id="(\d+)"', serp_html)
     if len(item_ids) >= 3:
         items = []
+        seen_ids = set()
         for item_id in item_ids:
-            # Extract minimal info: title from nearby link
-            idx = html.find(f'data-item-id="{item_id}"')
-            block = html[idx:idx + 3000] if idx >= 0 else ""
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            idx = serp_html.find(f'data-item-id="{item_id}"')
+            block = serp_html[idx:idx + 3000] if idx >= 0 else ""
+            # Skip blocks marked as VIP/promo
+            if 'data-marker="item-vip' in block or 'iva-item-titleStep' in block and 'isPromoted' in block:
+                continue
             title_m = re.search(r'title="([^"]{5,80})"', block)
             title = title_m.group(1) if title_m else f"Объявление {item_id}"
-            # Skip junk titles
             if "избранное" in title.lower() or "сравнение" in title.lower():
                 title_m2 = re.search(r'href="[^"]*"[^>]*>([^<]{5,80})<', block)
                 title = title_m2.group(1).strip() if title_m2 else f"Объявление {item_id}"
@@ -409,7 +560,7 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
                 image_url=None, location=None, description=None,
                 seller_name=None, published_timestamp=None,
             ))
-        logger.info("[html] parsed %d items from data-item-id", len(items))
+        logger.info("[html] parsed %d items from data-item-id (in serp area)", len(items))
         return items, False
 
     logger.warning("[html] no items found in HTML (size=%d)", len(html))
@@ -420,42 +571,70 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
 # Item parsing
 # ---------------------------------------------------------------------------
 
-def _extract_items_from_json(data: dict) -> list[AvitoItem]:
-    """Recursively find items array in a nested JSON structure."""
-    # Try common paths
-    for path in [
-        lambda d: d.get("items", []),
-        lambda d: d.get("catalog", {}).get("items", []),
-        lambda d: d.get("results", []),
-    ]:
-        items_raw = path(data)
-        if isinstance(items_raw, list) and len(items_raw) >= 3:
-            items = []
-            for raw in items_raw:
-                if not isinstance(raw, dict):
-                    continue
-                val = raw.get("value", raw) if "value" in raw else raw
-                if not isinstance(val, dict):
-                    continue
-                # Must have id + urlPath or price (real listing, not category)
-                if not (val.get("id") or val.get("itemId")):
-                    continue
-                if not (val.get("urlPath") or val.get("price") or val.get("priceDetailed")):
-                    continue
-                try:
-                    items.append(_parse_api_item(val))
-                except Exception:
-                    pass
+# Keys that are known to contain "recommended"/"similar" listings — never
+# read items from these.
+_FORBIDDEN_PARENT_KEYS = {
+    "recommendations", "recommendation", "recommended",
+    "similar", "similarItems", "alternatives", "alternative",
+    "youMayLike", "youMayAlsoLike", "alsoLooked",
+    "advertising", "promo", "promoted", "banners", "vip",
+    "topItems", "topAdverts", "popular",
+}
+
+
+def _extract_items_from_json(data: dict, parent_key: str = "") -> list[AvitoItem]:
+    """Find listings in the catalog block ONLY. Never recurse into recommendation
+    or 'similar items' blocks — those mix in items that don't match the user's
+    filters and would cause false notifications."""
+    if not isinstance(data, dict):
+        return []
+
+    # Refuse to read items if we are inside a recommendation/similar block.
+    if parent_key.lower() in {k.lower() for k in _FORBIDDEN_PARENT_KEYS}:
+        return []
+
+    # Only read from explicit catalog paths — never from arbitrary "items".
+    for getter in (
+        lambda d: d.get("catalog", {}).get("items", []) if isinstance(d.get("catalog"), dict) else [],
+        lambda d: (d.get("state", {}).get("data", {}).get("catalog", {}) or {}).get("items", []) if isinstance(d.get("state"), dict) else [],
+    ):
+        try:
+            items_raw = getter(data)
+        except Exception:
+            items_raw = []
+        if isinstance(items_raw, list) and len(items_raw) >= 1:
+            items = _items_from_raw_list(items_raw)
             if items:
                 return items
 
-    # Recurse into dict values
+    # Recurse only into dict values, but skip forbidden keys
     for key, val in data.items():
+        if key.lower() in {k.lower() for k in _FORBIDDEN_PARENT_KEYS}:
+            continue
         if isinstance(val, dict) and len(str(val)) > 1000:
-            result = _extract_items_from_json(val)
+            result = _extract_items_from_json(val, parent_key=key)
             if result:
                 return result
     return []
+
+
+def _items_from_raw_list(items_raw: list) -> list[AvitoItem]:
+    items: list[AvitoItem] = []
+    for raw in items_raw:
+        if not _is_real_listing(raw):
+            continue
+        val = raw.get("value", raw) if isinstance(raw, dict) and "value" in raw else raw
+        if not isinstance(val, dict):
+            continue
+        if not (val.get("id") or val.get("itemId")):
+            continue
+        if not (val.get("urlPath") or val.get("price") or val.get("priceDetailed")):
+            continue
+        try:
+            items.append(_parse_api_item(val))
+        except Exception:
+            pass
+    return items
 
 
 def _parse_api_item(val: dict) -> AvitoItem:
