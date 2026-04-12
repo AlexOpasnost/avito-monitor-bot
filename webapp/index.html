@@ -503,15 +503,31 @@
 
   // --- Real-time validation on input ---
   let debounceTimer;
+  let lastValue = '';
+
   urlInput.addEventListener('input', () => {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(validateUrl, 300);
   });
 
-  // Also validate on paste immediately
   urlInput.addEventListener('paste', () => {
     setTimeout(validateUrl, 50);
   });
+
+  urlInput.addEventListener('change', validateUrl);
+  urlInput.addEventListener('keyup', () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(validateUrl, 300);
+  });
+
+  // iOS Telegram WebView may not fire input/paste events — poll as fallback
+  setInterval(function() {
+    var cur = urlInput.value;
+    if (cur !== lastValue) {
+      lastValue = cur;
+      validateUrl();
+    }
+  }, 500);
 
   function validateUrl() {
     const raw = urlInput.value.trim();
