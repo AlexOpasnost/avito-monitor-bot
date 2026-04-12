@@ -11,7 +11,9 @@ from aiogram.types import (
     ContentType,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
     WebAppInfo,
 )
 
@@ -81,14 +83,18 @@ async def cmd_start(message: Message):
     reactivated = await db.reactivate_all(user_id)
 
     # Build WebApp button if URL is configured
+    # Must use KeyboardButton (not InlineKeyboardButton) for sendData() to work
     webapp_keyboard = None
     if config.webapp_url:
-        webapp_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="➕ Добавить отслеживание",
-                web_app=WebAppInfo(url=config.webapp_url),
-            )]
-        ])
+        webapp_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(
+                    text="➕ Добавить отслеживание",
+                    web_app=WebAppInfo(url=config.webapp_url),
+                )]
+            ],
+            resize_keyboard=True,
+        )
 
     if reactivated > 0:
         await message.answer(
