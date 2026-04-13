@@ -317,13 +317,17 @@ def _isolate_search_results(html: str) -> str:
 def _ensure_sort_by_date(url: str) -> str:
     """Make sure the search URL is sorted by date desc (s=104).
     Without this, Avito may return 'recommended' ordering which mixes
-    in old/promoted listings."""
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    if "s" not in qs:
-        qs["s"] = ["104"]
-    new_query = urlencode({k: v[0] for k, v in qs.items()})
-    return urlunparse(parsed._replace(query=new_query))
+    in old/promoted listings.
+
+    IMPORTANT: we must NOT reparse/reencode the URL — doing so would
+    re-encode the f= base64 parameter (which contains URL-safe `-` and `_`
+    that Python's urlencode will leave alone, but other characters might
+    get re-percent-encoded). Just append &s=104 if missing."""
+    # Quick check for existing s= parameter
+    if re.search(r"[?&]s=\d+", url):
+        return url
+    sep = "&" if "?" in url else "?"
+    return url + sep + "s=104"
 
 
 def _fetch_html_sync(url: str, proxy: str | None) -> tuple[int, str] | None:

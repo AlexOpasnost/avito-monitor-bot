@@ -2,7 +2,7 @@
 import base64
 import logging
 import re
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
@@ -23,7 +23,13 @@ _AVITO_URL_RE = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+", re.IGNORECAS
 
 
 def _validate_avito_url(text: str) -> tuple[str | None, str | None]:
-    """Extract & clean an Avito URL. Returns (clean_url, error_message)."""
+    """Extract & clean an Avito URL. Returns (clean_url, error_message).
+
+    IMPORTANT: We keep ALL query parameters as-is. Avito uses a number of
+    auxiliary params (localPriority, context, radius, metro, district, etc.)
+    that can affect which items are returned. Stripping them produces a
+    different feed than what the user sees in their browser, which is the
+    whole bug we are trying to avoid."""
     text = text.strip()
     match = _AVITO_URL_RE.search(text)
     if not match:
@@ -35,18 +41,11 @@ def _validate_avito_url(text: str) -> tuple[str | None, str | None]:
     url = url.replace("~", "-")
 
     parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-
-    # Keep only meaningful params
-    keep_keys = ["f", "q", "pmin", "pmax", "s", "user", "bt", "cd"]
-    clean: dict[str, str] = {}
-    for key in keep_keys:
-        if key in qs:
-            clean[key] = qs[key][0]
+    qs = parse_qs(parsed.query, keep_blank_values=True)
 
     # Validate that the f= filter is not truncated (Telegram mangling)
-    if "f" in clean:
-        f_val = clean["f"]
+    if "f" in qs and qs["f"]:
+        f_val = qs["f"][0]
         try:
             padded = f_val + "=" * (-len(f_val) % 4)
             raw = base64.urlsafe_b64decode(padded)
@@ -60,10 +59,11 @@ def _validate_avito_url(text: str) -> tuple[str | None, str | None]:
         except Exception:
             return None, "⚠️ Неверный формат URL — параметр <code>f=</code> повреждён."
 
-    clean_query = urlencode(clean) if clean else ""
+    # Reconstruct preserving the ORIGINAL parameter order — do not re-encode
+    # the f= base64 which is already URL-safe.
     clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    if clean_query:
-        clean_url += f"?{clean_query}"
+    if parsed.query:
+        clean_url += f"?{parsed.query}"
     return clean_url, None
 
 
