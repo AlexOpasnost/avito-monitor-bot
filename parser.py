@@ -1,4 +1,5 @@
 """Avito parser — primary: mobile API, fallback: HTML hydration JSON."""
+import base64
 import html as html_lib
 import logging
 import re
@@ -276,6 +277,70 @@ def _get_cloudscraper(proxy: str | None):
     _cs_session = s
     _cs_created = now
     return s
+
+
+def extract_price_range(url: str) -> tuple[int | None, int | None]:
+    """Pull (min_price, max_price) out of an Avito URL.
+
+    Checks, in order:
+      1. pmin/pmax query params (explicit and most reliable)
+      2. price_min / price_max (older variant)
+      3. The JSON blob inside the f= base64 parameter, which holds
+         filter state like {"<key>": {"from": 1000, "to": 5000}}
+
+    Returns (None, None) if no range is found."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None, None
+
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    pmin = _int((qs.get("pmin") or qs.get("price_min") or [None])[0])
+    pmax = _int((qs.get("pmax") or qs.get("price_max") or [None])[0])
+
+    if pmin is not None or pmax is not None:
+        return pmin, pmax
+
+    # Try decoding f= — it's URL-safe base64 with a JSON blob holding
+    # filter state. The price filter shows up as {"from": N, "to": M}.
+    f_val = (qs.get("f") or [None])[0]
+    if not f_val:
+        return None, None
+    try:
+        padded = f_val + "=" * (-len(f_val) % 4)
+        raw = base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
+        # Skip any leading non-JSON bytes
+        start = raw.find("{")
+        if start < 0:
+            return None, None
+        data = orjson.loads(raw[start:])
+    except Exception:
+        return None, None
+
+    # Walk the JSON and collect the first {from, to} pair
+    def _walk(node):
+        if isinstance(node, dict):
+            if "from" in node or "to" in node:
+                return _int(node.get("from")), _int(node.get("to"))
+            for v in node.values():
+                r = _walk(v)
+                if r != (None, None):
+                    return r
+        elif isinstance(node, list):
+            for v in node:
+                r = _walk(v)
+                if r != (None, None):
+                    return r
+        return None, None
+
+    return _walk(data)
 
 
 def _isolate_search_results(html: str) -> str:

@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -10,7 +11,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import config
 from database import db
-from parser import AvitoItem, fetch_search_items
+from parser import AvitoItem, extract_price_range, fetch_search_items
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,20 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
 async def _process_items(sub: dict, items: list[AvitoItem], bot: Bot):
     is_first_scan = sub.get("last_checked_at") is None
 
+    # Client-side safety net: drop anything whose price is outside the
+    # range specified in the user's URL. Avito's server should already
+    # honor this but we double-check to guarantee no out-of-range items.
+    pmin, pmax = extract_price_range(sub["url"])
+    if pmin is not None or pmax is not None:
+        before = len(items)
+        items = [i for i in items if _price_in_range(i, pmin, pmax)]
+        dropped = before - len(items)
+        if dropped:
+            logger.info(
+                "Sub #%d: dropped %d items outside price range [%s, %s]",
+                sub["id"], dropped, pmin, pmax,
+            )
+
     if is_first_scan:
         ids = [i.avito_id for i in items if i.avito_id]
         await db.mark_items_sent_batch(sub["id"], ids)
@@ -206,3 +221,28 @@ def _escape(s: str) -> str:
     if not s:
         return ""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _price_in_range(item: AvitoItem, pmin: int | None, pmax: int | None) -> bool:
+    """Return True if the item should pass the price filter.
+
+    Items with no parseable price are kept — we can't know whether they
+    fit and dropping them would cause false negatives on services /
+    listings where the price is negotiable."""
+    price = item.price_value
+    if price is None:
+        # Try to pull a number out of the price string as a fallback
+        if item.price:
+            digits = re.sub(r"\D+", "", item.price)
+            if digits:
+                try:
+                    price = int(digits)
+                except ValueError:
+                    price = None
+    if price is None:
+        return True  # unknown price — don't drop
+    if pmin is not None and price < pmin:
+        return False
+    if pmax is not None and price > pmax:
+        return False
+    return True
