@@ -622,6 +622,76 @@ def _extract_items_from_json(data: dict, parent_key: str = "") -> list[AvitoItem
     return []
 
 
+_IMAGE_SIZE_KEYS = (
+    "864x648", "636x476", "540x405", "432x324", "318x238",
+    "main", "big", "biggest", "default", "url",
+)
+
+
+def _extract_image_url(val: dict) -> str | None:
+    """Pull the best available image URL from whatever shape Avito used.
+
+    Observed shapes:
+      - images: [{"864x648": "...", "636x476": "...", ...}]
+      - images: [{"variants": {"864x648": "...", ...}}]
+      - images: [{"url": "..."}]
+      - imagesAlt: same
+      - image: {"864x648": "..."} or {"url": "..."}
+      - images: [{"sizes": {"1280x960": "..."}}]
+      - cover: {"url": "..."}
+    """
+    # 1) list-style
+    for key in ("images", "imagesAlt", "photos", "gallery"):
+        lst = val.get(key)
+        if isinstance(lst, list) and lst:
+            first = lst[0]
+            url = _image_from_dict(first)
+            if url:
+                return url
+
+    # 2) single-dict style
+    for key in ("image", "cover", "mainImage", "thumbnail"):
+        obj = val.get(key)
+        if isinstance(obj, dict):
+            url = _image_from_dict(obj)
+            if url:
+                return url
+        elif isinstance(obj, str) and obj.startswith("http"):
+            return obj
+    return None
+
+
+def _image_from_dict(obj) -> str | None:
+    if isinstance(obj, str) and obj.startswith("http"):
+        return obj
+    if not isinstance(obj, dict):
+        return None
+    # Direct size keys
+    for k in _IMAGE_SIZE_KEYS:
+        v = obj.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    # Nested variants / sizes
+    for nest_key in ("variants", "sizes", "urls"):
+        nested = obj.get(nest_key)
+        if isinstance(nested, dict):
+            for k in _IMAGE_SIZE_KEYS:
+                v = nested.get(k)
+                if isinstance(v, str) and v.startswith("http"):
+                    return v
+            # Fall back to any http value inside
+            for v in nested.values():
+                if isinstance(v, str) and v.startswith("http"):
+                    return v
+    # Last resort — any http value at the top level
+    for v in obj.values():
+        if isinstance(v, str) and v.startswith("http") and (
+            ".jpg" in v or ".jpeg" in v or ".png" in v or ".webp" in v
+        ):
+            return v
+    return None
+
+
 def _items_from_raw_list(items_raw: list) -> list[AvitoItem]:
     items: list[AvitoItem] = []
     for raw in items_raw:
@@ -665,25 +735,8 @@ def _parse_api_item(val: dict) -> AvitoItem:
     else:
         item_url = url_path or "https://www.avito.ru"
 
-    # Image
-    image_url = None
-    images = val.get("images") or []
-    if images and isinstance(images[0], dict):
-        img0 = images[0]
-        image_url = (
-            img0.get("864x648")
-            or img0.get("636x476")
-            or img0.get("432x324")
-            or img0.get("url")
-        )
-        # Sometimes image is a dict of size->url under "variants"
-        if not image_url and isinstance(img0.get("variants"), dict):
-            variants = img0["variants"]
-            image_url = (
-                variants.get("864x648")
-                or variants.get("636x476")
-                or next(iter(variants.values()), None)
-            )
+    # Image — Avito uses several different shapes depending on the endpoint
+    image_url = _extract_image_url(val)
 
     # Location
     location = None

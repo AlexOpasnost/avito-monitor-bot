@@ -192,7 +192,6 @@ def _format_notification(item: AvitoItem) -> str:
     lines.append(f"💰 <b>{_escape(item.price)}</b>")
     if item.location:
         lines.append(f"📍 {_escape(item.location)}")
-    lines.append(f"🔗 {item.url}")
     if item.description:
         lines.append(f"\n<i>{_escape(item.description)}</i>")
     if item.seller_name:
