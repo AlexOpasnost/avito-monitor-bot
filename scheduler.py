@@ -21,7 +21,7 @@ MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
 async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
     # Hard-coded sem=1: spec requires "never fire two subscriptions
     # simultaneously". Avito rate-limits per source IP/proxy pool.
-    logger.info("Scheduler started (per-sub interval=90-180s, sem=1, stagger=5-15s)")
+    logger.info("Scheduler started (per-sub interval=300-600s, sem=1, stagger=5-15s)")
     sem = asyncio.Semaphore(1)
     tasks: dict[int, asyncio.Task] = {}
 
@@ -118,9 +118,10 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             except Exception:
                 pass
 
-        # Random 90-180 s wait between cycles (per spec). Avito rate-limits
-        # tight 60 s polling — a wider spread looks much more like a human.
-        wait = random.uniform(90.0, 180.0)
+        # Random 5-10 min wait between cycles. Avito blocks predictable
+        # short-interval polling on behavioral fingerprint — wider spread
+        # looks much more like a human refreshing the page occasionally.
+        wait = random.randint(300, 600)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait)
             break
