@@ -68,14 +68,26 @@ _session_lock = asyncio.Lock()
 
 async def init_session() -> None:
     """Open ONE AsyncSession that lives for the entire bot lifetime.
-    Cookies accumulate in this session like a real browser."""
+
+    Proxy is bound at session level so curl-cffi tunnels EVERY request
+    (including TLS handshake / DNS resolution that goes through CONNECT)
+    via the proxy. verify=False avoids occasional MITM-cert issues that
+    some mobile-proxy providers introduce."""
     global _session
     if _session is not None:
         return
-    _session = AsyncSession(impersonate=_IMPERSONATE, timeout=_REQ_TIMEOUT)
+
+    proxies = _proxies_dict()
+    _session = AsyncSession(
+        impersonate=_IMPERSONATE,
+        timeout=_REQ_TIMEOUT,
+        proxies=proxies,
+        verify=False,
+    )
     logger.info(
-        "[parser] curl-cffi session opened (impersonate=%s, timeout=%ds)",
+        "[parser] curl-cffi session opened (impersonate=%s, timeout=%ds, proxy=%s, verify=False)",
         _IMPERSONATE, _REQ_TIMEOUT,
+        "yes" if proxies else "no",
     )
 
 
@@ -132,6 +144,7 @@ async def throttled_rotate_ip() -> bool:
 
 
 async def check_proxy_ip() -> str | None:
+    """Used at startup only — separate httpx client to verify proxy creds."""
     if not config.proxy_list:
         return None
     try:
@@ -144,7 +157,32 @@ async def check_proxy_ip() -> str | None:
     return None
 
 
+async def _log_visible_ip(label: str = "") -> None:
+    """Hit api.ipify.org through the SAME curl-cffi session and log the IP.
+
+    This is the IP Avito will see for the very next request — if it matches
+    Railway's egress IP, the proxy is not actually being used. If it matches
+    the mobile-proxy IP, traffic is correctly tunneled."""
+    if _session is None:
+        return
+    try:
+        async with _session_lock:
+            r = await _session.get("https://api.ipify.org?format=json")
+        if r.status_code == 200:
+            ip = (r.json() or {}).get("ip", "?")
+            logger.info("[parser] visible IP %s%s", ip, f" ({label})" if label else "")
+        else:
+            logger.warning("[parser] ipify HTTP %d", r.status_code)
+    except Exception as e:
+        logger.warning("[parser] visible-IP check failed: %s", str(e)[:120])
+
+
 def _proxies_dict() -> dict | None:
+    """Convert proxy URL into curl-cffi's expected dict shape.
+
+    Required form: {"http": "scheme://user:pass@host:port",
+                    "https": "scheme://user:pass@host:port"}
+    Both keys must be set so curl-cffi tunnels HTTP and HTTPS the same way."""
     if not config.proxy_list:
         return None
     p = config.proxy_list[0]
@@ -186,11 +224,15 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
         return None
 
     target_url = _ensure_sort_by_date(url)
-    proxies = _proxies_dict()
+
+    # Diagnostic: log the IP Avito will see for the next request. If this
+    # matches the Railway container IP instead of the mobile-proxy IP,
+    # the proxy isn't actually being used.
+    await _log_visible_ip("pre-scrape")
 
     try:
         async with _session_lock:
-            resp = await _session.get(target_url, proxies=proxies)
+            resp = await _session.get(target_url)
     except Exception as e:
         msg = str(e).lower()
         if "timeout" in msg or "timed out" in msg or "operation_timedout" in msg:
