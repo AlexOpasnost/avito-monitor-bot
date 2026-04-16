@@ -9,10 +9,11 @@ os.environ.setdefault("PROXY_ROTATE_URL", "")
 
 from parser import (
     _parse_initial_data,
-    _item_from_dom_dict,
     _find_catalog_items,
     _ensure_sort_by_date,
     _extract_image_url,
+    _extract_items_from_html,
+    _looks_like_block,
 )
 
 
@@ -81,21 +82,30 @@ def test_parse_initial_data():
     print("OK: _parse_initial_data")
 
 
-def test_dom_dict():
-    item = _item_from_dom_dict({
-        "id": "555",
-        "title": "Bike",
-        "priceStr": "10 000 ₽",
-        "priceValue": 10000,
-        "urlPath": "/moskva/velo_555",
-        "imageUrl": "https://example.com/bike.jpg",
-        "location": "Москва, метро Белорусская",
-    })
-    assert item.avito_id == "555"
-    assert item.title == "Bike"
-    assert item.url.startswith("https://www.avito.ru")
-    assert item.image_url == "https://example.com/bike.jpg"
-    print("OK: _item_from_dom_dict")
+def test_block_detection():
+    assert _looks_like_block("Доступ ограничен: проблема с IP")
+    assert _looks_like_block("Слишком много запросов")
+    assert _looks_like_block("Robot Check")
+    assert not _looks_like_block("Купить телефон в Москве")
+    assert not _looks_like_block("")
+    print("OK: _looks_like_block")
+
+
+def test_extract_from_mfe_html():
+    # Synthetic HTML mimicking Avito's modern hydration script
+    payload = '{"i18n":{"hasMessages":{}},"state":{"data":{"catalog":{"items":[{"type":"item","value":{"id":777,"title":"Test phone","price":1500,"urlPath":"/x/777"}}]}}}}'
+    # Avito HTML-escapes the JSON inside the script body
+    escaped = payload.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html = (
+        '<html><body>'
+        '<script type="mime/invalid" data-mfe-state="true">' + escaped + '</script>'
+        '</body></html>'
+    )
+    items = _extract_items_from_html(html)
+    assert items is not None and len(items) == 1, f"expected 1 item, got {items}"
+    assert items[0].avito_id == "777"
+    assert items[0].title == "Test phone"
+    print("OK: _extract_items_from_html (mfe-state)")
 
 
 def test_image_extraction():
@@ -126,7 +136,8 @@ if __name__ == "__main__":
     test_ensure_sort()
     test_find_catalog_items()
     test_parse_initial_data()
-    test_dom_dict()
+    test_block_detection()
+    test_extract_from_mfe_html()
     test_image_extraction()
     test_parse_url_encoded_string()
     print("\nALL UNIT TESTS PASSED")

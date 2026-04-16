@@ -1,15 +1,19 @@
-"""Avito parser — Playwright + stealth, single-browser-instance architecture.
+"""Avito parser — curl-cffi (Chrome TLS impersonation) + HTML hydration parsing.
 
-Architecture:
-  - bot.py calls init_browser() on startup -> ONE chromium instance for life of bot
-  - Each monitoring check calls fetch_search_items(url) which:
-      1. rotates the mobile proxy IP
-      2. opens a NEW page in the existing browser
-      3. applies stealth, navigates, scrolls, extracts window.__initialData__
-      4. closes the page (browser stays up)
-  - bot.py calls close_browser() on shutdown
+Why curl-cffi: it speaks TLS exactly like real Chrome (JA3 fingerprint),
+so Avito's CDN/anti-bot does not flag the request as a script. No browser
+runtime needed — just plain async HTTP.
+
+Each scrape:
+  1. rotate the mobile-proxy IP
+  2. sleep 5s so the new IP is fully active
+  3. async GET the URL with impersonate="chrome120" through the proxy
+  4. detect IP-block by title/body sniff
+  5. extract items from <script data-mfe-state="true"> JSON blobs
+  6. on block: retry up to 3 times with rotation between attempts
 """
 import asyncio
+import html as html_lib
 import logging
 import random
 import re
@@ -18,18 +22,7 @@ from urllib.parse import unquote
 
 import httpx
 import orjson
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Playwright,
-    async_playwright,
-)
-
-try:
-    # playwright-stealth >= 1.0.6 ships an async stealth() helper
-    from playwright_stealth import stealth_async  # type: ignore
-except ImportError:  # pragma: no cover
-    stealth_async = None
+from curl_cffi.requests import AsyncSession
 
 from config import config
 
@@ -55,54 +48,7 @@ class AvitoItem:
 
 
 # ---------------------------------------------------------------------------
-# Browser singleton
-# ---------------------------------------------------------------------------
-
-_pw: Playwright | None = None
-_browser: Browser | None = None
-_browser_lock = asyncio.Lock()
-
-
-async def init_browser() -> None:
-    """Launch ONE chromium that stays up for the entire bot lifetime."""
-    global _pw, _browser
-    if _browser is not None:
-        return
-    _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-    )
-    logger.info("[browser] chromium launched (singleton)")
-
-
-async def close_browser() -> None:
-    global _pw, _browser
-    if _browser:
-        try:
-            await _browser.close()
-        except Exception as e:
-            logger.debug("[browser] close error: %s", e)
-        _browser = None
-    if _pw:
-        try:
-            await _pw.stop()
-        except Exception as e:
-            logger.debug("[browser] pw stop error: %s", e)
-        _pw = None
-    logger.info("[browser] chromium closed")
-
-
-# ---------------------------------------------------------------------------
-# Proxy rotation
+# Proxy
 # ---------------------------------------------------------------------------
 
 async def rotate_ip() -> bool:
@@ -119,7 +65,6 @@ async def rotate_ip() -> bool:
 
 
 async def check_proxy_ip() -> str | None:
-    """Return external IP via the configured proxy, or None."""
     if not config.proxy_list:
         return None
     try:
@@ -132,51 +77,44 @@ async def check_proxy_ip() -> str | None:
     return None
 
 
-def _proxy_dict_for_pw() -> dict | None:
-    """Convert the configured proxy URL into Playwright's proxy dict shape."""
+def _proxies_dict() -> dict | None:
     if not config.proxy_list:
         return None
-    proxy_url = config.proxy_list[0]
-    # Expected format: scheme://[user:pass@]host:port
-    m = re.match(r"^(https?|socks5)://(?:([^:@]+):([^@]+)@)?([^:/]+):(\d+)/?$", proxy_url)
-    if not m:
-        logger.warning("[proxy] cannot parse proxy URL: %s", proxy_url)
-        return None
-    scheme, user, password, host, port = m.groups()
-    out: dict = {"server": f"{scheme}://{host}:{port}"}
-    if user:
-        out["username"] = user
-    if password:
-        out["password"] = password
-    return out
+    p = config.proxy_list[0]
+    return {"http": p, "https": p}
 
 
 # ---------------------------------------------------------------------------
-# URL helpers
+# User agents — random pick per request matching the impersonate target
 # ---------------------------------------------------------------------------
 
-# Realistic desktop user agents — random pick per new page so two scrapes
-# from the same proxy IP don't share the same fingerprint.
 _USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
+
+_IMPERSONATE_TARGETS = ("chrome120", "chrome119", "chrome116")
 
 
 def _pick_user_agent() -> str:
     return random.choice(_USER_AGENTS)
 
+
+def _pick_impersonate() -> str:
+    return random.choice(_IMPERSONATE_TARGETS)
+
+
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
 
 def _ensure_sort_by_date(url: str) -> str:
     """Append &s=104 (sort by date desc) without re-encoding the URL."""
@@ -187,10 +125,9 @@ def _ensure_sort_by_date(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — scrape with retry-on-IP-block
 # ---------------------------------------------------------------------------
 
-# Scrape result statuses
 _OK = "ok"
 _BLOCKED = "blocked"
 _FAIL = "fail"
@@ -199,26 +136,11 @@ _FAIL = "fail"
 async def fetch_search_items(
     url: str, *_unused, max_retries: int = 3
 ) -> list[AvitoItem] | None:
-    """Scrape the URL with retry-on-IP-block.
-
-    Each attempt:
-      - rotate the mobile-proxy IP
-      - sleep 5s after rotation so the new IP is live
-      - open a fresh context+page (random UA, stealth)
-      - goto + scroll + extract
-      - close context+page
-
-    On IP block: rotate, sleep, retry up to max_retries times. Returns
-    None only after all attempts fail. Extra positional args ignored
-    (back-compat with old (url, proxy) signature)."""
-    if _browser is None:
-        logger.error("[parser] browser not initialised — call init_browser() first")
-        return None
-
+    """Scrape the URL with retry-on-IP-block. Returns None only after all
+    attempts fail. Extra positional args ignored (back-compat)."""
     target_url = _ensure_sort_by_date(url)
 
     for attempt in range(1, max_retries + 1):
-        # Always rotate before each attempt — old IP may already be flagged
         rotated = await rotate_ip()
         if rotated:
             logger.info(
@@ -227,7 +149,6 @@ async def fetch_search_items(
             )
             await asyncio.sleep(5)
         else:
-            # No proxy configured or rotation failed — small jitter only
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
         status, items = await _scrape_once(target_url)
@@ -241,17 +162,15 @@ async def fetch_search_items(
 
         if status == _BLOCKED:
             logger.warning(
-                "[parser] BLOCKED on attempt %d/%d for %s — will rotate IP and retry",
+                "[parser] BLOCKED on attempt %d/%d for %s — rotating IP",
                 attempt, max_retries, target_url[:80],
             )
             continue
 
-        # Hard failure (timeout, network, no items found in a non-blocked page)
         logger.warning(
             "[parser] hard fail on attempt %d/%d for %s",
             attempt, max_retries, target_url[:80],
         )
-        # Still try once more with a fresh IP — sometimes the page just glitched
         continue
 
     logger.error("[parser] all %d attempts failed for %s", max_retries, target_url[:80])
@@ -259,106 +178,70 @@ async def fetch_search_items(
 
 
 async def _scrape_once(target_url: str) -> tuple[str, list[AvitoItem] | None]:
-    """One scrape attempt. Returns (status, items_or_none).
-
-    status: _OK   -> items is a list (possibly empty)
-            _BLOCKED -> Avito served the IP-block page; caller should rotate
-            _FAIL -> network/timeout/structural error"""
-    proxy_cfg = _proxy_dict_for_pw()
+    """One scrape attempt via curl-cffi."""
+    proxies = _proxies_dict()
     user_agent = _pick_user_agent()
+    impersonate = _pick_impersonate()
 
-    context: BrowserContext | None = None
-    page = None
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     try:
-        async with _browser_lock:
-            context = await _browser.new_context(
-                user_agent=user_agent,
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-                viewport={"width": 1366, "height": 900},
-                proxy=proxy_cfg,
-                extra_http_headers={
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                },
-            )
-        page = await context.new_page()
+        async with AsyncSession(impersonate=impersonate, timeout=30) as session:
+            resp = await session.get(target_url, headers=headers, proxies=proxies)
+    except Exception as e:
+        logger.warning("[parser] HTTP error: %s", e)
+        return _FAIL, None
 
-        if stealth_async:
-            try:
-                await stealth_async(page)
-            except Exception as e:
-                logger.debug("[parser] stealth_async failed: %s", e)
+    status_code = resp.status_code
+    if status_code in (429, 403):
+        logger.warning(
+            "[parser] HTTP %d (rate-limit/forbid) UA=%s impersonate=%s",
+            status_code, user_agent[:40], impersonate,
+        )
+        return _BLOCKED, None
+    if status_code in (301, 302, 303, 307, 308):
+        logger.warning("[parser] HTTP %d redirect (likely block)", status_code)
+        return _BLOCKED, None
+    if status_code != 200:
+        logger.warning("[parser] HTTP %d", status_code)
+        return _FAIL, None
 
-        try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
-        except Exception as e:
-            logger.warning("[parser] goto failed for %s: %s", target_url[:80], e)
-            return _FAIL, None
+    html = resp.text or ""
+    if not html:
+        return _FAIL, None
 
-        # Wait for network to settle so hydration variables are populated
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-        except Exception:
-            pass  # networkidle is best-effort
+    if _looks_like_block(html[:5000]):
+        logger.warning(
+            "[parser] IP BLOCKED (body sniff) UA=%s impersonate=%s",
+            user_agent[:40], impersonate,
+        )
+        return _BLOCKED, None
 
-        # Human-ish scroll
-        try:
-            await page.mouse.wheel(0, random.randint(300, 500))
-            await asyncio.sleep(random.uniform(0.4, 1.0))
-        except Exception:
-            pass
-
-        # IP-block detection — Avito serves a static page when the IP is banned
-        try:
-            title = await page.title()
-        except Exception:
-            title = ""
-        if _looks_like_block(title):
-            logger.warning(
-                "[parser] IP BLOCKED (title=%r) UA=%s",
-                title[:60], user_agent[:40],
-            )
-            return _BLOCKED, None
-
-        # Sometimes the title is fine but the body is a captcha — sniff body too
-        try:
-            body_snippet = await page.evaluate(
-                "() => (document.body && document.body.innerText || '').slice(0, 400)"
-            )
-        except Exception:
-            body_snippet = ""
-        if body_snippet and _looks_like_block(body_snippet):
-            logger.warning("[parser] IP BLOCKED (body) UA=%s", user_agent[:40])
-            return _BLOCKED, None
-
-        items = await _extract_items_via_browser(page)
-        if items is None:
-            logger.warning(
-                "[parser] could not extract items (title=%r)", title[:60]
-            )
-            return _FAIL, None
-        return _OK, items
-
-    finally:
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
-        if context:
-            try:
-                await context.close()
-            except Exception:
-                pass
+    items = _extract_items_from_html(html)
+    if items is None:
+        logger.warning("[parser] could not extract items from HTML (size=%d)", len(html))
+        return _FAIL, None
+    return _OK, items
 
 
 _BLOCK_PHRASES = (
     "доступ ограничен",
     "проблема с ip",
     "подозрительная активность",
-    "captcha",
-    "robot check",
     "слишком много запросов",
+    "robot check",
 )
 
 
@@ -370,134 +253,104 @@ def _looks_like_block(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Browser-side extraction
+# HTML extraction — pull items out of <script data-mfe-state> JSON blobs
 # ---------------------------------------------------------------------------
 
-# JS that pulls every plausible hydration source AND falls back to DOM scrape
-# inside the catalog-serp container only.
-_EXTRACT_JS = r"""
-() => {
-    // 1) global hydration vars
-    const globals = ['__initialData__', '__INITIAL_DATA__', '__preloadedState__',
-                     '__PRELOADED_STATE__', '__mfe__', '__NEXT_DATA__'];
-    for (const g of globals) {
-        if (window[g] !== undefined && window[g] !== null) {
-            return { source: 'global:' + g, data: window[g] };
-        }
-    }
-
-    // 2) <script type="mime/invalid" data-mfe-state="true"> — Avito's modern shape
-    const mfe = document.querySelectorAll('script[data-mfe-state="true"]');
-    const mfeBlobs = [];
-    for (const s of mfe) {
-        const t = (s.textContent || '').trim();
-        if (t && !t.includes('sandbox')) mfeBlobs.push(t);
-    }
-    if (mfeBlobs.length) return { source: 'mfe-state', data: mfeBlobs };
-
-    // 3) DOM fallback — scrape inside catalog-serp only
-    const root = document.querySelector('[data-marker="catalog-serp"]')
-              || document.querySelector('[data-marker="catalog-list"]')
-              || document.querySelector('.items-items')
-              || null;
-    if (!root) return { source: 'none', data: null };
-
-    const items = [];
-    const seen = new Set();
-    for (const node of root.querySelectorAll('[data-item-id]')) {
-        const id = node.getAttribute('data-item-id');
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        const link = node.querySelector('a[href*="' + id + '"]');
-        const titleEl = node.querySelector('[itemprop="name"], h3, [data-marker="item-title"]');
-        const priceEl = node.querySelector('[itemprop="price"], [data-marker="item-price"]');
-        const imgEl = node.querySelector('img');
-        const locEl = node.querySelector('[data-marker="item-address"], [class*="geo"]');
-        items.push({
-            id: id,
-            title: titleEl ? titleEl.textContent.trim() : '',
-            urlPath: link ? link.getAttribute('href').split('?')[0] : ('/' + id),
-            priceStr: priceEl ? priceEl.textContent.trim() : '',
-            priceValue: priceEl ? parseInt((priceEl.getAttribute('content') || priceEl.textContent).replace(/\D+/g, ''), 10) || null : null,
-            imageUrl: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null,
-            location: locEl ? locEl.textContent.trim() : null,
-        });
-    }
-    return { source: 'dom', data: items };
-}
-"""
+# Regex over raw HTML — fast, no BeautifulSoup needed for this part.
+_MFE_SCRIPT_RE = re.compile(
+    r'<script[^>]*data-mfe-state="true"[^>]*>([\s\S]+?)</script>',
+    re.IGNORECASE,
+)
 
 
-async def _extract_items_via_browser(page) -> list[AvitoItem] | None:
-    """Try multiple extraction sources via the live page. Returns a list of
-    AvitoItems (possibly empty) or None on hard failure."""
-    try:
-        result = await page.evaluate(_EXTRACT_JS)
-    except Exception as e:
-        logger.debug("[parser] evaluate _EXTRACT_JS failed: %s", e)
-        return None
+def _extract_items_from_html(html: str) -> list[AvitoItem] | None:
+    """Parse the catalog items out of the page HTML.
 
-    if not result or result.get("data") is None:
-        return None
-
-    source = result.get("source", "?")
-    data = result["data"]
-    logger.info("[parser] extraction source: %s", source)
-
-    if source == "dom":
-        # Already plain dicts shaped by our JS
-        items: list[AvitoItem] = []
-        for it in data:
+    Source priority:
+      1. <script data-mfe-state="true"> JSON blobs — Avito's modern hydration
+      2. window.__initialData__ (URL-encoded JSON, older pages)
+      3. window.__preloadedState__ / window.__mfe__
+    """
+    # 1) mfe-state scripts
+    for blob in _MFE_SCRIPT_RE.findall(html):
+        blob = blob.strip()
+        if not blob or "sandbox" in blob[:200]:
+            continue
+        try:
+            data = orjson.loads(html_lib.unescape(blob))
+        except Exception:
             try:
-                items.append(_item_from_dom_dict(it))
-            except Exception as e:
-                logger.debug("[parser] dom item err: %s", e)
-        return items
-
-    if source == "mfe-state":
-        # List of JSON strings — try each
-        for blob in data:
-            try:
-                parsed = orjson.loads(blob)
+                data = orjson.loads(blob)
             except Exception:
-                # Some scripts contain HTML-escaped JSON
-                try:
-                    import html as _html
-                    parsed = orjson.loads(_html.unescape(blob))
-                except Exception:
-                    continue
-            items = _parse_initial_data(parsed)
+                continue
+        items = _parse_initial_data(data)
+        if items:
+            logger.info("[parser] extraction source: mfe-state")
+            return items
+
+    # 2) __initialData__
+    m = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+    if m:
+        try:
+            decoded = unquote(m.group(1))
+            data = orjson.loads(decoded)
+            items = _parse_initial_data(data)
             if items:
+                logger.info("[parser] extraction source: __initialData__")
                 return items
-        return []
+        except Exception as e:
+            logger.debug("[parser] __initialData__ decode err: %s", e)
 
-    # Global hydration var — could be dict or string
-    return _parse_initial_data(data)
+    # 3) __preloadedState__ / __mfe__
+    for var_name in ("__preloadedState__", "__mfe__"):
+        marker = f"window.{var_name}"
+        idx = html.find(marker)
+        if idx < 0:
+            continue
+        eq_idx = html.find("=", idx)
+        if eq_idx < 0:
+            continue
+        start = eq_idx + 1
+        while start < len(html) and html[start] in " \t\n\r":
+            start += 1
+        if start >= len(html):
+            continue
+        try:
+            if html[start] == '"':
+                end = html.find('";', start + 1)
+                if end < 0:
+                    end = html.find('"', start + 1)
+                if end > start:
+                    encoded = html[start + 1:end]
+                    data = orjson.loads(unquote(encoded))
+                    items = _parse_initial_data(data)
+                    if items:
+                        logger.info("[parser] extraction source: %s", var_name)
+                        return items
+            elif html[start] == "{":
+                depth = 0
+                i = start
+                while i < min(len(html), start + 5_000_000):
+                    if html[i] == "{":
+                        depth += 1
+                    elif html[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            data = orjson.loads(html[start:i + 1])
+                            items = _parse_initial_data(data)
+                            if items:
+                                logger.info("[parser] extraction source: %s", var_name)
+                                return items
+                            break
+                    i += 1
+        except Exception as e:
+            logger.debug("[parser] %s parse err: %s", var_name, e)
 
-
-def _item_from_dom_dict(d: dict) -> AvitoItem:
-    item_id = str(d.get("id") or "")
-    url_path = d.get("urlPath") or f"/{item_id}"
-    if not url_path.startswith("http"):
-        item_url = f"https://www.avito.ru{url_path}"
-    else:
-        item_url = url_path
-    return AvitoItem(
-        avito_id=item_id,
-        title=d.get("title") or f"Объявление {item_id}",
-        price=d.get("priceStr") or "Цена не указана",
-        price_value=d.get("priceValue"),
-        url=item_url,
-        image_url=d.get("imageUrl"),
-        location=d.get("location"),
-        description=None,
-        seller_name=None,
-        published_timestamp=None,
-    )
+    return None
 
 
 # ---------------------------------------------------------------------------
-# __initialData__ parsing
+# Catalog item parsing
 # ---------------------------------------------------------------------------
 
 def _parse_initial_data(raw) -> list[AvitoItem] | None:
@@ -507,13 +360,11 @@ def _parse_initial_data(raw) -> list[AvitoItem] | None:
         data = raw
     elif isinstance(raw, str):
         try:
-            decoded = unquote(raw)
-            data = orjson.loads(decoded)
+            data = orjson.loads(unquote(raw))
         except Exception:
             try:
                 data = orjson.loads(raw)
-            except Exception as e:
-                logger.debug("[parser] cannot decode initial data: %s", e)
+            except Exception:
                 return None
     else:
         return None
@@ -526,7 +377,6 @@ def _parse_initial_data(raw) -> list[AvitoItem] | None:
     for raw_item in items_raw:
         if not isinstance(raw_item, dict):
             continue
-        # Skip non-listing payloads (banners, recommendations) at the row level
         rtype = (raw_item.get("type") or "").strip()
         if rtype and rtype != "item":
             continue
@@ -542,10 +392,9 @@ def _parse_initial_data(raw) -> list[AvitoItem] | None:
     return items
 
 
-# Catalog items live at one of these paths; everything else (recommendations,
-# similar, vip, etc.) is intentionally NOT searched — Avito already filtered
-# the catalog server-side based on the URL params.
 def _find_catalog_items(data) -> list | None:
+    """Find catalog.items list in the hydration payload — never recurse into
+    recommendation/similar/vip blocks."""
     if not isinstance(data, dict):
         return None
     candidates = [
@@ -568,9 +417,9 @@ def _find_catalog_items(data) -> list | None:
         if ok and isinstance(node, list):
             return node
 
-    # Last resort: walk dict values looking for a "catalog" subdict with items
     for key, val in data.items():
-        if key.lower() in ("recommendations", "similar", "vip", "promoted"):
+        if key.lower() in ("recommendations", "similar", "vip", "promoted",
+                           "advertising", "banners", "alternative", "alternatives"):
             continue
         if isinstance(val, dict):
             sub = _find_catalog_items(val)
@@ -583,7 +432,6 @@ def _parse_item(val: dict) -> AvitoItem:
     avito_id = str(val.get("id") or val.get("itemId") or "")
     title = val.get("title") or ""
 
-    # Price
     price_info = val.get("priceDetailed") or val.get("price") or {}
     price_value = None
     price_str = "Цена не указана"
@@ -596,7 +444,6 @@ def _parse_item(val: dict) -> AvitoItem:
         price_value = int(price_info)
         price_str = f"{price_value:,} ₽".replace(",", " ")
 
-    # URL
     url_path = val.get("urlPath") or val.get("url") or ""
     if url_path and not url_path.startswith("http"):
         item_url = f"https://www.avito.ru{url_path}"
@@ -605,24 +452,20 @@ def _parse_item(val: dict) -> AvitoItem:
 
     image_url = _extract_image_url(val)
 
-    # Location
     location = None
     loc = val.get("location") or {}
     if isinstance(loc, dict):
         location = loc.get("name")
 
-    # Description
     desc = val.get("description") or ""
     if isinstance(desc, dict):
         desc = desc.get("text") or ""
     if desc and len(desc) > 300:
         desc = desc[:300] + "..."
 
-    # Seller
     seller = val.get("seller") or {}
     seller_name = seller.get("name") if isinstance(seller, dict) else None
 
-    # Timestamp
     ts_raw = (
         val.get("sortTimeStamp")
         or val.get("time")
