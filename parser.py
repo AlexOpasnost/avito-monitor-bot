@@ -30,8 +30,18 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_IMPERSONATE = "chrome120"
 _REQ_TIMEOUT = 45  # seconds — generous for Avito's slow pages
+
+# Pool of impersonation targets — picked at random for every request.
+# Fixing on a single TLS fingerprint makes Avito's behavioral detector
+# trivially flag us. Each value here makes curl-cffi mimic that browser's
+# TLS handshake AND default header set, so they go together — never
+# override headers manually.
+_IMPERSONATE_OPTIONS = ("chrome119", "chrome120", "chrome124", "safari17_0")
+
+# Diagnostic — log the actual headers curl-cffi sends ONCE, on the first
+# successful request, so we can verify nothing custom is leaking through.
+_headers_logged = False
 
 # IP rotation is throttled globally — at most once every 5 minutes,
 # regardless of how many subscriptions hit a block. Rotating on every
@@ -68,48 +78,22 @@ class AvitoItem:
 
 
 # ---------------------------------------------------------------------------
-# Persistent session
+# Session lifecycle (no-op stubs)
 # ---------------------------------------------------------------------------
-
-_session: AsyncSession | None = None
-_session_lock = asyncio.Lock()
-
+# We deliberately do NOT keep a persistent AsyncSession anymore — a fresh
+# session is created per request inside _do_scrape. Banned cookies from a
+# previous block would otherwise carry over and re-trigger the ban.
 
 async def init_session() -> None:
-    """Open ONE AsyncSession that lives for the entire bot lifetime.
-
-    Proxy is bound at session level so curl-cffi tunnels EVERY request
-    (including TLS handshake / DNS resolution that goes through CONNECT)
-    via the proxy. verify=False avoids occasional MITM-cert issues that
-    some mobile-proxy providers introduce."""
-    global _session
-    if _session is not None:
-        return
-
     proxies = _proxies_dict()
-    _session = AsyncSession(
-        impersonate=_IMPERSONATE,
-        timeout=_REQ_TIMEOUT,
-        proxies=proxies,
-        verify=False,
-    )
     logger.info(
-        "[parser] curl-cffi session opened (impersonate=%s, timeout=%ds, proxy=%s, verify=False)",
-        _IMPERSONATE, _REQ_TIMEOUT,
-        "yes" if proxies else "no",
+        "[parser] per-request session mode (timeout=%ds, proxy=%s, verify=False)",
+        _REQ_TIMEOUT, "yes" if proxies else "no",
     )
 
 
 async def close_session() -> None:
-    global _session
-    if _session is None:
-        return
-    try:
-        await _session.close()
-    except Exception as e:
-        logger.debug("[parser] session close err: %s", e)
-    _session = None
-    logger.info("[parser] curl-cffi session closed")
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -166,17 +150,35 @@ async def check_proxy_ip() -> str | None:
     return None
 
 
-async def _log_visible_ip(label: str = "") -> None:
-    """Hit api.ipify.org through the SAME curl-cffi session and log the IP.
-
-    This is the IP Avito will see for the very next request — if it matches
-    Railway's egress IP, the proxy is not actually being used. If it matches
-    the mobile-proxy IP, traffic is correctly tunneled."""
-    if _session is None:
-        return
+async def _log_sent_headers(impersonate: str) -> None:
+    """One-off probe to httpbin/headers. Logs what server actually receives,
+    so we can confirm only impersonate-set headers are sent and no manual
+    overrides leak. Uses its OWN short-lived session via the proxy."""
+    proxies = _proxies_dict()
     try:
-        async with _session_lock:
-            r = await _session.get("https://api.ipify.org?format=json")
+        async with AsyncSession(
+            impersonate=impersonate, timeout=15, proxies=proxies, verify=False,
+        ) as s:
+            r = await s.get("https://httpbin.org/headers")
+            if r.status_code == 200:
+                data = r.json() or {}
+                headers = data.get("headers", {})
+                logger.info("[parser] SENT HEADERS (impersonate=%s, via httpbin):", impersonate)
+                for k, v in headers.items():
+                    logger.info("[parser]   %s: %s", k, v)
+            else:
+                logger.warning("[parser] httpbin probe HTTP %d", r.status_code)
+    except Exception as e:
+        logger.warning("[parser] header probe failed: %s", str(e)[:120])
+
+
+async def _log_visible_ip(session: AsyncSession, label: str = "") -> None:
+    """Hit api.ipify.org through the given session and log the IP.
+
+    Uses the SAME session that will then talk to Avito so we see the
+    exact IP/proxy path the scrape will use."""
+    try:
+        r = await session.get("https://api.ipify.org?format=json")
         if r.status_code == 200:
             ip = (r.json() or {}).get("ip", "?")
             logger.info("[parser] visible IP %s%s", ip, f" ({label})" if label else "")
@@ -233,10 +235,6 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
     scrape + 10-20s post-cooldown all happen under the lock. This makes
     it impossible for two scrapes to run in parallel — even when the
     handler's initial scan races with a scheduler cycle."""
-    if _session is None:
-        logger.error("[parser] session not initialised — call init_session() first")
-        return None
-
     target_url = _ensure_sort_by_date(url)
 
     async with _avito_request_lock:
@@ -252,62 +250,103 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
 
 
 async def _do_scrape(target_url: str) -> list[AvitoItem] | None:
-    """The actual scrape. Caller MUST hold _avito_request_lock."""
-    # Diagnostic: log the IP Avito will see for the next request. If this
-    # matches the Railway container IP instead of the mobile-proxy IP,
-    # the proxy isn't actually being used.
-    await _log_visible_ip("pre-scrape")
+    """The actual scrape. Caller MUST hold _avito_request_lock.
 
-    try:
-        async with _session_lock:
-            resp = await _session.get(target_url)
-    except Exception as e:
-        msg = str(e).lower()
-        if "timeout" in msg or "timed out" in msg or "operation_timedout" in msg:
-            logger.warning("[parser] TIMEOUT for %s: %s", target_url[:80], str(e)[:120])
-        else:
-            logger.warning("[parser] HTTP error for %s: %s", target_url[:80], str(e)[:120])
-        return None
+    Creates a FRESH AsyncSession for every request — banned cookies from
+    a previous block must not carry over and re-trigger the ban.
 
-    sc = resp.status_code
+    Random impersonate target per request — fixing on one TLS fingerprint
+    makes Avito's behavioural detector flag us trivially.
 
-    if sc == 200:
-        html = resp.text or ""
-        if not html:
-            logger.warning("[parser] empty body for %s", target_url[:80])
+    NO custom headers — curl-cffi's impersonate already sets the full
+    browser-correct header set. Adding User-Agent / Accept / Cookie etc.
+    by hand desyncs them from the TLS fingerprint and is a bot signal."""
+    impersonate = random.choice(_IMPERSONATE_OPTIONS)
+    proxies = _proxies_dict()
+
+    async with AsyncSession(
+        impersonate=impersonate,
+        timeout=_REQ_TIMEOUT,
+        proxies=proxies,
+        verify=False,
+    ) as session:
+        # Diagnostic: log the IP Avito will see for THIS request via the
+        # same session (so we know it's the same proxy path).
+        await _log_visible_ip(session, f"pre-scrape, impersonate={impersonate}")
+
+        try:
+            resp = await session.get(target_url)
+        except Exception as e:
+            msg = str(e).lower()
+            if "timeout" in msg or "timed out" in msg or "operation_timedout" in msg:
+                logger.warning("[parser] TIMEOUT for %s: %s", target_url[:80], str(e)[:120])
+            else:
+                logger.warning("[parser] HTTP error for %s: %s", target_url[:80], str(e)[:120])
             return None
-        if _looks_like_block(html[:5000]):
-            logger.warning("[parser] HTML block detected for %s — rotating IP (throttled)", target_url[:80])
+
+        # First-time diagnostic: ask httpbin what it received from us so we
+        # can verify curl-cffi sends ONLY the impersonate-generated headers
+        # and nothing custom is leaking through. (curl-cffi's resp.request
+        # .headers is empty — headers are set by libcurl on the C side.)
+        global _headers_logged
+        if not _headers_logged:
+            _headers_logged = True  # set first so a probe failure doesn't repeat
+            await _log_sent_headers(impersonate)
+
+        sc = resp.status_code
+
+        if sc == 200:
+            html = resp.text or ""
+            if not html:
+                logger.warning("[parser] empty body for %s", target_url[:80])
+                return None
+            if _looks_like_block(html[:5000]):
+                logger.warning(
+                    "[parser] HTML block detected for %s (impersonate=%s) — rotating IP (throttled)",
+                    target_url[:80], impersonate,
+                )
+                await throttled_rotate_ip()
+                return None
+            items = _extract_items_from_html(html)
+            if items is None:
+                logger.warning(
+                    "[parser] could not extract items from HTML for %s (size=%d)",
+                    target_url[:80], len(html),
+                )
+                return None
+            logger.info(
+                "[parser] OK %d items for %s (impersonate=%s)",
+                len(items), target_url[:80], impersonate,
+            )
+            return items
+
+        if sc == 403:
+            logger.warning(
+                "[parser] HTTP 403 for %s (impersonate=%s) — rotating IP (throttled)",
+                target_url[:80], impersonate,
+            )
             await throttled_rotate_ip()
             return None
-        items = _extract_items_from_html(html)
-        if items is None:
+
+        if sc == 429:
+            # Spec: do NOT rotate on 429. Just log and let scheduler retry next
+            # cycle. Rotating on 429 makes Avito ban the whole proxy pool.
             logger.warning(
-                "[parser] could not extract items from HTML for %s (size=%d)",
-                target_url[:80], len(html),
+                "[parser] HTTP 429 for %s (impersonate=%s) — NOT rotating",
+                target_url[:80], impersonate,
             )
             return None
-        logger.info("[parser] OK %d items for %s", len(items), target_url[:80])
-        return items
 
-    if sc == 403:
-        logger.warning("[parser] HTTP 403 for %s — rotating IP (throttled)", target_url[:80])
-        await throttled_rotate_ip()
+        if sc in (301, 302, 303, 307, 308):
+            logger.warning(
+                "[parser] HTTP %d redirect for %s (impersonate=%s) — block, rotating IP",
+                sc, target_url[:80], impersonate,
+            )
+            await throttled_rotate_ip()
+            return None
+
+        logger.warning("[parser] HTTP %d for %s (impersonate=%s)", sc, target_url[:80], impersonate)
         return None
-
-    if sc == 429:
-        # Spec: do NOT rotate on 429. Just log and let scheduler retry next
-        # cycle. Rotating on 429 makes Avito ban the whole proxy pool.
-        logger.warning("[parser] HTTP 429 for %s — NOT rotating (will retry next cycle)", target_url[:80])
-        return None
-
-    if sc in (301, 302, 303, 307, 308):
-        logger.warning("[parser] HTTP %d redirect for %s — treating as block, rotating IP", sc, target_url[:80])
-        await throttled_rotate_ip()
-        return None
-
-    logger.warning("[parser] HTTP %d for %s", sc, target_url[:80])
-    return None
 
 
 _BLOCK_PHRASES = (
