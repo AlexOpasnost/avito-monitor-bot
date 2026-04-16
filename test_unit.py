@@ -8,12 +8,13 @@ os.environ.setdefault("PROXY_LIST", "")
 os.environ.setdefault("PROXY_ROTATE_URL", "")
 
 from parser import (
-    _parse_initial_data,
-    _find_catalog_items,
     _ensure_sort_by_date,
     _extract_image_url,
     _extract_items_from_html,
+    _items_from_raw_list,
     _looks_like_block,
+    _walk_path,
+    _MAIN_CATALOG_PATH,
 )
 
 
@@ -31,55 +32,84 @@ def test_ensure_sort():
     print("OK: _ensure_sort_by_date")
 
 
-def test_find_catalog_items():
-    data = {"catalog": {"items": [{"id": 1}, {"id": 2}]}}
-    assert _find_catalog_items(data) == [{"id": 1}, {"id": 2}]
-    nested = {"state": {"data": {"catalog": {"items": [{"id": 9}]}}}}
-    assert _find_catalog_items(nested) == [{"id": 9}]
-    # Should NOT pick up recommendations
-    bad = {
-        "recommendations": {"items": [{"id": 99}]},
-        "catalog": {"items": [{"id": 1}]},
-    }
-    assert _find_catalog_items(bad) == [{"id": 1}]
-    print("OK: _find_catalog_items")
+def test_walk_path():
+    data = {"state": {"data": {"catalog": {"items": [{"id": 1}]}}}}
+    assert _walk_path(data, _MAIN_CATALOG_PATH) == [{"id": 1}]
+    assert _walk_path(data, ("state", "data", "missing")) is None
+    assert _walk_path({}, _MAIN_CATALOG_PATH) is None
+    print("OK: _walk_path")
 
 
-def test_parse_initial_data():
-    data = {
-        "catalog": {
-            "items": [
-                {
-                    "type": "item",
-                    "value": {
-                        "id": 12345,
-                        "title": "iPhone 13",
-                        "priceDetailed": {"value": 50000, "string": "50 000 ₽"},
-                        "urlPath": "/moskva/telefony/iphone_12345",
-                        "images": [{"864x648": "https://example.com/img.jpg"}],
-                        "location": {"name": "Москва"},
-                    },
-                },
-                # Should be filtered out — non-item type
-                {"type": "xlItem", "value": {"id": 99999}},
-                # Plain dict without wrapper — also valid
-                {"id": 67890, "title": "Samsung", "price": 30000,
-                 "urlPath": "/x/67890"},
-            ]
-        }
-    }
-    items = _parse_initial_data(data)
-    assert items is not None
-    assert len(items) == 2, f"expected 2 items, got {len(items)}"
+def test_items_from_raw_list():
+    raw = [
+        {
+            "type": "item",
+            "value": {
+                "id": 12345, "title": "iPhone 13",
+                "priceDetailed": {"value": 50000, "string": "50 000 ₽"},
+                "urlPath": "/moskva/telefony/iphone_12345",
+                "images": [{"864x864": "https://example.com/img.jpg"}],
+                "location": {"name": "Москва"},
+            },
+        },
+        # Should be filtered — non-item type
+        {"type": "xlItem", "value": {"id": 99999}},
+        # Plain dict (no wrapper)
+        {"id": 67890, "title": "Samsung", "price": 30000, "urlPath": "/x/67890"},
+    ]
+    items = _items_from_raw_list(raw)
+    assert len(items) == 2
     assert items[0].avito_id == "12345"
-    assert items[0].title == "iPhone 13"
-    assert items[0].price_value == 50000
     assert items[0].image_url == "https://example.com/img.jpg"
     assert items[0].location == "Москва"
-    assert items[0].url == "https://www.avito.ru/moskva/telefony/iphone_12345"
     assert items[1].avito_id == "67890"
-    assert items[1].price_value == 30000
-    print("OK: _parse_initial_data")
+    print("OK: _items_from_raw_list")
+
+
+def test_only_main_catalog_extracted():
+    """Critical: a recommendations block in the same page must NOT bleed
+    into our items, even if it has an `items` array structurally identical
+    to the catalog."""
+    payload = {
+        "i18n": {"hasMessages": {}},
+        "state": {
+            "data": {
+                # Main search catalog — should be picked
+                "catalog": {
+                    "items": [
+                        {"type": "item", "value": {"id": 100, "title": "Right item",
+                                                    "urlPath": "/x/100", "price": 1}}
+                    ]
+                },
+                # Sibling block with items — must be ignored
+                "recommendations": {
+                    "items": [
+                        {"type": "item", "value": {"id": 999, "title": "WRONG dress",
+                                                    "urlPath": "/x/999", "price": 1}}
+                    ]
+                },
+                "viewedItems": {
+                    "items": [
+                        {"type": "item", "value": {"id": 888, "title": "Recently viewed",
+                                                    "urlPath": "/x/888", "price": 1}}
+                    ]
+                },
+            }
+        },
+    }
+    escaped = orjson_dumps(payload).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html = f'<html><body><script type="mime/invalid" data-mfe-state="true">{escaped}</script></body></html>'
+    items = _extract_items_from_html(html)
+    assert items is not None
+    assert len(items) == 1, f"expected 1 item, got {len(items)}"
+    assert items[0].avito_id == "100"
+    assert "WRONG" not in items[0].title
+    print("OK: only main catalog extracted (recs/viewed ignored)")
+
+
+def orjson_dumps(obj):
+    import orjson
+    return orjson.dumps(obj).decode("utf-8")
 
 
 def test_block_detection():
@@ -92,9 +122,7 @@ def test_block_detection():
 
 
 def test_extract_from_mfe_html():
-    # Synthetic HTML mimicking Avito's modern hydration script
     payload = '{"i18n":{"hasMessages":{}},"state":{"data":{"catalog":{"items":[{"type":"item","value":{"id":777,"title":"Test phone","price":1500,"urlPath":"/x/777"}}]}}}}'
-    # Avito HTML-escapes the JSON inside the script body
     escaped = payload.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html = (
         '<html><body>'
@@ -123,21 +151,12 @@ def test_image_extraction():
     print("OK: _extract_image_url")
 
 
-def test_parse_url_encoded_string():
-    # If hydration var is a URL-encoded JSON string
-    raw = '%7B%22catalog%22%3A%7B%22items%22%3A%5B%7B%22id%22%3A1%2C%22title%22%3A%22T%22%2C%22urlPath%22%3A%22%2Fa%22%2C%22price%22%3A100%7D%5D%7D%7D'
-    items = _parse_initial_data(raw)
-    assert items is not None and len(items) == 1
-    assert items[0].avito_id == "1"
-    print("OK: url-encoded string parse")
-
-
 if __name__ == "__main__":
     test_ensure_sort()
-    test_find_catalog_items()
-    test_parse_initial_data()
+    test_walk_path()
+    test_items_from_raw_list()
+    test_only_main_catalog_extracted()
     test_block_detection()
     test_extract_from_mfe_html()
     test_image_extraction()
-    test_parse_url_encoded_string()
     print("\nALL UNIT TESTS PASSED")

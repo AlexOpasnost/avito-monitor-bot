@@ -186,30 +186,30 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
         if attempt >= _MAX_ATTEMPTS:
             break
 
-        # Decide post-failure strategy
+        # Per-error backoff before retry. _scrape_once always rotates
+        # IP at the start, so we don't rotate here — just wait the right
+        # amount based on the error type.
         if status == _FAIL_403:
             logger.warning(
-                "[parser] 403 on attempt %d — rotating IP, waiting %ds",
+                "[parser] 403 on attempt %d — waiting %ds before retry",
                 attempt, _WAIT_AFTER_403,
             )
-            await rotate_ip()
             await asyncio.sleep(_WAIT_AFTER_403)
         elif status == _FAIL_429:
             logger.warning(
-                "[parser] 429 on attempt %d — waiting %ds (NOT rotating)",
+                "[parser] 429 on attempt %d — waiting %ds before retry",
                 attempt, _WAIT_AFTER_429,
             )
             await asyncio.sleep(_WAIT_AFTER_429)
         elif status == _FAIL_HTML_BLOCK:
             logger.warning(
-                "[parser] HTML block on attempt %d — rotating IP, waiting %ds",
+                "[parser] HTML block on attempt %d — waiting %ds before retry",
                 attempt, _WAIT_AFTER_HTML_BLOCK,
             )
-            await rotate_ip()
             await asyncio.sleep(_WAIT_AFTER_HTML_BLOCK)
         elif status == _FAIL_TIMEOUT:
             logger.warning(
-                "[parser] timeout on attempt %d — waiting %ds (same IP)",
+                "[parser] timeout on attempt %d — waiting %ds before retry",
                 attempt, _WAIT_AFTER_TIMEOUT,
             )
             await asyncio.sleep(_WAIT_AFTER_TIMEOUT)
@@ -228,9 +228,19 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
 async def _scrape_once(target_url: str) -> tuple[str, list[AvitoItem] | None]:
     """One scrape attempt via the persistent curl-cffi session.
 
+    Always rotates the mobile-proxy IP BEFORE the request and waits 3s.
+    Avito rate-limits per source IP — by the time we detect a 429 the
+    current IP is already burned, so the only working strategy is to
+    use a fresh IP for every single request (mobile proxies exist for
+    exactly this).
+
     NO manual headers — curl-cffi's impersonate sets the full Chrome
     header set so that User-Agent and TLS fingerprint match. Any manual
     override would break that and trip Avito's bot detector."""
+    # Always rotate before request — spec: "don't economize on IPs"
+    await rotate_ip()
+    await asyncio.sleep(3)
+
     proxies = _proxies_dict()
 
     try:
@@ -294,23 +304,48 @@ def _looks_like_block(text: str) -> bool:
 # HTML extraction — pull items out of <script data-mfe-state> JSON blobs
 # ---------------------------------------------------------------------------
 
-# Regex over raw HTML — fast, no BeautifulSoup needed for this part.
 _MFE_SCRIPT_RE = re.compile(
     r'<script[^>]*data-mfe-state="true"[^>]*>([\s\S]+?)</script>',
     re.IGNORECASE,
 )
 
+# The ONE and ONLY path that holds the main search results. Avito's MFE
+# architecture puts the search catalog under state.data.catalog. Any other
+# `items` array on the page belongs to a different widget (recently viewed,
+# recommendations, similar items, banners, etc.) and MUST NOT be read.
+_MAIN_CATALOG_PATH = ("state", "data", "catalog", "items")
+# Older variants seen on some pages
+_FALLBACK_CATALOG_PATHS = (
+    ("data", "catalog", "items"),
+    ("initialData", "catalog", "items"),
+    ("pageProps", "catalog", "items"),
+)
+
+
+def _walk_path(data, path: tuple[str, ...]):
+    node = data
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node if isinstance(node, list) else None
+
 
 def _extract_items_from_html(html: str) -> list[AvitoItem] | None:
-    """Parse the catalog items out of the page HTML.
+    """Parse the MAIN search catalog out of the HTML.
 
-    Source priority:
-      1. <script data-mfe-state="true"> JSON blobs — Avito's modern hydration
-      2. window.__initialData__ (URL-encoded JSON, older pages)
-      3. window.__preloadedState__ / window.__mfe__
-    """
-    # 1) mfe-state scripts
-    for blob in _MFE_SCRIPT_RE.findall(html):
+    Strategy: iterate every <script data-mfe-state> blob, parse its JSON,
+    and accept ONLY items found at the exact main-catalog path. Anything
+    that doesn't have that exact path is ignored — even if it has its own
+    `items` array, it is not the search result.
+
+    Falls back to legacy hydration vars (__initialData__ / __preloadedState__
+    / __mfe__) using the same exact-path lookup."""
+    blobs = _MFE_SCRIPT_RE.findall(html)
+    logger.info("[parser] %d mfe-state scripts on page", len(blobs))
+
+    # 1) mfe-state scripts — main path first
+    for idx, blob in enumerate(blobs):
         blob = blob.strip()
         if not blob or "sandbox" in blob[:200]:
             continue
@@ -321,25 +356,68 @@ def _extract_items_from_html(html: str) -> list[AvitoItem] | None:
                 data = orjson.loads(blob)
             except Exception:
                 continue
-        items = _parse_initial_data(data)
-        if items:
-            logger.info("[parser] extraction source: mfe-state")
-            return items
+        if not isinstance(data, dict):
+            continue
 
-    # 2) __initialData__
+        items_raw = _walk_path(data, _MAIN_CATALOG_PATH)
+        if items_raw is not None:
+            logger.info(
+                "[parser] mfe script #%d: MAIN CATALOG found at %s (%d raw items)",
+                idx, ".".join(_MAIN_CATALOG_PATH), len(items_raw),
+            )
+            items = _items_from_raw_list(items_raw)
+            if items:
+                logger.info(
+                    "[parser] extraction source: mfe-state #%d / %s — %d listings",
+                    idx, ".".join(_MAIN_CATALOG_PATH), len(items),
+                )
+                return items
+
+        # Log what this script DOES have so we can spot if Avito changed paths
+        top_keys = list(data.keys())[:6]
+        logger.debug("[parser] mfe script #%d: no main catalog (top keys: %s)", idx, top_keys)
+
+    # 2) Same scripts again, but with fallback paths — covers older page variants
+    for idx, blob in enumerate(blobs):
+        blob = blob.strip()
+        if not blob or "sandbox" in blob[:200]:
+            continue
+        try:
+            data = orjson.loads(html_lib.unescape(blob))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for path in _FALLBACK_CATALOG_PATHS:
+            items_raw = _walk_path(data, path)
+            if items_raw is not None:
+                items = _items_from_raw_list(items_raw)
+                if items:
+                    logger.info(
+                        "[parser] extraction source: mfe-state #%d / %s (fallback) — %d listings",
+                        idx, ".".join(path), len(items),
+                    )
+                    return items
+
+    # 3) window.__initialData__ — legacy hydration var
     m = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
     if m:
         try:
-            decoded = unquote(m.group(1))
-            data = orjson.loads(decoded)
-            items = _parse_initial_data(data)
-            if items:
-                logger.info("[parser] extraction source: __initialData__")
-                return items
+            data = orjson.loads(unquote(m.group(1)))
+            for path in (_MAIN_CATALOG_PATH,) + _FALLBACK_CATALOG_PATHS:
+                items_raw = _walk_path(data, path)
+                if items_raw is not None:
+                    items = _items_from_raw_list(items_raw)
+                    if items:
+                        logger.info(
+                            "[parser] extraction source: __initialData__ / %s — %d listings",
+                            ".".join(path), len(items),
+                        )
+                        return items
         except Exception as e:
             logger.debug("[parser] __initialData__ decode err: %s", e)
 
-    # 3) __preloadedState__ / __mfe__
+    # 4) window.__preloadedState__ / __mfe__
     for var_name in ("__preloadedState__", "__mfe__"):
         marker = f"window.{var_name}"
         idx = html.find(marker)
@@ -354,17 +432,13 @@ def _extract_items_from_html(html: str) -> list[AvitoItem] | None:
         if start >= len(html):
             continue
         try:
+            data = None
             if html[start] == '"':
                 end = html.find('";', start + 1)
                 if end < 0:
                     end = html.find('"', start + 1)
                 if end > start:
-                    encoded = html[start + 1:end]
-                    data = orjson.loads(unquote(encoded))
-                    items = _parse_initial_data(data)
-                    if items:
-                        logger.info("[parser] extraction source: %s", var_name)
-                        return items
+                    data = orjson.loads(unquote(html[start + 1:end]))
             elif html[start] == "{":
                 depth = 0
                 i = start
@@ -375,42 +449,30 @@ def _extract_items_from_html(html: str) -> list[AvitoItem] | None:
                         depth -= 1
                         if depth == 0:
                             data = orjson.loads(html[start:i + 1])
-                            items = _parse_initial_data(data)
-                            if items:
-                                logger.info("[parser] extraction source: %s", var_name)
-                                return items
                             break
                     i += 1
+            if data is None:
+                continue
+            for path in (_MAIN_CATALOG_PATH,) + _FALLBACK_CATALOG_PATHS:
+                items_raw = _walk_path(data, path)
+                if items_raw is not None:
+                    items = _items_from_raw_list(items_raw)
+                    if items:
+                        logger.info(
+                            "[parser] extraction source: %s / %s — %d listings",
+                            var_name, ".".join(path), len(items),
+                        )
+                        return items
         except Exception as e:
             logger.debug("[parser] %s parse err: %s", var_name, e)
 
     return None
 
 
-# ---------------------------------------------------------------------------
-# Catalog item parsing
-# ---------------------------------------------------------------------------
-
-def _parse_initial_data(raw) -> list[AvitoItem] | None:
-    """`raw` may be a dict (already parsed) or a URL-encoded string."""
-    data = None
-    if isinstance(raw, dict):
-        data = raw
-    elif isinstance(raw, str):
-        try:
-            data = orjson.loads(unquote(raw))
-        except Exception:
-            try:
-                data = orjson.loads(raw)
-            except Exception:
-                return None
-    else:
-        return None
-
-    items_raw = _find_catalog_items(data)
-    if items_raw is None:
-        return None
-
+def _items_from_raw_list(items_raw) -> list[AvitoItem]:
+    """Convert the raw catalog.items list into AvitoItems. Skips wrappers
+    that are not 'item' type (banners/snippets if Avito ever inlines them
+    into the catalog)."""
     items: list[AvitoItem] = []
     for raw_item in items_raw:
         if not isinstance(raw_item, dict):
@@ -430,40 +492,9 @@ def _parse_initial_data(raw) -> list[AvitoItem] | None:
     return items
 
 
-def _find_catalog_items(data) -> list | None:
-    """Find catalog.items list in the hydration payload — never recurse into
-    recommendation/similar/vip blocks."""
-    if not isinstance(data, dict):
-        return None
-    candidates = [
-        ["catalog", "items"],
-        ["state", "data", "catalog", "items"],
-        ["data", "catalog", "items"],
-        ["initialData", "catalog", "items"],
-        ["pageProps", "catalog", "items"],
-        ["props", "catalog", "items"],
-    ]
-    for path in candidates:
-        node = data
-        ok = True
-        for key in path:
-            if isinstance(node, dict) and key in node:
-                node = node[key]
-            else:
-                ok = False
-                break
-        if ok and isinstance(node, list):
-            return node
-
-    for key, val in data.items():
-        if key.lower() in ("recommendations", "similar", "vip", "promoted",
-                           "advertising", "banners", "alternative", "alternatives"):
-            continue
-        if isinstance(val, dict):
-            sub = _find_catalog_items(val)
-            if sub is not None:
-                return sub
-    return None
+# ---------------------------------------------------------------------------
+# Catalog item parsing
+# ---------------------------------------------------------------------------
 
 
 def _parse_item(val: dict) -> AvitoItem:
