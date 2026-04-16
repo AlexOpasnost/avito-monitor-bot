@@ -31,13 +31,13 @@ logger = logging.getLogger(__name__)
 
 _IMPERSONATE = "chrome120"
 _REQ_TIMEOUT = 45  # seconds — generous for Avito's slow pages
-_MAX_ATTEMPTS = 2
 
-# Per-error-type retry waits
-_WAIT_AFTER_403 = 10
-_WAIT_AFTER_429 = 30
-_WAIT_AFTER_TIMEOUT = 15
-_WAIT_AFTER_HTML_BLOCK = 10
+# IP rotation is throttled globally — at most once every 5 minutes,
+# regardless of how many subscriptions hit a block. Rotating on every
+# error makes the proxy pool look bot-like (many IPs, same behavior).
+_MIN_ROTATION_INTERVAL = 300  # seconds
+_last_rotation_ts: float = 0.0
+_rotation_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +108,29 @@ async def rotate_ip() -> bool:
         return False
 
 
+async def throttled_rotate_ip() -> bool:
+    """Rotate IP at most once every _MIN_ROTATION_INTERVAL seconds (5 min).
+    If another scrape just rotated, skip — multiple subs hitting a block in
+    a short window must NOT cause multiple rotations."""
+    global _last_rotation_ts
+    import time
+    async with _rotation_lock:
+        now = time.monotonic()
+        elapsed = now - _last_rotation_ts
+        if elapsed < _MIN_ROTATION_INTERVAL:
+            logger.info(
+                "[parser] skipping IP rotation — last one was %.0fs ago "
+                "(min interval %ds)",
+                elapsed, _MIN_ROTATION_INTERVAL,
+            )
+            return False
+        ok = await rotate_ip()
+        if ok:
+            _last_rotation_ts = now
+            logger.info("[parser] IP rotated (next allowed in %ds)", _MIN_ROTATION_INTERVAL)
+        return ok
+
+
 async def check_proxy_ip() -> str | None:
     if not config.proxy_list:
         return None
@@ -141,106 +164,28 @@ def _ensure_sort_by_date(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public API — scrape with smart per-error-type retry
+# Public API — ONE request per call. NO retries.
 # ---------------------------------------------------------------------------
-
-# Status enum for _scrape_once
-_OK = "ok"
-_FAIL_403 = "fail_403"
-_FAIL_429 = "fail_429"
-_FAIL_HTML_BLOCK = "fail_html_block"
-_FAIL_TIMEOUT = "fail_timeout"
-_FAIL_OTHER = "fail_other"
-
+#
+# Strategy (per spec):
+#   - One monitoring cycle = one request. Period.
+#   - Any error -> log, return None. Caller (scheduler) waits 90-180s for
+#     the next cycle and after 3 failed cycles in a row pauses 10 minutes.
+#   - IP rotation only on 403 / HTML block, throttled to once per 5 minutes
+#     globally. On 429 we DO NOT rotate (rotating on 429 makes it worse —
+#     Avito sees many fresh IPs all behaving the same way and rate-limits
+#     the whole pool).
+#   - No pre-request rotation. Same IP across requests until something
+#     actually breaks.
 
 async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
-    """Scrape the URL with smart retry. At most 2 attempts per call.
-
-    Retry strategy by error type:
-      403            -> rotate IP, wait 10s, retry
-      429            -> wait 30s WITHOUT rotating (rotating makes it worse)
-      HTML block     -> rotate IP, wait 10s, retry
-      timeout        -> wait 15s, same IP, retry  (not a block, just network)
-      anything else  -> no retry (genuine failure)
-
-    Caller (scheduler) tracks consecutive failures and applies its own
-    longer back-off after 3 cycles in a row."""
+    """Single request, no retry. Returns parsed items on success, None on
+    any failure. The scheduler is responsible for back-off."""
     if _session is None:
         logger.error("[parser] session not initialised — call init_session() first")
         return None
 
     target_url = _ensure_sort_by_date(url)
-
-    last_status: str = _FAIL_OTHER
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        status, items = await _scrape_once(target_url)
-        last_status = status
-
-        if status == _OK:
-            logger.info(
-                "[parser] OK %d items for %s (attempt %d)",
-                len(items or []), target_url[:80], attempt,
-            )
-            return items
-
-        if attempt >= _MAX_ATTEMPTS:
-            break
-
-        # Per-error backoff before retry. _scrape_once always rotates
-        # IP at the start, so we don't rotate here — just wait the right
-        # amount based on the error type.
-        if status == _FAIL_403:
-            logger.warning(
-                "[parser] 403 on attempt %d — waiting %ds before retry",
-                attempt, _WAIT_AFTER_403,
-            )
-            await asyncio.sleep(_WAIT_AFTER_403)
-        elif status == _FAIL_429:
-            logger.warning(
-                "[parser] 429 on attempt %d — waiting %ds before retry",
-                attempt, _WAIT_AFTER_429,
-            )
-            await asyncio.sleep(_WAIT_AFTER_429)
-        elif status == _FAIL_HTML_BLOCK:
-            logger.warning(
-                "[parser] HTML block on attempt %d — waiting %ds before retry",
-                attempt, _WAIT_AFTER_HTML_BLOCK,
-            )
-            await asyncio.sleep(_WAIT_AFTER_HTML_BLOCK)
-        elif status == _FAIL_TIMEOUT:
-            logger.warning(
-                "[parser] timeout on attempt %d — waiting %ds before retry",
-                attempt, _WAIT_AFTER_TIMEOUT,
-            )
-            await asyncio.sleep(_WAIT_AFTER_TIMEOUT)
-        else:
-            # Hard non-retryable failure (HTTP 500/etc / network unreachable)
-            logger.warning("[parser] hard fail on attempt %d (status=%s)", attempt, status)
-            return None
-
-    logger.error(
-        "[parser] both attempts failed for %s (last=%s)",
-        target_url[:80], last_status,
-    )
-    return None
-
-
-async def _scrape_once(target_url: str) -> tuple[str, list[AvitoItem] | None]:
-    """One scrape attempt via the persistent curl-cffi session.
-
-    Always rotates the mobile-proxy IP BEFORE the request and waits 3s.
-    Avito rate-limits per source IP — by the time we detect a 429 the
-    current IP is already burned, so the only working strategy is to
-    use a fresh IP for every single request (mobile proxies exist for
-    exactly this).
-
-    NO manual headers — curl-cffi's impersonate sets the full Chrome
-    header set so that User-Agent and TLS fingerprint match. Any manual
-    override would break that and trip Avito's bot detector."""
-    # Always rotate before request — spec: "don't economize on IPs"
-    await rotate_ip()
-    await asyncio.sleep(3)
-
     proxies = _proxies_dict()
 
     try:
@@ -249,39 +194,50 @@ async def _scrape_once(target_url: str) -> tuple[str, list[AvitoItem] | None]:
     except Exception as e:
         msg = str(e).lower()
         if "timeout" in msg or "timed out" in msg or "operation_timedout" in msg:
-            logger.warning("[parser] TIMEOUT: %s", str(e)[:120])
-            return _FAIL_TIMEOUT, None
-        logger.warning("[parser] HTTP error: %s", str(e)[:120])
-        return _FAIL_OTHER, None
+            logger.warning("[parser] TIMEOUT for %s: %s", target_url[:80], str(e)[:120])
+        else:
+            logger.warning("[parser] HTTP error for %s: %s", target_url[:80], str(e)[:120])
+        return None
 
     sc = resp.status_code
+
+    if sc == 200:
+        html = resp.text or ""
+        if not html:
+            logger.warning("[parser] empty body for %s", target_url[:80])
+            return None
+        if _looks_like_block(html[:5000]):
+            logger.warning("[parser] HTML block detected for %s — rotating IP (throttled)", target_url[:80])
+            await throttled_rotate_ip()
+            return None
+        items = _extract_items_from_html(html)
+        if items is None:
+            logger.warning(
+                "[parser] could not extract items from HTML for %s (size=%d)",
+                target_url[:80], len(html),
+            )
+            return None
+        logger.info("[parser] OK %d items for %s", len(items), target_url[:80])
+        return items
+
     if sc == 403:
-        logger.warning("[parser] HTTP 403")
-        return _FAIL_403, None
+        logger.warning("[parser] HTTP 403 for %s — rotating IP (throttled)", target_url[:80])
+        await throttled_rotate_ip()
+        return None
+
     if sc == 429:
-        logger.warning("[parser] HTTP 429")
-        return _FAIL_429, None
+        # Spec: do NOT rotate on 429. Just log and let scheduler retry next
+        # cycle. Rotating on 429 makes Avito ban the whole proxy pool.
+        logger.warning("[parser] HTTP 429 for %s — NOT rotating (will retry next cycle)", target_url[:80])
+        return None
+
     if sc in (301, 302, 303, 307, 308):
-        logger.warning("[parser] HTTP %d redirect (treating as block)", sc)
-        return _FAIL_HTML_BLOCK, None
-    if sc != 200:
-        logger.warning("[parser] HTTP %d", sc)
-        return _FAIL_OTHER, None
+        logger.warning("[parser] HTTP %d redirect for %s — treating as block, rotating IP", sc, target_url[:80])
+        await throttled_rotate_ip()
+        return None
 
-    html = resp.text or ""
-    if not html:
-        logger.warning("[parser] empty body")
-        return _FAIL_OTHER, None
-
-    if _looks_like_block(html[:5000]):
-        logger.warning("[parser] HTML block detected (body sniff)")
-        return _FAIL_HTML_BLOCK, None
-
-    items = _extract_items_from_html(html)
-    if items is None:
-        logger.warning("[parser] could not extract items from HTML (size=%d)", len(html))
-        return _FAIL_OTHER, None
-    return _OK, items
+    logger.warning("[parser] HTTP %d for %s", sc, target_url[:80])
+    return None
 
 
 _BLOCK_PHRASES = (
