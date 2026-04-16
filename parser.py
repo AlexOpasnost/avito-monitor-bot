@@ -12,6 +12,7 @@ Architecture rules:
 import asyncio
 import html as html_lib
 import logging
+import random
 import re
 from dataclasses import dataclass
 from urllib.parse import unquote
@@ -38,6 +39,14 @@ _REQ_TIMEOUT = 45  # seconds — generous for Avito's slow pages
 _MIN_ROTATION_INTERVAL = 300  # seconds
 _last_rotation_ts: float = 0.0
 _rotation_lock = asyncio.Lock()
+
+# GLOBAL lock for ALL Avito requests across the whole bot (scheduler AND
+# handlers' initial scan). Held for IP-check + scrape + post-cooldown so
+# two requests can never overlap and there's always a randomized 10-20s
+# gap between consecutive scrapes from this process.
+_avito_request_lock = asyncio.Lock()
+_POST_REQUEST_MIN = 10
+_POST_REQUEST_MAX = 20
 
 
 # ---------------------------------------------------------------------------
@@ -218,13 +227,32 @@ def _ensure_sort_by_date(url: str) -> str:
 
 async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
     """Single request, no retry. Returns parsed items on success, None on
-    any failure. The scheduler is responsible for back-off."""
+    any failure. The scheduler is responsible for back-off.
+
+    Acquires the GLOBAL avito-request lock for the whole call: IP check +
+    scrape + 10-20s post-cooldown all happen under the lock. This makes
+    it impossible for two scrapes to run in parallel — even when the
+    handler's initial scan races with a scheduler cycle."""
     if _session is None:
         logger.error("[parser] session not initialised — call init_session() first")
         return None
 
     target_url = _ensure_sort_by_date(url)
 
+    async with _avito_request_lock:
+        try:
+            return await _do_scrape(target_url)
+        finally:
+            # Mandatory cooldown BEFORE releasing the lock so the next
+            # caller starts at least 10-20s after the previous request
+            # finished — never instant succession.
+            cooldown = random.randint(_POST_REQUEST_MIN, _POST_REQUEST_MAX)
+            logger.debug("[parser] post-request cooldown %ds (lock held)", cooldown)
+            await asyncio.sleep(cooldown)
+
+
+async def _do_scrape(target_url: str) -> list[AvitoItem] | None:
+    """The actual scrape. Caller MUST hold _avito_request_lock."""
     # Diagnostic: log the IP Avito will see for the next request. If this
     # matches the Railway container IP instead of the mobile-proxy IP,
     # the proxy isn't actually being used.
