@@ -155,10 +155,27 @@ def _proxy_dict_for_pw() -> dict | None:
 # URL helpers
 # ---------------------------------------------------------------------------
 
-_USER_AGENT = (
+# Realistic desktop user agents — random pick per new page so two scrapes
+# from the same proxy IP don't share the same fingerprint.
+_USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
 )
+
+
+def _pick_user_agent() -> str:
+    return random.choice(_USER_AGENTS)
 
 
 def _ensure_sort_by_date(url: str) -> str:
@@ -173,30 +190,89 @@ def _ensure_sort_by_date(url: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
-    """Open a fresh page in the singleton browser, scrape the results,
-    close the page. Returns None on failure (caller logs and retries next cycle).
+# Scrape result statuses
+_OK = "ok"
+_BLOCKED = "blocked"
+_FAIL = "fail"
 
-    Extra positional args are ignored — kept for backward compat with the
-    old (url, proxy) signature."""
+
+async def fetch_search_items(
+    url: str, *_unused, max_retries: int = 3
+) -> list[AvitoItem] | None:
+    """Scrape the URL with retry-on-IP-block.
+
+    Each attempt:
+      - rotate the mobile-proxy IP
+      - sleep 5s after rotation so the new IP is live
+      - open a fresh context+page (random UA, stealth)
+      - goto + scroll + extract
+      - close context+page
+
+    On IP block: rotate, sleep, retry up to max_retries times. Returns
+    None only after all attempts fail. Extra positional args ignored
+    (back-compat with old (url, proxy) signature)."""
     if _browser is None:
         logger.error("[parser] browser not initialised — call init_browser() first")
         return None
 
     target_url = _ensure_sort_by_date(url)
 
-    # Get a fresh mobile IP for this scrape
-    await rotate_ip()
-    await asyncio.sleep(0.5)
+    for attempt in range(1, max_retries + 1):
+        # Always rotate before each attempt — old IP may already be flagged
+        rotated = await rotate_ip()
+        if rotated:
+            logger.info(
+                "[parser] attempt %d/%d: IP rotated, waiting 5s",
+                attempt, max_retries,
+            )
+            await asyncio.sleep(5)
+        else:
+            # No proxy configured or rotation failed — small jitter only
+            await asyncio.sleep(random.uniform(0.5, 1.5))
 
+        status, items = await _scrape_once(target_url)
+
+        if status == _OK:
+            logger.info(
+                "[parser] %d items for %s (attempt %d)",
+                len(items or []), target_url[:80], attempt,
+            )
+            return items
+
+        if status == _BLOCKED:
+            logger.warning(
+                "[parser] BLOCKED on attempt %d/%d for %s — will rotate IP and retry",
+                attempt, max_retries, target_url[:80],
+            )
+            continue
+
+        # Hard failure (timeout, network, no items found in a non-blocked page)
+        logger.warning(
+            "[parser] hard fail on attempt %d/%d for %s",
+            attempt, max_retries, target_url[:80],
+        )
+        # Still try once more with a fresh IP — sometimes the page just glitched
+        continue
+
+    logger.error("[parser] all %d attempts failed for %s", max_retries, target_url[:80])
+    return None
+
+
+async def _scrape_once(target_url: str) -> tuple[str, list[AvitoItem] | None]:
+    """One scrape attempt. Returns (status, items_or_none).
+
+    status: _OK   -> items is a list (possibly empty)
+            _BLOCKED -> Avito served the IP-block page; caller should rotate
+            _FAIL -> network/timeout/structural error"""
     proxy_cfg = _proxy_dict_for_pw()
+    user_agent = _pick_user_agent()
 
     context: BrowserContext | None = None
     page = None
     try:
         async with _browser_lock:
             context = await _browser.new_context(
-                user_agent=_USER_AGENT,
+                user_agent=user_agent,
                 locale="ru-RU",
                 timezone_id="Europe/Moscow",
                 viewport={"width": 1366, "height": 900},
@@ -217,9 +293,9 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
         except Exception as e:
             logger.warning("[parser] goto failed for %s: %s", target_url[:80], e)
-            return None
+            return _FAIL, None
 
-        # Wait for network to settle so __initialData__ is populated
+        # Wait for network to settle so hydration variables are populated
         try:
             await page.wait_for_load_state("networkidle", timeout=20_000)
         except Exception:
@@ -237,16 +313,31 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
             title = await page.title()
         except Exception:
             title = ""
-        if title and ("доступ ограничен" in title.lower() or "проблема с ip" in title.lower()):
-            logger.warning("[parser] IP BLOCKED (title=%r) for %s", title, target_url[:80])
-            return None
+        if _looks_like_block(title):
+            logger.warning(
+                "[parser] IP BLOCKED (title=%r) UA=%s",
+                title[:60], user_agent[:40],
+            )
+            return _BLOCKED, None
+
+        # Sometimes the title is fine but the body is a captcha — sniff body too
+        try:
+            body_snippet = await page.evaluate(
+                "() => (document.body && document.body.innerText || '').slice(0, 400)"
+            )
+        except Exception:
+            body_snippet = ""
+        if body_snippet and _looks_like_block(body_snippet):
+            logger.warning("[parser] IP BLOCKED (body) UA=%s", user_agent[:40])
+            return _BLOCKED, None
 
         items = await _extract_items_via_browser(page)
         if items is None:
-            logger.warning("[parser] could not extract items for %s (title=%r)", target_url[:80], title[:60])
-            return None
-        logger.info("[parser] %d items for %s", len(items), target_url[:80])
-        return items
+            logger.warning(
+                "[parser] could not extract items (title=%r)", title[:60]
+            )
+            return _FAIL, None
+        return _OK, items
 
     finally:
         if page:
@@ -259,6 +350,23 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
                 await context.close()
             except Exception:
                 pass
+
+
+_BLOCK_PHRASES = (
+    "доступ ограничен",
+    "проблема с ip",
+    "подозрительная активность",
+    "captcha",
+    "robot check",
+    "слишком много запросов",
+)
+
+
+def _looks_like_block(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(p in t for p in _BLOCK_PHRASES)
 
 
 # ---------------------------------------------------------------------------
