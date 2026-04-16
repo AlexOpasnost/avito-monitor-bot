@@ -232,27 +232,18 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
         except Exception:
             pass
 
-        # Pull the hydration blob
-        raw = None
+        # IP-block detection — Avito serves a static page when the IP is banned
         try:
-            raw = await page.evaluate("() => window.__initialData__")
-        except Exception as e:
-            logger.debug("[parser] evaluate __initialData__ failed: %s", e)
-
-        if raw is None:
-            # Try the alternate hydration variable used by the new SPA
-            try:
-                raw = await page.evaluate("() => window.__mfe__ || window.__preloadedState__ || null")
-            except Exception:
-                pass
-
-        if not raw:
-            logger.warning("[parser] no __initialData__ for %s", target_url[:80])
+            title = await page.title()
+        except Exception:
+            title = ""
+        if title and ("доступ ограничен" in title.lower() or "проблема с ip" in title.lower()):
+            logger.warning("[parser] IP BLOCKED (title=%r) for %s", title, target_url[:80])
             return None
 
-        items = _parse_initial_data(raw)
+        items = await _extract_items_via_browser(page)
         if items is None:
-            logger.warning("[parser] could not extract items from __initialData__ for %s", target_url[:80])
+            logger.warning("[parser] could not extract items for %s (title=%r)", target_url[:80], title[:60])
             return None
         logger.info("[parser] %d items for %s", len(items), target_url[:80])
         return items
@@ -268,6 +259,133 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
                 await context.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Browser-side extraction
+# ---------------------------------------------------------------------------
+
+# JS that pulls every plausible hydration source AND falls back to DOM scrape
+# inside the catalog-serp container only.
+_EXTRACT_JS = r"""
+() => {
+    // 1) global hydration vars
+    const globals = ['__initialData__', '__INITIAL_DATA__', '__preloadedState__',
+                     '__PRELOADED_STATE__', '__mfe__', '__NEXT_DATA__'];
+    for (const g of globals) {
+        if (window[g] !== undefined && window[g] !== null) {
+            return { source: 'global:' + g, data: window[g] };
+        }
+    }
+
+    // 2) <script type="mime/invalid" data-mfe-state="true"> — Avito's modern shape
+    const mfe = document.querySelectorAll('script[data-mfe-state="true"]');
+    const mfeBlobs = [];
+    for (const s of mfe) {
+        const t = (s.textContent || '').trim();
+        if (t && !t.includes('sandbox')) mfeBlobs.push(t);
+    }
+    if (mfeBlobs.length) return { source: 'mfe-state', data: mfeBlobs };
+
+    // 3) DOM fallback — scrape inside catalog-serp only
+    const root = document.querySelector('[data-marker="catalog-serp"]')
+              || document.querySelector('[data-marker="catalog-list"]')
+              || document.querySelector('.items-items')
+              || null;
+    if (!root) return { source: 'none', data: null };
+
+    const items = [];
+    const seen = new Set();
+    for (const node of root.querySelectorAll('[data-item-id]')) {
+        const id = node.getAttribute('data-item-id');
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const link = node.querySelector('a[href*="' + id + '"]');
+        const titleEl = node.querySelector('[itemprop="name"], h3, [data-marker="item-title"]');
+        const priceEl = node.querySelector('[itemprop="price"], [data-marker="item-price"]');
+        const imgEl = node.querySelector('img');
+        const locEl = node.querySelector('[data-marker="item-address"], [class*="geo"]');
+        items.push({
+            id: id,
+            title: titleEl ? titleEl.textContent.trim() : '',
+            urlPath: link ? link.getAttribute('href').split('?')[0] : ('/' + id),
+            priceStr: priceEl ? priceEl.textContent.trim() : '',
+            priceValue: priceEl ? parseInt((priceEl.getAttribute('content') || priceEl.textContent).replace(/\D+/g, ''), 10) || null : null,
+            imageUrl: imgEl ? (imgEl.getAttribute('src') || imgEl.getAttribute('data-src')) : null,
+            location: locEl ? locEl.textContent.trim() : null,
+        });
+    }
+    return { source: 'dom', data: items };
+}
+"""
+
+
+async def _extract_items_via_browser(page) -> list[AvitoItem] | None:
+    """Try multiple extraction sources via the live page. Returns a list of
+    AvitoItems (possibly empty) or None on hard failure."""
+    try:
+        result = await page.evaluate(_EXTRACT_JS)
+    except Exception as e:
+        logger.debug("[parser] evaluate _EXTRACT_JS failed: %s", e)
+        return None
+
+    if not result or result.get("data") is None:
+        return None
+
+    source = result.get("source", "?")
+    data = result["data"]
+    logger.info("[parser] extraction source: %s", source)
+
+    if source == "dom":
+        # Already plain dicts shaped by our JS
+        items: list[AvitoItem] = []
+        for it in data:
+            try:
+                items.append(_item_from_dom_dict(it))
+            except Exception as e:
+                logger.debug("[parser] dom item err: %s", e)
+        return items
+
+    if source == "mfe-state":
+        # List of JSON strings — try each
+        for blob in data:
+            try:
+                parsed = orjson.loads(blob)
+            except Exception:
+                # Some scripts contain HTML-escaped JSON
+                try:
+                    import html as _html
+                    parsed = orjson.loads(_html.unescape(blob))
+                except Exception:
+                    continue
+            items = _parse_initial_data(parsed)
+            if items:
+                return items
+        return []
+
+    # Global hydration var — could be dict or string
+    return _parse_initial_data(data)
+
+
+def _item_from_dom_dict(d: dict) -> AvitoItem:
+    item_id = str(d.get("id") or "")
+    url_path = d.get("urlPath") or f"/{item_id}"
+    if not url_path.startswith("http"):
+        item_url = f"https://www.avito.ru{url_path}"
+    else:
+        item_url = url_path
+    return AvitoItem(
+        avito_id=item_id,
+        title=d.get("title") or f"Объявление {item_id}",
+        price=d.get("priceStr") or "Цена не указана",
+        price_value=d.get("priceValue"),
+        url=item_url,
+        image_url=d.get("imageUrl"),
+        location=d.get("location"),
+        description=None,
+        seller_name=None,
+        published_timestamp=None,
+    )
 
 
 # ---------------------------------------------------------------------------
