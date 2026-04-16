@@ -1,8 +1,6 @@
 """Telegram bot handlers — aiogram 3."""
-import base64
 import logging
 import re
-from urllib.parse import urlparse, parse_qs
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
@@ -23,49 +21,26 @@ router = Router()
 _AVITO_URL_RE = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+", re.IGNORECASE)
 
 
-def _validate_avito_url(text: str) -> tuple[str | None, str | None]:
-    """Extract & clean an Avito URL. Returns (clean_url, error_message).
+def _extract_avito_url(text: str) -> str | None:
+    """Pull an Avito URL out of the raw message text.
 
-    IMPORTANT: We keep ALL query parameters as-is. Avito uses a number of
-    auxiliary params (localPriority, context, radius, metro, district, etc.)
-    that can affect which items are returned. Stripping them produces a
-    different feed than what the user sees in their browser, which is the
-    whole bug we are trying to avoid."""
+    IMPORTANT: this works directly on `message.text` (which Telegram delivers
+    in full even when the UI visually truncates the link). We do NOT touch
+    `message.entities` — entity offsets/lengths get clipped by Telegram's
+    UI for long URLs and would give us a truncated string.
+
+    No truncation/length validation here — the parser handles whatever URL
+    we save. If the URL really is broken, the scrape will just return
+    nothing and the scheduler's retry covers it."""
+    if not text:
+        return None
     text = text.strip()
-    match = _AVITO_URL_RE.search(text)
-    if not match:
-        return None, "Это не ссылка на Авито. Отправь ссылку вида https://www.avito.ru/..."
-
-    url = match.group(0).rstrip(".,);]")
-
     # Telegram sometimes swaps URL-safe base64 `-` with `~`
-    url = url.replace("~", "-")
-
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query, keep_blank_values=True)
-
-    # Validate that the f= filter is not truncated (Telegram mangling)
-    if "f" in qs and qs["f"]:
-        f_val = qs["f"][0]
-        try:
-            padded = f_val + "=" * (-len(f_val) % 4)
-            raw = base64.urlsafe_b64decode(padded)
-            # f= contains a JSON blob — must terminate with "}"
-            if not raw.rstrip(b"\x00").endswith(b"}"):
-                return None, (
-                    "⚠️ Похоже, URL обрезан Telegram.\n\n"
-                    "Отправь ссылку ещё раз, обернув её в обратные кавычки:\n"
-                    "<code>`https://www.avito.ru/...`</code>"
-                )
-        except Exception:
-            return None, "⚠️ Неверный формат URL — параметр <code>f=</code> повреждён."
-
-    # Reconstruct preserving the ORIGINAL parameter order — do not re-encode
-    # the f= base64 which is already URL-safe.
-    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    if parsed.query:
-        clean_url += f"?{parsed.query}"
-    return clean_url, None
+    text = text.replace("~", "-")
+    m = _AVITO_URL_RE.search(text)
+    if not m:
+        return None
+    return m.group(0).rstrip(".,);]")
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +69,7 @@ async def cmd_start(message: Message):
             "<b>Как добавить отслеживание:</b>\n"
             "1. Настрой поиск на Авито (город, категория, цена, фильтры)\n"
             "2. Скопируй ссылку из адресной строки\n"
-            "3. Отправь её сюда\n\n"
-            "<b>⚠️ Важно — длинные ссылки</b>\n"
-            "Telegram иногда коверкает длинные ссылки с фильтрами. "
-            "Чтобы этого избежать — оберни ссылку в обратные кавычки:\n"
-            "<code>`https://www.avito.ru/...`</code>\n\n"
+            "3. Отправь её сюда — длинные ссылки тоже принимаются\n\n"
             f"Лимит: {config.max_subscriptions} отслеживаний одновременно\n\n"
             "/list — мои отслеживания\n"
             "/profile — статистика\n"
@@ -242,10 +213,9 @@ async def cmd_stop(message: Message):
 
 @router.message(F.text)
 async def handle_url(message: Message):
-    url, error = _validate_avito_url(message.text or "")
-    if error:
-        await message.answer(error, parse_mode="HTML")
-        return
+    # Read raw text — NOT entities (Telegram clips entity offsets for very
+    # long URLs even though message.text itself is delivered intact).
+    url = _extract_avito_url(message.text or "")
     if not url:
         await message.answer(
             "Отправь ссылку на поиск Авито.\n\n"
