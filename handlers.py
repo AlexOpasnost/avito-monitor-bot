@@ -15,6 +15,7 @@ from aiogram.types import (
 
 from config import config
 from database import db
+from parser import fetch_search_items
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -265,10 +266,32 @@ async def handle_url(message: Message):
         )
         return
 
+    # Initial scan: open the URL once, mark every current listing as seen so
+    # the user does not get flooded with all 50 results on the first cycle.
     await message.answer(
-        f"✅ <b>Отслеживание #{sub_id} добавлено!</b>\n\n"
-        f"🔗 <a href=\"{url}\">Ваша ссылка на Авито</a>\n\n"
-        f"Проверяю каждую минуту. Как появится новое объявление — пришлю с фото, ценой и описанием.\n\n"
+        f"⏳ <b>Отслеживание #{sub_id} добавлено</b>\n"
+        f"Открываю Авито и записываю текущие объявления...",
+        parse_mode="HTML",
+    )
+    try:
+        initial_items = await fetch_search_items(url)
+    except Exception as e:
+        logger.exception("initial scan failed for sub #%d", sub_id)
+        initial_items = None
+
+    if initial_items:
+        ids = [i.avito_id for i in initial_items if i.avito_id]
+        await db.mark_items_sent_batch(sub_id, ids)
+        await db.update_last_checked(sub_id)
+        seeded = len(ids)
+    else:
+        seeded = 0
+
+    await message.answer(
+        f"✅ <b>Мониторинг запущен</b>\n\n"
+        f"🔗 <a href=\"{url}\">Твоя ссылка на Авито</a>\n\n"
+        f"Записал {seeded} текущих объявлений как уже виденные. "
+        f"Как появится новое — пришлю с фото, ценой и описанием.\n\n"
         f"/list — все отслеживания  ·  /delete — удалить",
         parse_mode="HTML",
         disable_web_page_preview=True,

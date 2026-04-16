@@ -12,7 +12,7 @@ from aiogram.types import BotCommand
 from config import config
 from database import db
 from handlers import router
-from parser import check_proxy_ip, rotate_ip
+from parser import check_proxy_ip, close_browser, init_browser, rotate_ip
 from scheduler import run_scheduler
 
 logging.basicConfig(
@@ -44,6 +44,9 @@ async def main():
         logger.info("Proxy IP: %s", ip or "UNKNOWN")
     else:
         logger.warning("No proxy configured — Avito may block requests")
+
+    # Launch ONE chromium for the entire bot lifetime
+    await init_browser()
 
     if config.telegram_api_url and config.telegram_api_url != "https://api.telegram.org":
         session = AiohttpSession(api=TelegramAPIServer.from_base(config.telegram_api_url))
@@ -94,6 +97,7 @@ async def main():
             await bot.session.close()
         except Exception:
             pass
+        await close_browser()
         await db.close()
         logger.info("Bot stopped")
 
