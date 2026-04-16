@@ -10,7 +10,7 @@ os.environ.setdefault("PROXY_ROTATE_URL", "")
 from parser import (
     _ensure_sort_by_date,
     _extract_image_url,
-    _extract_items_from_html,
+    _items_from_payload,
     _items_from_raw_list,
     _looks_like_block,
     _walk_path,
@@ -67,7 +67,7 @@ def test_items_from_raw_list():
 
 
 def test_only_main_catalog_extracted():
-    """Critical: a recommendations block in the same page must NOT bleed
+    """Critical: a recommendations block in the same payload must NOT bleed
     into our items, even if it has an `items` array structurally identical
     to the catalog."""
     payload = {
@@ -97,19 +97,12 @@ def test_only_main_catalog_extracted():
             }
         },
     }
-    escaped = orjson_dumps(payload).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html = f'<html><body><script type="mime/invalid" data-mfe-state="true">{escaped}</script></body></html>'
-    items = _extract_items_from_html(html)
+    items = _items_from_payload(payload)
     assert items is not None
     assert len(items) == 1, f"expected 1 item, got {len(items)}"
     assert items[0].avito_id == "100"
     assert "WRONG" not in items[0].title
     print("OK: only main catalog extracted (recs/viewed ignored)")
-
-
-def orjson_dumps(obj):
-    import orjson
-    return orjson.dumps(obj).decode("utf-8")
 
 
 def test_block_detection():
@@ -121,19 +114,30 @@ def test_block_detection():
     print("OK: _looks_like_block")
 
 
-def test_extract_from_mfe_html():
-    payload = '{"i18n":{"hasMessages":{}},"state":{"data":{"catalog":{"items":[{"type":"item","value":{"id":777,"title":"Test phone","price":1500,"urlPath":"/x/777"}}]}}}}'
-    escaped = payload.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html = (
-        '<html><body>'
-        '<script type="mime/invalid" data-mfe-state="true">' + escaped + '</script>'
-        '</body></html>'
-    )
-    items = _extract_items_from_html(html)
-    assert items is not None and len(items) == 1, f"expected 1 item, got {items}"
+def test_items_from_payload_dict():
+    payload = {"state": {"data": {"catalog": {"items": [
+        {"type": "item", "value": {"id": 777, "title": "Test phone",
+                                    "price": 1500, "urlPath": "/x/777"}}
+    ]}}}}
+    items = _items_from_payload(payload)
+    assert items is not None and len(items) == 1
     assert items[0].avito_id == "777"
     assert items[0].title == "Test phone"
-    print("OK: _extract_items_from_html (mfe-state)")
+    print("OK: _items_from_payload (dict)")
+
+
+def test_items_from_payload_string():
+    """Older Avito pages hand us a URL-encoded JSON string via
+    window.__initialData__ — must decode and walk the strict path."""
+    import urllib.parse, orjson
+    payload = {"state": {"data": {"catalog": {"items": [
+        {"id": 1, "title": "T", "urlPath": "/a", "price": 100}
+    ]}}}}
+    payload_str = urllib.parse.quote(orjson.dumps(payload).decode())
+    items = _items_from_payload(payload_str)
+    assert items is not None and len(items) == 1
+    assert items[0].avito_id == "1"
+    print("OK: _items_from_payload (URL-encoded string)")
 
 
 def test_image_extraction():
@@ -157,6 +161,7 @@ if __name__ == "__main__":
     test_items_from_raw_list()
     test_only_main_catalog_extracted()
     test_block_detection()
-    test_extract_from_mfe_html()
+    test_items_from_payload_dict()
+    test_items_from_payload_string()
     test_image_extraction()
     print("\nALL UNIT TESTS PASSED")

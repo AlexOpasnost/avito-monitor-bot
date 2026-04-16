@@ -31,11 +31,11 @@ async def main():
     # Import after env vars are set so config picks them up
     from parser import fetch_search_items, init_session, close_session
 
-    log.info("Opening persistent session...")
+    log.info("Launching Playwright Chromium...")
     await init_session()
 
     try:
-        log.info("First scrape (curl-cffi chrome120, persistent session)...")
+        log.info("First scrape (Playwright + page.reload)...")
         items1 = await fetch_search_items(url)
         if items1 is None:
             log.error("FAIL: no items returned")
@@ -48,7 +48,7 @@ async def main():
                 "yes" if it.image_url else "no",
             )
 
-        log.info("Second scrape (cookies should now be set)...")
+        log.info("Second scrape (page.reload, same page)...")
         items2 = await fetch_search_items(url)
         if items2 is None:
             log.error("FAIL: second scrape returned None")
