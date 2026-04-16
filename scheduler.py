@@ -8,7 +8,6 @@ from datetime import datetime, timezone, timedelta
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import config
 from database import db
 from parser import AvitoItem, fetch_search_items
 
@@ -20,12 +19,10 @@ MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
 
 
 async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
-    logger.info(
-        "Scheduler started (interval=%ds, max_concurrent=%d)",
-        config.parse_interval, config.max_concurrent_requests,
-    )
-
-    sem = asyncio.Semaphore(config.max_concurrent_requests)
+    # Hard-coded sem=1: spec requires "never fire two subscriptions
+    # simultaneously". Avito rate-limits per source IP/proxy pool.
+    logger.info("Scheduler started (per-sub interval=90-180s, sem=1, stagger=5-15s)")
+    sem = asyncio.Semaphore(1)
     tasks: dict[int, asyncio.Task] = {}
 
     while not stop_event.is_set():
@@ -70,25 +67,47 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
 
 
 async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asyncio.Event):
-    """One loop per subscription."""
-    # Stagger startup so we don't hit Avito from all tasks at once
-    await asyncio.sleep(random.uniform(0, 30))
+    """One loop per subscription. Uses a global semaphore (1) so only one
+    subscription fetches at a time, plus an in-sem stagger of 5-15s so
+    consecutive scrapes are spaced out across the proxy pool."""
+    # Initial stagger: spread sub startups across 0-60 s so they don't all
+    # try to grab the semaphore at once on bot start.
+    await asyncio.sleep(random.uniform(0, 60))
     logger.info("Sub #%d loop started", sub["id"])
+
+    consecutive_failures = 0
 
     while not stop_event.is_set():
         try:
-            # 3-8 s random pacing between page-opens (across all subscriptions)
-            await asyncio.sleep(random.uniform(3.0, 8.0))
             async with sem:
                 items = await fetch_search_items(sub["url"])
+                # Spacing held INSIDE the semaphore so the next sub waits
+                # 5-15 s before its own scrape starts.
+                await asyncio.sleep(random.uniform(5.0, 15.0))
 
             if items is None:
-                logger.warning("Sub #%d: parse failed (None)", sub["id"])
+                consecutive_failures += 1
+                logger.warning(
+                    "Sub #%d: parse failed (%d in a row)",
+                    sub["id"], consecutive_failures,
+                )
                 await db.increment_error(sub["id"], "Parse failed")
+
+                if consecutive_failures >= 3:
+                    logger.warning(
+                        "Sub #%d: 3 consecutive failures — pausing for 10 minutes",
+                        sub["id"],
+                    )
+                    consecutive_failures = 0
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=600)
+                        break
+                    except asyncio.TimeoutError:
+                        continue  # 10 min passed — start fresh cycle
             else:
+                consecutive_failures = 0
                 await _process_items(sub, items, bot)
                 await db.update_last_checked(sub["id"])
-                # Update in-memory last_checked_at so next cycle is not a "first scan"
                 sub["last_checked_at"] = datetime.now(timezone.utc)
         except asyncio.CancelledError:
             raise
@@ -99,8 +118,9 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             except Exception:
                 pass
 
-        # Jittered sleep
-        wait = max(10, config.parse_interval + random.uniform(-8, 8))
+        # Random 90-180 s wait between cycles (per spec). Avito rate-limits
+        # tight 60 s polling — a wider spread looks much more like a human.
+        wait = random.uniform(90.0, 180.0)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait)
             break

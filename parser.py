@@ -1,21 +1,17 @@
 """Avito parser — curl-cffi (Chrome TLS impersonation) + HTML hydration parsing.
 
-Why curl-cffi: it speaks TLS exactly like real Chrome (JA3 fingerprint),
-so Avito's CDN/anti-bot does not flag the request as a script. No browser
-runtime needed — just plain async HTTP.
-
-Each scrape:
-  1. rotate the mobile-proxy IP
-  2. sleep 5s so the new IP is fully active
-  3. async GET the URL with impersonate="chrome120" through the proxy
-  4. detect IP-block by title/body sniff
-  5. extract items from <script data-mfe-state="true"> JSON blobs
-  6. on block: retry up to 3 times with rotation between attempts
+Architecture rules:
+  - ONE persistent AsyncSession across the whole bot lifetime
+    (cookies build up like a real browser)
+  - impersonate="chrome120" ALWAYS (no rotation — UA/TLS mismatch is a bot
+    signal); curl-cffi sets all browser headers — we add NOTHING manually
+  - Proxy rotation only when blocked (403 / HTML block), never proactively
+  - Smart per-error-type retry behavior with bounded backoff
+  - Max 2 attempts per scrape call
 """
 import asyncio
 import html as html_lib
 import logging
-import random
 import re
 from dataclasses import dataclass
 from urllib.parse import unquote
@@ -27,6 +23,21 @@ from curl_cffi.requests import AsyncSession
 from config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_IMPERSONATE = "chrome120"
+_REQ_TIMEOUT = 45  # seconds — generous for Avito's slow pages
+_MAX_ATTEMPTS = 2
+
+# Per-error-type retry waits
+_WAIT_AFTER_403 = 10
+_WAIT_AFTER_429 = 30
+_WAIT_AFTER_TIMEOUT = 15
+_WAIT_AFTER_HTML_BLOCK = 10
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +56,39 @@ class AvitoItem:
     description: str | None
     seller_name: str | None
     published_timestamp: int | None  # unix seconds
+
+
+# ---------------------------------------------------------------------------
+# Persistent session
+# ---------------------------------------------------------------------------
+
+_session: AsyncSession | None = None
+_session_lock = asyncio.Lock()
+
+
+async def init_session() -> None:
+    """Open ONE AsyncSession that lives for the entire bot lifetime.
+    Cookies accumulate in this session like a real browser."""
+    global _session
+    if _session is not None:
+        return
+    _session = AsyncSession(impersonate=_IMPERSONATE, timeout=_REQ_TIMEOUT)
+    logger.info(
+        "[parser] curl-cffi session opened (impersonate=%s, timeout=%ds)",
+        _IMPERSONATE, _REQ_TIMEOUT,
+    )
+
+
+async def close_session() -> None:
+    global _session
+    if _session is None:
+        return
+    try:
+        await _session.close()
+    except Exception as e:
+        logger.debug("[parser] session close err: %s", e)
+    _session = None
+    logger.info("[parser] curl-cffi session closed")
 
 
 # ---------------------------------------------------------------------------
@@ -85,34 +129,6 @@ def _proxies_dict() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# User agents — random pick per request matching the impersonate target
-# ---------------------------------------------------------------------------
-
-_USER_AGENTS = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-)
-
-_IMPERSONATE_TARGETS = ("chrome120", "chrome119", "chrome116")
-
-
-def _pick_user_agent() -> str:
-    return random.choice(_USER_AGENTS)
-
-
-def _pick_impersonate() -> str:
-    return random.choice(_IMPERSONATE_TARGETS)
-
-
-# ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
@@ -125,114 +141,136 @@ def _ensure_sort_by_date(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public API — scrape with retry-on-IP-block
+# Public API — scrape with smart per-error-type retry
 # ---------------------------------------------------------------------------
 
+# Status enum for _scrape_once
 _OK = "ok"
-_BLOCKED = "blocked"
-_FAIL = "fail"
+_FAIL_403 = "fail_403"
+_FAIL_429 = "fail_429"
+_FAIL_HTML_BLOCK = "fail_html_block"
+_FAIL_TIMEOUT = "fail_timeout"
+_FAIL_OTHER = "fail_other"
 
 
-async def fetch_search_items(
-    url: str, *_unused, max_retries: int = 3
-) -> list[AvitoItem] | None:
-    """Scrape the URL with retry-on-IP-block. Returns None only after all
-    attempts fail. Extra positional args ignored (back-compat)."""
+async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
+    """Scrape the URL with smart retry. At most 2 attempts per call.
+
+    Retry strategy by error type:
+      403            -> rotate IP, wait 10s, retry
+      429            -> wait 30s WITHOUT rotating (rotating makes it worse)
+      HTML block     -> rotate IP, wait 10s, retry
+      timeout        -> wait 15s, same IP, retry  (not a block, just network)
+      anything else  -> no retry (genuine failure)
+
+    Caller (scheduler) tracks consecutive failures and applies its own
+    longer back-off after 3 cycles in a row."""
+    if _session is None:
+        logger.error("[parser] session not initialised — call init_session() first")
+        return None
+
     target_url = _ensure_sort_by_date(url)
 
-    for attempt in range(1, max_retries + 1):
-        rotated = await rotate_ip()
-        if rotated:
-            logger.info(
-                "[parser] attempt %d/%d: IP rotated, waiting 5s",
-                attempt, max_retries,
-            )
-            await asyncio.sleep(5)
-        else:
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-
+    last_status: str = _FAIL_OTHER
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
         status, items = await _scrape_once(target_url)
+        last_status = status
 
         if status == _OK:
             logger.info(
-                "[parser] %d items for %s (attempt %d)",
+                "[parser] OK %d items for %s (attempt %d)",
                 len(items or []), target_url[:80], attempt,
             )
             return items
 
-        if status == _BLOCKED:
+        if attempt >= _MAX_ATTEMPTS:
+            break
+
+        # Decide post-failure strategy
+        if status == _FAIL_403:
             logger.warning(
-                "[parser] BLOCKED on attempt %d/%d for %s — rotating IP",
-                attempt, max_retries, target_url[:80],
+                "[parser] 403 on attempt %d — rotating IP, waiting %ds",
+                attempt, _WAIT_AFTER_403,
             )
-            continue
+            await rotate_ip()
+            await asyncio.sleep(_WAIT_AFTER_403)
+        elif status == _FAIL_429:
+            logger.warning(
+                "[parser] 429 on attempt %d — waiting %ds (NOT rotating)",
+                attempt, _WAIT_AFTER_429,
+            )
+            await asyncio.sleep(_WAIT_AFTER_429)
+        elif status == _FAIL_HTML_BLOCK:
+            logger.warning(
+                "[parser] HTML block on attempt %d — rotating IP, waiting %ds",
+                attempt, _WAIT_AFTER_HTML_BLOCK,
+            )
+            await rotate_ip()
+            await asyncio.sleep(_WAIT_AFTER_HTML_BLOCK)
+        elif status == _FAIL_TIMEOUT:
+            logger.warning(
+                "[parser] timeout on attempt %d — waiting %ds (same IP)",
+                attempt, _WAIT_AFTER_TIMEOUT,
+            )
+            await asyncio.sleep(_WAIT_AFTER_TIMEOUT)
+        else:
+            # Hard non-retryable failure (HTTP 500/etc / network unreachable)
+            logger.warning("[parser] hard fail on attempt %d (status=%s)", attempt, status)
+            return None
 
-        logger.warning(
-            "[parser] hard fail on attempt %d/%d for %s",
-            attempt, max_retries, target_url[:80],
-        )
-        continue
-
-    logger.error("[parser] all %d attempts failed for %s", max_retries, target_url[:80])
+    logger.error(
+        "[parser] both attempts failed for %s (last=%s)",
+        target_url[:80], last_status,
+    )
     return None
 
 
 async def _scrape_once(target_url: str) -> tuple[str, list[AvitoItem] | None]:
-    """One scrape attempt via curl-cffi."""
-    proxies = _proxies_dict()
-    user_agent = _pick_user_agent()
-    impersonate = _pick_impersonate()
+    """One scrape attempt via the persistent curl-cffi session.
 
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    NO manual headers — curl-cffi's impersonate sets the full Chrome
+    header set so that User-Agent and TLS fingerprint match. Any manual
+    override would break that and trip Avito's bot detector."""
+    proxies = _proxies_dict()
 
     try:
-        async with AsyncSession(impersonate=impersonate, timeout=30) as session:
-            resp = await session.get(target_url, headers=headers, proxies=proxies)
+        async with _session_lock:
+            resp = await _session.get(target_url, proxies=proxies)
     except Exception as e:
-        logger.warning("[parser] HTTP error: %s", e)
-        return _FAIL, None
+        msg = str(e).lower()
+        if "timeout" in msg or "timed out" in msg or "operation_timedout" in msg:
+            logger.warning("[parser] TIMEOUT: %s", str(e)[:120])
+            return _FAIL_TIMEOUT, None
+        logger.warning("[parser] HTTP error: %s", str(e)[:120])
+        return _FAIL_OTHER, None
 
-    status_code = resp.status_code
-    if status_code in (429, 403):
-        logger.warning(
-            "[parser] HTTP %d (rate-limit/forbid) UA=%s impersonate=%s",
-            status_code, user_agent[:40], impersonate,
-        )
-        return _BLOCKED, None
-    if status_code in (301, 302, 303, 307, 308):
-        logger.warning("[parser] HTTP %d redirect (likely block)", status_code)
-        return _BLOCKED, None
-    if status_code != 200:
-        logger.warning("[parser] HTTP %d", status_code)
-        return _FAIL, None
+    sc = resp.status_code
+    if sc == 403:
+        logger.warning("[parser] HTTP 403")
+        return _FAIL_403, None
+    if sc == 429:
+        logger.warning("[parser] HTTP 429")
+        return _FAIL_429, None
+    if sc in (301, 302, 303, 307, 308):
+        logger.warning("[parser] HTTP %d redirect (treating as block)", sc)
+        return _FAIL_HTML_BLOCK, None
+    if sc != 200:
+        logger.warning("[parser] HTTP %d", sc)
+        return _FAIL_OTHER, None
 
     html = resp.text or ""
     if not html:
-        return _FAIL, None
+        logger.warning("[parser] empty body")
+        return _FAIL_OTHER, None
 
     if _looks_like_block(html[:5000]):
-        logger.warning(
-            "[parser] IP BLOCKED (body sniff) UA=%s impersonate=%s",
-            user_agent[:40], impersonate,
-        )
-        return _BLOCKED, None
+        logger.warning("[parser] HTML block detected (body sniff)")
+        return _FAIL_HTML_BLOCK, None
 
     items = _extract_items_from_html(html)
     if items is None:
         logger.warning("[parser] could not extract items from HTML (size=%d)", len(html))
-        return _FAIL, None
+        return _FAIL_OTHER, None
     return _OK, items
 
 

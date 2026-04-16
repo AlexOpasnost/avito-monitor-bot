@@ -29,39 +29,45 @@ async def main():
     log.info("Test URL: %s", url[:120])
 
     # Import after env vars are set so config picks them up
-    from parser import fetch_search_items
+    from parser import fetch_search_items, init_session, close_session
 
-    log.info("First scrape (curl-cffi chrome120)...")
-    items1 = await fetch_search_items(url)
-    if items1 is None:
-        log.error("FAIL: no items returned")
-        return 1
-    log.info("Got %d items", len(items1))
-    for i, it in enumerate(items1[:3], 1):
-        log.info(
-            "  [%d] id=%s title=%r price=%r loc=%r img=%s",
-            i, it.avito_id, it.title[:50], it.price, it.location,
-            "yes" if it.image_url else "no",
-        )
+    log.info("Opening persistent session...")
+    await init_session()
 
-    log.info("Second scrape...")
-    items2 = await fetch_search_items(url)
-    if items2 is None:
-        log.error("FAIL: second scrape returned None")
-        return 1
-    log.info("Got %d items on second scrape", len(items2))
+    try:
+        log.info("First scrape (curl-cffi chrome120, persistent session)...")
+        items1 = await fetch_search_items(url)
+        if items1 is None:
+            log.error("FAIL: no items returned")
+            return 1
+        log.info("Got %d items", len(items1))
+        for i, it in enumerate(items1[:3], 1):
+            log.info(
+                "  [%d] id=%s title=%r price=%r loc=%r img=%s",
+                i, it.avito_id, it.title[:50], it.price, it.location,
+                "yes" if it.image_url else "no",
+            )
 
-    if len(items1) < 5:
-        log.warning("Only %d items — Avito may have blocked us or filter is narrow", len(items1))
-    ids1 = {i.avito_id for i in items1}
-    ids2 = {i.avito_id for i in items2}
-    log.info("ID overlap between scrapes: %d / %d", len(ids1 & ids2), len(ids1))
+        log.info("Second scrape (cookies should now be set)...")
+        items2 = await fetch_search_items(url)
+        if items2 is None:
+            log.error("FAIL: second scrape returned None")
+            return 1
+        log.info("Got %d items on second scrape", len(items2))
 
-    with_images = sum(1 for i in items1 if i.image_url)
-    log.info("Items with images: %d / %d", with_images, len(items1))
+        if len(items1) < 5:
+            log.warning("Only %d items — Avito may have blocked us or filter is narrow", len(items1))
+        ids1 = {i.avito_id for i in items1}
+        ids2 = {i.avito_id for i in items2}
+        log.info("ID overlap between scrapes: %d / %d", len(ids1 & ids2), len(ids1))
 
-    log.info("PASS")
-    return 0
+        with_images = sum(1 for i in items1 if i.image_url)
+        log.info("Items with images: %d / %d", with_images, len(items1))
+
+        log.info("PASS")
+        return 0
+    finally:
+        await close_session()
 
 
 if __name__ == "__main__":
