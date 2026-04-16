@@ -499,6 +499,9 @@ def _parse_item(val: dict) -> AvitoItem:
 # ---------------------------------------------------------------------------
 
 _IMAGE_SIZE_KEYS = (
+    # Modern Avito catalog uses square crops
+    "864x864", "636x636", "472x472", "432x432",
+    # Older/rectangular crops still appear in some payloads
     "864x648", "636x476", "540x405", "432x324", "318x238",
     "main", "big", "biggest", "default", "url",
 )
