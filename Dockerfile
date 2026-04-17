@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
     libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 \
     libxkbcommon0 libxrandr2 xdg-utils \
-    xvfb \
+    xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
