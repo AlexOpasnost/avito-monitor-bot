@@ -140,16 +140,29 @@ async def init_session() -> None:
         timezone_id="Europe/Moscow",
         viewport={"width": 1366, "height": 768},
         proxy=proxy_cfg,
+        permissions=[],  # deny all — blocks WebRTC, geolocation, etc.
         extra_http_headers={
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         },
     )
-    # Mask headless Chromium fingerprint — Avito checks these JS props
+    # Mask headless Chromium fingerprint + block WebRTC IP leak
     await _context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
         Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru']});
         window.chrome = {runtime: {}};
+
+        // Block WebRTC — prevents leaking Railway's real datacenter IP
+        // through STUN/TURN ICE candidates even when traffic goes via proxy
+        const origRTC = window.RTCPeerConnection;
+        window.RTCPeerConnection = function(...args) {
+            if (args[0]) args[0].iceServers = [];
+            return new origRTC(...args);
+        };
+        window.RTCPeerConnection.prototype = origRTC.prototype;
+        if (window.webkitRTCPeerConnection) {
+            window.webkitRTCPeerConnection = window.RTCPeerConnection;
+        }
     """)
     logger.info(
         "[parser] Playwright Chromium + context launched (proxy=%s, locale=ru-RU, tz=Europe/Moscow, anti-detect=on)",
