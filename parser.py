@@ -134,17 +134,20 @@ async def init_session() -> None:
             "--no-default-browser-check",
         ],
     )
-    _context = await _browser.new_context(
+    ctx_kwargs: dict = dict(
         user_agent=_USER_AGENT,
         locale="ru-RU",
         timezone_id="Europe/Moscow",
         viewport={"width": 1366, "height": 768},
-        proxy=proxy_cfg,
         permissions=[],  # deny all — blocks WebRTC, geolocation, etc.
         extra_http_headers={
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         },
     )
+    # Only pass proxy= when actually configured — completely clean launch otherwise
+    if proxy_cfg:
+        ctx_kwargs["proxy"] = proxy_cfg
+    _context = await _browser.new_context(**ctx_kwargs)
     # Mask headless Chromium fingerprint + block WebRTC IP leak
     await _context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -330,12 +333,18 @@ async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
 
     title = await _safe_title(page)
     if _looks_like_block(title):
-        logger.warning(
-            "[parser] BLOCKED (title=%r) for %s — rotating IP + fresh goto",
-            title[:60], target_url[:80],
-        )
-        await rotate_ip()
-        await asyncio.sleep(10)
+        if config.proxy_list:
+            logger.warning(
+                "[parser] BLOCKED (title=%r) for %s — rotating IP + fresh goto",
+                title[:60], target_url[:80],
+            )
+            await rotate_ip()
+            await asyncio.sleep(10)
+        else:
+            logger.warning(
+                "[parser] BLOCKED (title=%r) for %s — no proxy, retrying goto",
+                title[:60], target_url[:80],
+            )
         # Full goto, NOT reload — reload carries old cookies/state from
         # the blocked response. goto starts the navigation from scratch.
         try:
