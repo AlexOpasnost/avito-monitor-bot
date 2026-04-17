@@ -126,6 +126,7 @@ async def init_session() -> None:
         headless=True,
         args=[
             "--no-sandbox",
+            "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
             "--disable-gpu",
@@ -143,8 +144,15 @@ async def init_session() -> None:
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         },
     )
+    # Mask headless Chromium fingerprint — Avito checks these JS props
+    await _context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru']});
+        window.chrome = {runtime: {}};
+    """)
     logger.info(
-        "[parser] Playwright Chromium + context launched (proxy=%s, locale=ru-RU, tz=Europe/Moscow)",
+        "[parser] Playwright Chromium + context launched (proxy=%s, locale=ru-RU, tz=Europe/Moscow, anti-detect=on)",
         "yes" if proxy_cfg else "no",
     )
 
