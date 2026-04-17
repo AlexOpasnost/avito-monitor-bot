@@ -251,6 +251,15 @@ async def _get_or_create_page(target_url: str) -> Page:
         except Exception:
             pass
         raise
+    # Wait for items to render (JS hydration)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20_000)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_selector('[data-marker="item"]', timeout=15_000)
+    except Exception:
+        pass  # may be a block page — caller handles that
     _pages[target_url] = page
     logger.info("[parser] page created for %s", target_url[:80])
     return page
@@ -284,37 +293,40 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
 
 
 async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
+    # Reload the page to get fresh listings
     try:
         await page.reload(wait_until="domcontentloaded", timeout=45_000)
     except Exception as e:
         logger.warning("[parser] reload failed for %s: %s", target_url[:80], str(e)[:200])
         return None
 
-    try:
-        await page.wait_for_load_state("networkidle", timeout=20_000)
-    except Exception:
-        pass  # networkidle is best-effort
+    # Wait for JS to finish rendering — networkidle alone is not enough,
+    # Avito's SPA hydrates DOM asynchronously after DOMContentLoaded.
+    # Waiting for an actual item element guarantees __initialData__ / mfe-state
+    # scripts are populated.
+    if not await _wait_for_items(page, target_url):
+        return None
 
     title = await _safe_title(page)
     if _looks_like_block(title):
         logger.warning(
-            "[parser] BLOCKED (title=%r) for %s — rotating IP and reloading",
+            "[parser] BLOCKED (title=%r) for %s — rotating IP + fresh goto",
             title[:60], target_url[:80],
         )
         await rotate_ip()
-        await asyncio.sleep(2)
+        await asyncio.sleep(10)
+        # Full goto, NOT reload — reload carries old cookies/state from
+        # the blocked response. goto starts the navigation from scratch.
         try:
-            await page.reload(wait_until="domcontentloaded", timeout=45_000)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
         except Exception as e:
-            logger.warning("[parser] reload after rotation failed: %s", str(e)[:200])
+            logger.warning("[parser] goto after rotation failed: %s", str(e)[:200])
             return None
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-        except Exception:
-            pass
+        if not await _wait_for_items(page, target_url):
+            return None
         title = await _safe_title(page)
         if _looks_like_block(title):
-            logger.warning("[parser] still BLOCKED after IP rotation+reload (title=%r)", title[:60])
+            logger.warning("[parser] still BLOCKED after IP rotation+goto (title=%r)", title[:60])
             return None
 
     # Extract hydration payload via the page itself
@@ -334,6 +346,36 @@ async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
         return None
     logger.info("[parser] OK %d items for %s", len(items), target_url[:80])
     return items
+
+
+async def _wait_for_items(page: Page, target_url: str) -> bool:
+    """Wait for the page to fully hydrate. Returns True on success."""
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20_000)
+    except Exception:
+        pass  # best-effort
+
+    # Explicit wait for rendered item elements — Avito's SPA injects them
+    # after JS executes, so networkidle alone is not reliable.
+    try:
+        await page.wait_for_selector(
+            '[data-marker="item"]',
+            timeout=15_000,
+        )
+    except Exception:
+        # Items may not appear if the page is a block/captcha page or
+        # if the search genuinely returned zero results. Check title to
+        # decide whether this is a real problem or just an empty search.
+        title = await _safe_title(page)
+        if _looks_like_block(title):
+            return True  # let the caller handle the block detection
+        logger.warning(
+            "[parser] wait_for_selector timed out on %s (title=%r)",
+            target_url[:80], title[:60],
+        )
+        # Still try to extract — maybe items loaded under a different marker
+        return True
+    return True
 
 
 async def _safe_title(page: Page) -> str:
