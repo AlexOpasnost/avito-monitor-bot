@@ -1,16 +1,17 @@
 """Avito parser — Playwright (real Chromium) singleton + per-subscription pages.
 
-Architecture (per spec):
-  - ONE Playwright Chromium for the entire bot lifetime
-  - ONE BrowserContext (locale ru-RU, tz Europe/Moscow, viewport 1366x768,
-    real Chrome Windows User-Agent, mobile proxy bound at context level)
-  - Per-subscription Page registered by URL — kept open across cycles
-  - Each cycle: page.reload() → wait networkidle → extract → parse
-  - On block (title contains "Доступ ограничен"): rotate IP, page.reload()
-  - Browser is NEVER recreated on IP rotation — same context, same page
+Architecture:
+  - ONE Playwright Chromium (headless on server, headed locally via HEADLESS=false)
+  - ONE BrowserContext (locale ru-RU, tz Europe/Moscow, no_viewport for natural
+    window size, real Chrome Windows UA, mobile proxy if configured)
+  - Anti-detect via add_init_script (no playwright-stealth — it leaks its own
+    patches and is detected by some anti-bot systems)
+  - Per-subscription Page kept open across cycles (page.reload every 5-10 min)
+  - Human-like behavior: random delays before/after navigation, scroll
 """
 import asyncio
 import logging
+import random
 import re
 from dataclasses import dataclass
 from urllib.parse import unquote
@@ -24,11 +25,6 @@ from playwright.async_api import (
     Playwright,
     async_playwright,
 )
-
-try:
-    from playwright_stealth import stealth_async  # type: ignore
-except ImportError:  # pragma: no cover
-    stealth_async = None
 
 from config import config
 
@@ -114,62 +110,85 @@ def _proxy_dict_for_pw() -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def init_session() -> None:
-    """Launch ONE Chromium + ONE BrowserContext for the entire bot lifetime."""
+    """Launch ONE Chromium + ONE BrowserContext for the entire bot lifetime.
+
+    HEADLESS env var controls the mode:
+      HEADLESS=true  (default) — headless, for server (Railway + xvfb-run)
+      HEADLESS=false           — headed, for local testing (real window)
+    """
     global _pw, _browser, _context
     if _browser is not None:
         return
 
     proxy_cfg = _proxy_dict_for_pw()
+    headless = config.headless
 
     _pw = await async_playwright().start()
     _browser = await _pw.chromium.launch(
-        headless=True,
+        headless=headless,
         args=[
+            "--start-maximized",
+            "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-setuid-sandbox",
+            "--disable-infobars",
             "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
         ],
     )
     ctx_kwargs: dict = dict(
         user_agent=_USER_AGENT,
         locale="ru-RU",
         timezone_id="Europe/Moscow",
-        viewport={"width": 1366, "height": 768},
-        permissions=[],  # deny all — blocks WebRTC, geolocation, etc.
+        no_viewport=True,  # natural window size, no fixed headless viewport
+        permissions=[],     # deny all — blocks WebRTC, geolocation, etc.
         extra_http_headers={
             "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         },
     )
-    # Only pass proxy= when actually configured — completely clean launch otherwise
     if proxy_cfg:
         ctx_kwargs["proxy"] = proxy_cfg
     _context = await _browser.new_context(**ctx_kwargs)
-    # Mask headless Chromium fingerprint + block WebRTC IP leak
-    await _context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru']});
-        window.chrome = {runtime: {}};
 
-        // Block WebRTC — prevents leaking Railway's real datacenter IP
-        // through STUN/TURN ICE candidates even when traffic goes via proxy
+    # Anti-detect init script — replaces playwright-stealth which leaks
+    # its own patches and gets detected by some anti-bot systems.
+    await _context.add_init_script("""
+        // Remove webdriver flag
+        delete navigator.__proto__.webdriver;
+
+        // Fake plugins (headless has empty array)
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+
+        // Languages matching locale
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['ru-RU', 'ru']
+        });
+
+        // Real Chrome always has this
+        window.chrome = { runtime: {} };
+
+        // Platform matching User-Agent (Windows)
+        Object.defineProperty(navigator, 'platform', {
+            get: () => 'Win32'
+        });
+
+        // Block WebRTC IP leak (prevents exposing datacenter IP via STUN)
         const origRTC = window.RTCPeerConnection;
-        window.RTCPeerConnection = function(...args) {
-            if (args[0]) args[0].iceServers = [];
-            return new origRTC(...args);
-        };
-        window.RTCPeerConnection.prototype = origRTC.prototype;
+        if (origRTC) {
+            window.RTCPeerConnection = function(...args) {
+                if (args[0]) args[0].iceServers = [];
+                return new origRTC(...args);
+            };
+            window.RTCPeerConnection.prototype = origRTC.prototype;
+        }
         if (window.webkitRTCPeerConnection) {
             window.webkitRTCPeerConnection = window.RTCPeerConnection;
         }
     """)
     logger.info(
-        "[parser] Playwright Chromium + context launched (proxy=%s, locale=ru-RU, tz=Europe/Moscow, anti-detect=on)",
-        "yes" if proxy_cfg else "no",
+        "[parser] Playwright launched (headless=%s, proxy=%s, anti-detect=on)",
+        headless, "yes" if proxy_cfg else "no",
     )
 
 
@@ -257,15 +276,13 @@ async def _get_or_create_page(target_url: str) -> Page:
         page = _pages[target_url]
         if not page.is_closed():
             return page
-        # Stale entry — page got closed somehow
         del _pages[target_url]
 
     page = await _context.new_page()
-    if stealth_async:
-        try:
-            await stealth_async(page)
-        except Exception as e:
-            logger.debug("[parser] stealth_async failed: %s", e)
+
+    # Human-like delay before first navigation
+    await asyncio.sleep(random.uniform(2, 5))
+
     try:
         await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
     except Exception as e:
@@ -275,15 +292,10 @@ async def _get_or_create_page(target_url: str) -> Page:
         except Exception:
             pass
         raise
-    # Wait for items to render (JS hydration)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=20_000)
-    except Exception:
-        pass
-    try:
-        await page.wait_for_selector('[data-marker="item"]', timeout=15_000)
-    except Exception:
-        pass  # may be a block page — caller handles that
+
+    # Wait for full hydration
+    await _wait_for_items(page, target_url)
+
     _pages[target_url] = page
     logger.info("[parser] page created for %s", target_url[:80])
     return page
@@ -317,20 +329,19 @@ async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
 
 
 async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
-    # Reload the page to get fresh listings
+    # Random pre-reload delay (human doesn't hit F5 instantly every cycle)
+    await asyncio.sleep(random.uniform(2, 5))
+
     try:
         await page.reload(wait_until="domcontentloaded", timeout=45_000)
     except Exception as e:
         logger.warning("[parser] reload failed for %s: %s", target_url[:80], str(e)[:200])
         return None
 
-    # Wait for JS to finish rendering — networkidle alone is not enough,
-    # Avito's SPA hydrates DOM asynchronously after DOMContentLoaded.
-    # Waiting for an actual item element guarantees __initialData__ / mfe-state
-    # scripts are populated.
     if not await _wait_for_items(page, target_url):
         return None
 
+    # Check for block
     title = await _safe_title(page)
     if _looks_like_block(title):
         if config.proxy_list:
@@ -345,8 +356,8 @@ async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
                 "[parser] BLOCKED (title=%r) for %s — no proxy, retrying goto",
                 title[:60], target_url[:80],
             )
-        # Full goto, NOT reload — reload carries old cookies/state from
-        # the blocked response. goto starts the navigation from scratch.
+        # Full goto, NOT reload — reload carries cookies/state from blocked response
+        await asyncio.sleep(random.uniform(2, 5))
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
         except Exception as e:
@@ -356,10 +367,18 @@ async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
             return None
         title = await _safe_title(page)
         if _looks_like_block(title):
-            logger.warning("[parser] still BLOCKED after IP rotation+goto (title=%r)", title[:60])
+            logger.warning("[parser] still BLOCKED after rotation+goto (title=%r)", title[:60])
             return None
 
-    # Extract hydration payload via the page itself
+    # Human-like post-load behavior: wait, scroll, wait, then read data
+    await asyncio.sleep(random.uniform(3, 5))
+    try:
+        await page.mouse.wheel(0, random.randint(300, 700))
+    except Exception:
+        pass
+    await asyncio.sleep(random.uniform(1, 2))
+
+    # Extract hydration payload
     try:
         payload = await page.evaluate(_EXTRACT_JS)
     except Exception as e:
@@ -379,32 +398,23 @@ async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
 
 
 async def _wait_for_items(page: Page, target_url: str) -> bool:
-    """Wait for the page to fully hydrate. Returns True on success."""
+    """Wait for the page to fully hydrate: networkidle + item elements."""
     try:
         await page.wait_for_load_state("networkidle", timeout=20_000)
     except Exception:
-        pass  # best-effort
+        pass
 
-    # Explicit wait for rendered item elements — Avito's SPA injects them
-    # after JS executes, so networkidle alone is not reliable.
     try:
-        await page.wait_for_selector(
-            '[data-marker="item"]',
-            timeout=15_000,
-        )
+        await page.wait_for_selector('[data-marker="item"]', timeout=15_000)
     except Exception:
-        # Items may not appear if the page is a block/captcha page or
-        # if the search genuinely returned zero results. Check title to
-        # decide whether this is a real problem or just an empty search.
         title = await _safe_title(page)
         if _looks_like_block(title):
-            return True  # let the caller handle the block detection
+            return True  # caller handles block detection
         logger.warning(
             "[parser] wait_for_selector timed out on %s (title=%r)",
             target_url[:80], title[:60],
         )
-        # Still try to extract — maybe items loaded under a different marker
-        return True
+        return True  # still try to extract
     return True
 
 

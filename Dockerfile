@@ -2,7 +2,7 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# Chromium runtime deps (Debian Bookworm) for Playwright
+# Chromium runtime deps + xvfb for headed mode on server
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget gnupg ca-certificates fonts-liberation \
     libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
     libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 \
     libxkbcommon0 libxrandr2 xdg-utils \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -20,4 +21,7 @@ RUN python -m playwright install chromium
 
 COPY . .
 
-CMD ["python", "-u", "bot.py"]
+# xvfb-run provides a virtual display for headed Chromium on a headless server.
+# If HEADLESS=true (default), Chromium runs headless and xvfb is harmless.
+# If HEADLESS=false, xvfb gives it a virtual screen to render to.
+CMD ["xvfb-run", "--auto-servernum", "python", "-u", "bot.py"]

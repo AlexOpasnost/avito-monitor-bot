@@ -19,6 +19,7 @@ class Config:
     # Avito mobile API
     avito_api_key: str = "af0deccbgcgidddjgnvljitntccdduijhdinfgjgfjir"
     max_concurrent_requests: int = 3
+    headless: bool = True
     user_agent: str = (
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -38,6 +39,7 @@ class Config:
             proxy_rotate_url=os.getenv("PROXY_ROTATE_URL", ""),
             admin_id=int(os.getenv("ADMIN_ID", "0")),
             max_concurrent_requests=int(os.getenv("MAX_CONCURRENT_REQUESTS", "3")),
+            headless=os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes"),
         )
 
 
