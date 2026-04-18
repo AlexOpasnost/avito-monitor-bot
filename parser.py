@@ -1,50 +1,17 @@
-"""Avito parser — undetected-chromedriver (real Chrome, low-level patched).
-
-Architecture:
-  - ONE undetected_chromedriver.Chrome instance for the entire bot lifetime
-  - Selenium is sync — async wrappers run all driver calls in a thread pool
-    via asyncio.to_thread
-  - All Avito interactions are serialized through a single asyncio.Lock so
-    only one navigation happens at a time
-  - Per-request: driver.get(url) -> wait for [data-marker="item"] ->
-    human-like delays + scroll -> execute_script returns hydration payload
-  - On block: rotate IP -> driver.get(url) again
-"""
-import asyncio
+"""Avito parser — primary: mobile API, fallback: HTML hydration JSON."""
+import html as html_lib
 import logging
-import random
 import re
-import time
 from dataclasses import dataclass
-from urllib.parse import unquote
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 import orjson
-
-# Optional Selenium imports — only needed at runtime in production.
-# Unit tests don't need them.
-# We use seleniumwire.undetected_chromedriver because authenticated proxies
-# (user:pass@host:port) do NOT work with Chromium's --proxy-server flag —
-# selenium-wire's mitmproxy-based tunnel handles auth transparently.
-_uc_import_error: str | None = None
-try:
-    import seleniumwire.undetected_chromedriver as uc  # type: ignore
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import WebDriverWait
-except Exception as _e:  # pragma: no cover
-    uc = None  # type: ignore
-    By = EC = WebDriverWait = None  # type: ignore
-    _uc_import_error = f"{type(_e).__name__}: {_e}"
 
 from config import config
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
 
 @dataclass
 class AvitoItem:
@@ -61,115 +28,49 @@ class AvitoItem:
 
 
 # ---------------------------------------------------------------------------
-# Singleton driver
+# Public API
 # ---------------------------------------------------------------------------
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) -> list[AvitoItem] | None:
+    """Try mobile API first, fall back to HTML hydration JSON.
+    Rotates IP and retries on blocks (429/403)."""
+    import asyncio
 
-_driver = None  # uc.Chrome | None — type hint omitted so unit tests can import without selenium
-# All Selenium calls go through this lock — Selenium is single-threaded,
-# and Avito should never see two simultaneous requests anyway.
-_driver_lock = asyncio.Lock()
+    for attempt in range(max_retries):
+        # Try mobile API first (fast, clean JSON)
+        items, api_blocked = await _fetch_mobile_api(url, proxy)
+        if items is not None:
+            logger.info("[api] fetched %d items for %s", len(items), url[:80])
+            return items
 
+        # API blocked — rotate IP FIRST, then try HTML with fresh IP + fresh session
+        if api_blocked:
+            logger.info("[api] blocked, rotating IP before HTML fallback...")
+            _invalidate_session()
+            await rotate_ip()
+            await asyncio.sleep(3)
 
-# Strict catalog paths inside the hydration payload
-_MAIN_CATALOG_PATH = ("state", "data", "catalog", "items")
-_FALLBACK_CATALOG_PATHS = (
-    ("data", "catalog", "items"),
-    ("initialData", "catalog", "items"),
-    ("pageProps", "catalog", "items"),
-)
+        # Try HTML fallback with (possibly fresh) IP
+        items, html_blocked = await _fetch_hydration_json(url, proxy)
+        if items is not None:
+            logger.info("[html] fetched %d items for %s", len(items), url[:80])
+            return items
 
-_BLOCK_PHRASES = (
-    "доступ ограничен",
-    "проблема с ip",
-    "подозрительная активность",
-    "слишком много запросов",
-    "robot check",
-    "captcha",
-)
+        if not api_blocked and not html_blocked:
+            return None
 
+        if html_blocked:
+            logger.warning("HTML also blocked (attempt %d/%d), rotating IP again", attempt + 1, max_retries)
+            _invalidate_session()
+            await rotate_ip()
+            await asyncio.sleep(5)
 
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
+    logger.error("All %d attempts blocked for %s", max_retries, url[:80])
+    return None
 
-def _build_driver_sync():
-    """SYNC — must be called via asyncio.to_thread. Returns uc.Chrome."""
-    if uc is None:
-        raise RuntimeError(
-            f"seleniumwire-undetected-chromedriver import failed: {_uc_import_error or 'not installed'}"
-        )
-    options = uc.ChromeOptions()
-    options.add_argument("--lang=ru-RU,ru")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(f"--user-agent={_USER_AGENT}")
-    options.add_argument("--window-size=1366,768")
-    # selenium-wire intercepts HTTPS via a self-signed CA — Chrome must
-    # trust it or every Avito page turns into a "Privacy error" screen.
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--ignore-ssl-errors=yes")
-    options.set_capability("acceptInsecureCerts", True)
-
-    # Proxy goes through selenium-wire (mitmproxy tunnel) so user:pass auth
-    # is handled transparently — Chromium's --proxy-server does NOT support
-    # credentials in the URL.
-    sw_options: dict = {}
-    if config.proxy_list:
-        proxy = config.proxy_list[0]
-        sw_options["proxy"] = {
-            "http": proxy,
-            "https": proxy,
-            "no_proxy": "localhost,127.0.0.1",
-        }
-        # Redact creds in log
-        redacted = re.sub(r"://[^@]+@", "://***@", proxy)
-        logger.info("[parser] proxy bound via selenium-wire: %s", redacted)
-
-    driver = uc.Chrome(
-        options=options,
-        headless=config.headless,
-        no_sandbox=True,
-        seleniumwire_options=sw_options,
-    )
-    driver.set_page_load_timeout(45)
-    return driver
-
-
-async def init_session() -> None:
-    """Launch ONE undetected Chrome for the entire bot lifetime."""
-    global _driver
-    if _driver is not None:
-        return
-    _driver = await asyncio.to_thread(_build_driver_sync)
-    logger.info(
-        "[parser] undetected-chromedriver started (headless=%s, proxy=%s)",
-        config.headless, "yes" if config.proxy_list else "no",
-    )
-
-
-async def close_session() -> None:
-    global _driver
-    if _driver is None:
-        return
-    drv = _driver
-    _driver = None
-    try:
-        await asyncio.to_thread(drv.quit)
-    except Exception as e:
-        logger.debug("[parser] driver quit err: %s", e)
-    logger.info("[parser] undetected-chromedriver stopped")
-
-
-# ---------------------------------------------------------------------------
-# Proxy
-# ---------------------------------------------------------------------------
 
 async def rotate_ip() -> bool:
+    """Call proxy rotation URL (if configured)."""
     if not config.proxy_rotate_url:
         return False
     try:
@@ -182,6 +83,7 @@ async def rotate_ip() -> bool:
 
 
 async def check_proxy_ip() -> str | None:
+    """Return external IP via the configured proxy, or None."""
     if not config.proxy_list:
         return None
     try:
@@ -195,364 +97,372 @@ async def check_proxy_ip() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# URL helpers
+# Mobile API
 # ---------------------------------------------------------------------------
 
-def _ensure_sort_by_date(url: str) -> str:
-    if re.search(r"[?&]s=\d+", url):
-        return url
-    sep = "&" if "?" in url else "?"
-    return url + sep + "s=104"
+async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
+    """Fetch via the Avito mobile API using curl_cffi (Chrome TLS fingerprint).
+    Returns (items, blocked). blocked=True means IP is rate-limited/banned."""
+    import asyncio
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
 
-
-# ---------------------------------------------------------------------------
-# Public API — async wrapper around sync Selenium scrape
-# ---------------------------------------------------------------------------
-
-async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
-    """Navigate to URL and return parsed catalog items, or None on failure.
-    Holds the global lock — only one Avito request at a time."""
-    if _driver is None:
-        logger.error("[parser] driver not initialised — call init_session() first")
-        return None
-
-    target_url = _ensure_sort_by_date(url)
-
-    async with _driver_lock:
-        try:
-            payload = await asyncio.to_thread(_scrape_sync, target_url)
-        except Exception as e:
-            logger.warning("[parser] scrape error for %s: %s", target_url[:80], str(e)[:200])
-            return None
-
-        if payload is None:
-            return None
-
-        items = _items_from_payload(payload)
-        if items is None:
-            logger.warning("[parser] could not extract items from payload on %s", target_url[:80])
-            return None
-        logger.info("[parser] OK %d items for %s", len(items), target_url[:80])
-        return items
-
-
-# ---------------------------------------------------------------------------
-# SYNC Selenium scrape — runs in a thread via asyncio.to_thread
-# ---------------------------------------------------------------------------
-
-def _scrape_sync(target_url: str):
-    """Returns the hydration payload (dict/str) or None.
-    May call into the proxy-rotation HTTP client through the event loop —
-    we use asyncio.run_coroutine_threadsafe for that single side-effect."""
-    # Random pre-navigation delay (human pace)
-    time.sleep(random.uniform(2, 5))
-
-    try:
-        _driver.get(target_url)
-    except Exception as e:
-        logger.warning("[parser] driver.get failed: %s", str(e)[:200])
-        return None
-
-    # Wait for items to render
-    if not _wait_for_items_sync(target_url):
-        return None
-
-    # Block check
-    title = _safe_title_sync()
-    if _looks_like_block(title):
-        logger.warning(
-            "[parser] BLOCKED (title=%r) for %s — rotating IP and retrying goto",
-            title[:60], target_url[:80],
-        )
-        if config.proxy_rotate_url:
-            _rotate_ip_sync()
-            time.sleep(10)
-        time.sleep(random.uniform(2, 5))
-        try:
-            _driver.get(target_url)
-        except Exception as e:
-            logger.warning("[parser] driver.get after rotation failed: %s", str(e)[:200])
-            return None
-        if not _wait_for_items_sync(target_url):
-            return None
-        title = _safe_title_sync()
-        if _looks_like_block(title):
-            logger.warning("[parser] still BLOCKED after rotation (title=%r)", title[:60])
-            return None
-
-    # Human-like post-load behavior
-    time.sleep(random.uniform(3, 5))
-    try:
-        _driver.execute_script("window.scrollBy(0, arguments[0])", random.randint(300, 700))
-    except Exception:
-        pass
-    time.sleep(random.uniform(1, 2))
-
-    # Give Avito's SPA extra time to finish JS hydration after scroll
-    time.sleep(5)
-
-    # Diagnostic — what actually loaded?
-    page_title = _safe_title_sync()
-    try:
-        page_len = len(_driver.page_source or "")
-    except Exception:
-        page_len = 0
-    logger.info("[parser] loaded title=%r, page_source=%d chars", page_title[:80], page_len)
-
-    # Try hydration sources one by one
-    payload = None
-    for var in ("__initialData__", "__preloadedState__", "__mfe__"):
-        try:
-            v = _driver.execute_script(f"return window.{var} || null;")
-        except Exception as e:
-            logger.debug("[parser] read window.%s failed: %s", var, str(e)[:120])
-            continue
-        if v:
-            logger.info("[parser] hydration source: window.%s", var)
-            payload = v
-            break
-
-    # data-mfe-state script blobs
-    if payload is None:
-        try:
-            payload = _driver.execute_script(_MFE_STATE_JS)
-        except Exception as e:
-            logger.debug("[parser] mfe-state script extract failed: %s", str(e)[:120])
-        if payload is not None:
-            logger.info("[parser] hydration source: mfe-state script blob")
-
-    # Last-resort: BeautifulSoup scrape of data-item-id inside catalog-serp
-    if payload is None:
-        logger.warning(
-            "[parser] no hydration JSON — falling back to DOM scrape on %s",
-            target_url[:80],
-        )
-        dom_items = _scrape_dom_fallback(_driver.page_source or "")
-        if dom_items:
-            # Return a synthetic payload that _items_from_payload will accept
-            return {"state": {"data": {"catalog": {"items": dom_items}}}}
-        logger.warning("[parser] DOM fallback also produced no items")
-    return payload
-
-
-# JS to pull the first data-mfe-state script blob that has state.data.catalog
-_MFE_STATE_JS = r"""
-const scripts = document.querySelectorAll('script[data-mfe-state="true"]');
-for (const s of scripts) {
-  const txt = (s.textContent || '').trim();
-  if (!txt || txt.includes('sandbox')) continue;
-  try {
-    const data = JSON.parse(txt);
-    if (data && data.state && data.state.data && data.state.data.catalog) {
-      return data;
+    api_url = "https://m.avito.ru/api/11/items"
+    params = {
+        "key": config.avito_api_key,
+        "locationId": "621540",
+        "limit": "50",
+        "display": "list",
+        "sort": "date",
     }
-  } catch (e) {}
-}
-return null;
-"""
+    if "f" in qs:
+        params["f"] = qs["f"][0]
+    if "q" in qs:
+        params["query"] = qs["q"][0]
+    if "pmin" in qs:
+        params["priceMin"] = qs["pmin"][0]
+    if "pmax" in qs:
+        params["priceMax"] = qs["pmax"][0]
+
+    def _do_request():
+        from urllib.parse import urlencode
+        full_url = api_url + "?" + urlencode(params)
+        try:
+            scraper = _get_cloudscraper(proxy)
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            resp = scraper.get(
+                full_url,
+                proxies=proxies,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Language": "ru-RU,ru;q=0.9",
+                    "Referer": "https://m.avito.ru/",
+                },
+                timeout=30,
+            )
+            return resp.status_code, resp.text
+        except Exception as e:
+            logger.debug("[api] cloudscraper error: %s", e)
+            return 0, ""
+
+    try:
+        loop = asyncio.get_running_loop()
+        status, text = await loop.run_in_executor(None, _do_request)
+
+        if status in (429, 403):
+            logger.warning("[api] BLOCKED %d for %s", status, url[:80])
+            return None, True
+        if status != 200:
+            logger.debug("[api] HTTP %d for %s", status, url[:80])
+            return None, False
+
+        data = orjson.loads(text)
+        items_raw = (data.get("result") or {}).get("items") or []
+        items: list[AvitoItem] = []
+        for raw in items_raw:
+            if raw.get("type") != "item":
+                continue
+            val = raw.get("value") or {}
+            try:
+                items.append(_parse_api_item(val))
+            except Exception as e:
+                logger.debug("parse item err: %s", e)
+        if items:
+            logger.info("[api] SUCCESS: %d items from mobile API", len(items))
+        return (items if items else None), False
+    except Exception as e:
+        logger.debug("[api] exception: %s", e)
+        return None, False
 
 
-def _scrape_dom_fallback(html: str) -> list[dict]:
-    """Pull items out of rendered HTML using BeautifulSoup. Only looks inside
-    the main catalog container so recommendations/similar widgets are ignored."""
+# ---------------------------------------------------------------------------
+# HTML fallback (hydration JSON)
+# ---------------------------------------------------------------------------
+
+_cs_session = None
+_cs_created = 0.0
+
+
+def _get_cloudscraper(proxy: str | None):
+    """Get or create a cloudscraper session (reuse for cookies)."""
+    import time
+    global _cs_session, _cs_created
+    now = time.time()
+    if _cs_session and (now - _cs_created) < 300:
+        return _cs_session
+    import cloudscraper
+    s = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+    )
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    # Warmup: visit BOTH domains for cookies
+    try:
+        r = s.get("https://www.avito.ru/", proxies=proxies, timeout=20)
+        logger.info("[html] warmup www: HTTP %d, %d cookies", r.status_code, len(s.cookies))
+    except Exception as e:
+        logger.warning("[html] warmup www failed: %s", e)
+    try:
+        r2 = s.get("https://m.avito.ru/", proxies=proxies, timeout=20)
+        logger.info("[html] warmup m: HTTP %d, %d cookies", r2.status_code, len(s.cookies))
+    except Exception as e:
+        logger.warning("[html] warmup m failed: %s", e)
+    _cs_session = s
+    _cs_created = now
+    return s
+
+
+def _fetch_html_sync(url: str, proxy: str | None) -> tuple[int, str] | None:
+    """Fetch Avito HTML with cloudscraper (sync, runs in thread)."""
+    try:
+        s = _get_cloudscraper(proxy)
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = s.get(url, proxies=proxies, timeout=60, allow_redirects=False)
+        return resp.status_code, resp.text
+    except Exception as e:
+        logger.debug("[html] sync fetch error: %s", e)
+        return None
+
+
+def _invalidate_session():
+    """Reset cloudscraper session (after IP rotation)."""
+    global _cs_session, _cs_created
+    _cs_session = None
+    _cs_created = 0.0
+
+
+_HYDRATION_RE = re.compile(
+    r'<script[^>]*data-mfe-state="true"[^>]*>([^<]+)</script>',
+    re.IGNORECASE,
+)
+
+
+async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[AvitoItem] | None, bool]:
+    """Fetch HTML with cloudscraper (bypasses WAF) + extract hydration JSON."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+        resp_data = await loop.run_in_executor(None, lambda: _fetch_html_sync(url, proxy))
+        if resp_data is None:
+            return None, False
+        status, html = resp_data
+        if status in (429, 403):
+            logger.warning("[html] BLOCKED %d for %s", status, url[:80])
+            return None, True
+        if status in (301, 302, 303, 307, 308):
+            logger.warning("[html] REDIRECT %d (block) for %s", status, url[:80])
+            return None, True
+        if status != 200:
+            logger.debug("[html] HTTP %d for %s", status, url[:80])
+            return None, False
+        if "проблема с ip" in html.lower() or "доступ ограничен" in html.lower():
+            logger.warning("[html] BLOCKED (IP problem) for %s", url[:80])
+            return None, True
+        logger.info("[html] Page loaded: %d, size=%d", status, len(html))
+    except Exception as e:
+        logger.debug("[html] exception: %s", e)
+        return None, False
+
+    # Method 1: data-mfe-state hydration JSON (Duff89 method — BeautifulSoup)
     try:
         from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for script in soup.select("script"):
+            if (script.get("type") == "mime/invalid"
+                and script.get("data-mfe-state") == "true"
+                and "sandbox" not in (script.text or "")):
+                data = orjson.loads(html_lib.unescape(script.text))
+                if data.get("i18n", {}).get("hasMessages", {}):
+                    catalog = data.get("state", {}).get("data", {}).get("catalog", {})
+                    items_raw = catalog.get("items") or []
+                    items: list[AvitoItem] = []
+                    for raw in items_raw:
+                        if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
+                            continue
+                        val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
+                        if not isinstance(val, dict):
+                            continue
+                        try:
+                            items.append(_parse_api_item(val))
+                        except Exception:
+                            pass
+                    if items:
+                        logger.info("[html] parsed %d items from mfe-state (Duff89 method)", len(items))
+                        return items, False
+                    else:
+                        logger.info("[html] mfe-state found (i18n OK) but catalog empty, keys: %s",
+                                   list(data.get("state", {}).get("data", {}).keys())[:8])
     except ImportError:
-        logger.warning("[parser] beautifulsoup4 not installed, DOM fallback unavailable")
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    root = (
-        soup.select_one('[data-marker="catalog-serp"]')
-        or soup.select_one('[data-marker="catalog-list"]')
-        or soup
-    )
-
-    items: list[dict] = []
-    seen: set[str] = set()
-    for node in root.select("[data-item-id]"):
-        item_id = node.get("data-item-id") or ""
-        if not item_id or item_id in seen:
-            continue
-        seen.add(item_id)
-
-        # URL
-        link_el = node.select_one(f'a[href*="{item_id}"]') or node.select_one("a[href]")
-        href = link_el.get("href", "") if link_el else ""
-        url_path = href.split("?")[0] if href else f"/{item_id}"
-
-        # Title
-        title_el = (
-            node.select_one('[itemprop="name"]')
-            or node.select_one('[data-marker="item-title"]')
-            or node.select_one("h3")
-        )
-        title = title_el.get_text(strip=True) if title_el else f"Объявление {item_id}"
-
-        # Price
-        price_el = (
-            node.select_one('[itemprop="price"]')
-            or node.select_one('[data-marker="item-price"]')
-        )
-        price_text = price_el.get_text(strip=True) if price_el else ""
-        price_digits = re.sub(r"\D+", "", price_text)
-        price_value = int(price_digits) if price_digits else None
-
-        # Image
-        img_el = node.select_one("img")
-        img_src = ""
-        if img_el:
-            img_src = img_el.get("src") or img_el.get("data-src") or ""
-
-        items.append({
-            "id": item_id,
-            "title": title,
-            "urlPath": url_path,
-            "priceDetailed": (
-                {"value": price_value, "string": price_text} if price_value else (
-                    {"string": price_text} if price_text else {}
-                )
-            ),
-            "images": [{"url": img_src}] if img_src else [],
-        })
-    logger.info("[parser] DOM fallback extracted %d items", len(items))
-    return items
-
-
-def _wait_for_items_sync(target_url: str) -> bool:
-    try:
-        WebDriverWait(_driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-marker="item"]'))
-        )
-        return True
-    except Exception:
-        title = _safe_title_sync()
-        if _looks_like_block(title):
-            return True  # caller handles block detection
-        logger.warning(
-            "[parser] wait_for_selector timed out on %s (title=%r)",
-            target_url[:80], title[:60],
-        )
-        return True  # still try to extract
-
-
-def _safe_title_sync() -> str:
-    try:
-        return _driver.title or ""
-    except Exception:
-        return ""
-
-
-def _rotate_ip_sync() -> bool:
-    """Sync IP rotation — uses httpx in sync mode, NOT the async one above.
-    Called from within the threaded scrape so we can't await."""
-    if not config.proxy_rotate_url:
-        return False
-    try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(config.proxy_rotate_url)
-            return resp.status_code == 200
+        logger.debug("[html] BeautifulSoup not installed, skipping mfe-state method")
     except Exception as e:
-        logger.warning("rotate_ip (sync) failed: %s", e)
-        return False
+        logger.debug("[html] mfe-state parse err: %s", e)
 
-
-def _looks_like_block(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    return any(p in t for p in _BLOCK_PHRASES)
-
-
-# JS to extract Avito hydration data
-_EXTRACT_JS = r"""
-for (const g of ['__initialData__', '__preloadedState__', '__mfe__']) {
-  const v = window[g];
-  if (v !== undefined && v !== null) return v;
-}
-const scripts = document.querySelectorAll('script[data-mfe-state="true"]');
-for (const s of scripts) {
-  const txt = (s.textContent || '').trim();
-  if (!txt || txt.includes('sandbox')) continue;
-  try {
-    const data = JSON.parse(txt);
-    if (data && data.state && data.state.data && data.state.data.catalog) {
-      return data;
-    }
-  } catch (e) {}
-}
-return null;
-"""
-
-
-# ---------------------------------------------------------------------------
-# Item extraction (strict main-catalog path only)
-# ---------------------------------------------------------------------------
-
-def _items_from_payload(payload) -> list[AvitoItem] | None:
-    data = payload
-    if isinstance(data, str):
+    # Method 2: __initialData__ (URL-encoded JSON in older Avito pages)
+    from urllib.parse import unquote
+    init_match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
+    if init_match:
         try:
-            data = orjson.loads(unquote(data))
-        except Exception:
-            try:
-                data = orjson.loads(data)
-            except Exception:
-                return None
-    if not isinstance(data, dict):
-        return None
-
-    items_raw = _walk_path(data, _MAIN_CATALOG_PATH)
-    used_path = ".".join(_MAIN_CATALOG_PATH)
-    if items_raw is None:
-        for path in _FALLBACK_CATALOG_PATHS:
-            items_raw = _walk_path(data, path)
-            if items_raw is not None:
-                used_path = ".".join(path)
-                break
-    if items_raw is None:
-        logger.warning("[parser] no main catalog in payload (top keys: %s)", list(data.keys())[:8])
-        return None
-
-    items = _items_from_raw_list(items_raw)
-    if items:
-        logger.info("[parser] extracted from %s — %d listings (raw=%d)", used_path, len(items), len(items_raw))
-    return items
-
-
-def _walk_path(data, path: tuple[str, ...]):
-    node = data
-    for key in path:
-        if not isinstance(node, dict) or key not in node:
-            return None
-        node = node[key]
-    return node if isinstance(node, list) else None
-
-
-def _items_from_raw_list(items_raw) -> list[AvitoItem]:
-    items: list[AvitoItem] = []
-    for raw_item in items_raw:
-        if not isinstance(raw_item, dict):
-            continue
-        rtype = (raw_item.get("type") or "").strip()
-        if rtype and rtype != "item":
-            continue
-        val = raw_item.get("value", raw_item) if "value" in raw_item else raw_item
-        if not isinstance(val, dict):
-            continue
-        if not (val.get("id") or val.get("itemId")):
-            continue
-        try:
-            items.append(_parse_item(val))
+            raw_json = unquote(init_match.group(1))
+            data = orjson.loads(raw_json)
+            items = _extract_items_from_json(data)
+            if items:
+                logger.info("[html] parsed %d items from __initialData__", len(items))
+                return items, False
         except Exception as e:
-            logger.debug("[parser] parse item err: %s", e)
-    return items
+            logger.debug("[html] __initialData__ parse err: %s", e)
+
+    # Method 3: __preloadedState__ or __mfe__ (URL-encoded JSON in quotes)
+    for var_name in ['__preloadedState__', '__preloadedState_', '__mfe__']:
+        marker = f'window.{var_name}'
+        idx = html.find(marker)
+        if idx < 0:
+            continue
+        # Find the opening quote after =
+        eq_idx = html.find('=', idx)
+        if eq_idx < 0:
+            continue
+        # Skip whitespace after =
+        start = eq_idx + 1
+        while start < len(html) and html[start] in ' \t\n\r':
+            start += 1
+        if start >= len(html):
+            continue
+
+        try:
+            if html[start] == '"':
+                # URL-encoded string: "...encoded..."
+                end = html.find('";', start + 1)
+                if end < 0:
+                    end = html.find('"', start + 1)
+                if end > start:
+                    encoded = html[start + 1:end]
+                    decoded = unquote(encoded)
+                    data = orjson.loads(decoded)
+            elif html[start] == '{':
+                # Raw JSON object — find matching }
+                depth = 0
+                i = start
+                while i < min(len(html), start + 5_000_000):
+                    if html[i] == '{':
+                        depth += 1
+                    elif html[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            data = orjson.loads(html[start:i + 1])
+                            break
+                    i += 1
+                else:
+                    continue
+            else:
+                continue
+
+            items = _extract_items_from_json(data)
+            if items:
+                logger.info("[html] parsed %d items from %s", len(items), var_name)
+                return items, False
+            else:
+                # Log deeper structure to find where items hide
+                keys_info = list(data.keys())[:8] if isinstance(data, dict) else "?"
+                logger.info("[html] %s found but no items (keys: %s)", var_name, keys_info)
+                # Dig into first-level values
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            sub_keys = list(v.keys())[:8]
+                            size = len(str(v))
+                            if size > 5000:
+                                logger.info("[html]   %s.%s (%d chars): %s", var_name, k, size, sub_keys)
+                                # Try second level
+                                for k2, v2 in v.items():
+                                    if isinstance(v2, dict) and len(str(v2)) > 5000:
+                                        logger.info("[html]     %s.%s.%s (%d chars): %s",
+                                                   var_name, k, k2, len(str(v2)), list(v2.keys())[:8])
+        except Exception as e:
+            logger.debug("[html] %s parse error: %s", var_name, e)
+
+    # Debug: what JS vars and scripts are on the page?
+    js_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
+    mfe_scripts = re.findall(r'data-mfe-state', html[:50000])
+    logger.info("[html] JS vars: %s, mfe-state tags: %d, page size: %d",
+                js_vars[:5], len(mfe_scripts), len(html))
+
+    # Method 4: data-item-id from HTML (last resort)
+    item_ids = re.findall(r'data-item-id="(\d+)"', html)
+    if len(item_ids) >= 3:
+        items = []
+        for item_id in item_ids:
+            # Extract minimal info: title from nearby link
+            idx = html.find(f'data-item-id="{item_id}"')
+            block = html[idx:idx + 3000] if idx >= 0 else ""
+            title_m = re.search(r'title="([^"]{5,80})"', block)
+            title = title_m.group(1) if title_m else f"Объявление {item_id}"
+            # Skip junk titles
+            if "избранное" in title.lower() or "сравнение" in title.lower():
+                title_m2 = re.search(r'href="[^"]*"[^>]*>([^<]{5,80})<', block)
+                title = title_m2.group(1).strip() if title_m2 else f"Объявление {item_id}"
+            url_m = re.search(rf'href="(/[^"]*?{item_id}[^"]*?)"', block)
+            url_path = url_m.group(1).split("?")[0] if url_m else f"/{item_id}"
+            price_m = re.search(r'(\d[\d\s]*\d)\s*₽', block)
+            price = (price_m.group(1).strip() + " ₽") if price_m else ""
+            items.append(AvitoItem(
+                avito_id=item_id, title=title, price=price, price_value=None,
+                url=f"https://www.avito.ru{url_path}",
+                image_url=None, location=None, description=None,
+                seller_name=None, published_timestamp=None,
+            ))
+        logger.info("[html] parsed %d items from data-item-id", len(items))
+        return items, False
+
+    logger.warning("[html] no items found in HTML (size=%d)", len(html))
+    return None, False
 
 
-def _parse_item(val: dict) -> AvitoItem:
+# ---------------------------------------------------------------------------
+# Item parsing
+# ---------------------------------------------------------------------------
+
+def _extract_items_from_json(data: dict) -> list[AvitoItem]:
+    """Recursively find items array in a nested JSON structure."""
+    # Try common paths
+    for path in [
+        lambda d: d.get("items", []),
+        lambda d: d.get("catalog", {}).get("items", []),
+        lambda d: d.get("results", []),
+    ]:
+        items_raw = path(data)
+        if isinstance(items_raw, list) and len(items_raw) >= 3:
+            items = []
+            for raw in items_raw:
+                if not isinstance(raw, dict):
+                    continue
+                val = raw.get("value", raw) if "value" in raw else raw
+                if not isinstance(val, dict):
+                    continue
+                # Must have id + urlPath or price (real listing, not category)
+                if not (val.get("id") or val.get("itemId")):
+                    continue
+                if not (val.get("urlPath") or val.get("price") or val.get("priceDetailed")):
+                    continue
+                try:
+                    items.append(_parse_api_item(val))
+                except Exception:
+                    pass
+            if items:
+                return items
+
+    # Recurse into dict values
+    for key, val in data.items():
+        if isinstance(val, dict) and len(str(val)) > 1000:
+            result = _extract_items_from_json(val)
+            if result:
+                return result
+    return []
+
+
+def _parse_api_item(val: dict) -> AvitoItem:
     avito_id = str(val.get("id") or val.get("itemId") or "")
     title = val.get("title") or ""
 
+    # Price
     price_info = val.get("priceDetailed") or val.get("price") or {}
     price_value = None
     price_str = "Цена не указана"
@@ -565,28 +475,51 @@ def _parse_item(val: dict) -> AvitoItem:
         price_value = int(price_info)
         price_str = f"{price_value:,} ₽".replace(",", " ")
 
+    # URL
     url_path = val.get("urlPath") or val.get("url") or ""
     if url_path and not url_path.startswith("http"):
         item_url = f"https://www.avito.ru{url_path}"
     else:
         item_url = url_path or "https://www.avito.ru"
 
-    image_url = _extract_image_url(val)
+    # Image
+    image_url = None
+    images = val.get("images") or []
+    if images and isinstance(images[0], dict):
+        img0 = images[0]
+        image_url = (
+            img0.get("864x648")
+            or img0.get("636x476")
+            or img0.get("432x324")
+            or img0.get("url")
+        )
+        # Sometimes image is a dict of size->url under "variants"
+        if not image_url and isinstance(img0.get("variants"), dict):
+            variants = img0["variants"]
+            image_url = (
+                variants.get("864x648")
+                or variants.get("636x476")
+                or next(iter(variants.values()), None)
+            )
 
+    # Location
     location = None
     loc = val.get("location") or {}
     if isinstance(loc, dict):
         location = loc.get("name")
 
+    # Description
     desc = val.get("description") or ""
     if isinstance(desc, dict):
         desc = desc.get("text") or ""
     if desc and len(desc) > 300:
         desc = desc[:300] + "..."
 
+    # Seller
     seller = val.get("seller") or {}
     seller_name = seller.get("name") if isinstance(seller, dict) else None
 
+    # Timestamp
     ts_raw = (
         val.get("sortTimeStamp")
         or val.get("time")
@@ -596,7 +529,7 @@ def _parse_item(val: dict) -> AvitoItem:
     ts: int | None = None
     if isinstance(ts_raw, (int, float)):
         ts_int = int(ts_raw)
-        if ts_int > 1_000_000_000_000:
+        if ts_int > 1_000_000_000_000:  # ms
             ts = ts_int // 1000
         else:
             ts = ts_int
@@ -613,59 +546,3 @@ def _parse_item(val: dict) -> AvitoItem:
         seller_name=seller_name,
         published_timestamp=ts,
     )
-
-
-# ---------------------------------------------------------------------------
-# Image extraction
-# ---------------------------------------------------------------------------
-
-_IMAGE_SIZE_KEYS = (
-    "864x864", "636x636", "472x472", "432x432",
-    "864x648", "636x476", "540x405", "432x324", "318x238",
-    "main", "big", "biggest", "default", "url",
-)
-
-
-def _extract_image_url(val: dict) -> str | None:
-    for key in ("images", "imagesAlt", "photos", "gallery"):
-        lst = val.get(key)
-        if isinstance(lst, list) and lst:
-            url = _image_from_dict(lst[0])
-            if url:
-                return url
-    for key in ("image", "cover", "mainImage", "thumbnail"):
-        obj = val.get(key)
-        if isinstance(obj, dict):
-            url = _image_from_dict(obj)
-            if url:
-                return url
-        elif isinstance(obj, str) and obj.startswith("http"):
-            return obj
-    return None
-
-
-def _image_from_dict(obj) -> str | None:
-    if isinstance(obj, str) and obj.startswith("http"):
-        return obj
-    if not isinstance(obj, dict):
-        return None
-    for k in _IMAGE_SIZE_KEYS:
-        v = obj.get(k)
-        if isinstance(v, str) and v.startswith("http"):
-            return v
-    for nest_key in ("variants", "sizes", "urls"):
-        nested = obj.get(nest_key)
-        if isinstance(nested, dict):
-            for k in _IMAGE_SIZE_KEYS:
-                v = nested.get(k)
-                if isinstance(v, str) and v.startswith("http"):
-                    return v
-            for v in nested.values():
-                if isinstance(v, str) and v.startswith("http"):
-                    return v
-    for v in obj.values():
-        if isinstance(v, str) and v.startswith("http") and (
-            ".jpg" in v or ".jpeg" in v or ".png" in v or ".webp" in v
-        ):
-            return v
-    return None

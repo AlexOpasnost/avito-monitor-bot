@@ -244,7 +244,8 @@ async def handle_url(message: Message):
         parse_mode="HTML",
     )
     try:
-        initial_items = await fetch_search_items(url)
+        proxy = config.proxy_list[0] if config.proxy_list else None
+        initial_items = await fetch_search_items(url, proxy)
     except Exception as e:
         logger.exception("initial scan failed for sub #%d", sub_id)
         initial_items = None

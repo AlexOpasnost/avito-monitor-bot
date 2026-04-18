@@ -80,7 +80,8 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
     while not stop_event.is_set():
         try:
             async with sem:
-                items = await fetch_search_items(sub["url"])
+                proxy = config.proxy_list[0] if config.proxy_list else None
+                items = await fetch_search_items(sub["url"], proxy)
                 # Spacing held INSIDE the semaphore so the next sub waits
                 # 5-15 s before its own scrape starts.
                 await asyncio.sleep(random.uniform(5.0, 15.0))
