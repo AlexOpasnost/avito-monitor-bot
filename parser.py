@@ -1,6 +1,8 @@
 """Avito parser — primary: mobile API, fallback: HTML hydration JSON."""
+import asyncio
 import html as html_lib
 import logging
+import random
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
@@ -11,6 +13,14 @@ import orjson
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# GLOBAL lock for ALL Avito requests — scheduler sub loops AND handlers'
+# initial scan funnel through here. Held for the entire fetch PLUS a
+# 5-10 s cooldown before release, so two scrapes never overlap and there
+# is always a gap before the next one can start. This is authoritative;
+# the scheduler's own Semaphore(1) only sees scheduler tasks, not the
+# handler's initial-scan call.
+_avito_lock = asyncio.Lock()
 
 
 @dataclass
@@ -33,9 +43,24 @@ class AvitoItem:
 
 async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) -> list[AvitoItem] | None:
     """Try mobile API first, fall back to HTML hydration JSON.
-    Rotates IP and retries on blocks (429/403)."""
-    import asyncio
+    Rotates IP and retries on blocks (429/403).
 
+    Holds the global _avito_lock for the entire fetch + post-cooldown so
+    no two scrapes EVER overlap, regardless of whether the caller is the
+    scheduler (via its own Semaphore) or the handler's initial-scan
+    (which bypasses the scheduler). Cooldown inside the lock guarantees
+    a 5-10 s gap before the next caller can start."""
+    async with _avito_lock:
+        logger.debug("[parser] avito-lock acquired by %s", url[:80])
+        try:
+            return await _fetch_search_items_inner(url, proxy, max_retries)
+        finally:
+            cooldown = random.uniform(5.0, 10.0)
+            logger.info("[parser] post-request cooldown %.1fs (lock held)", cooldown)
+            await asyncio.sleep(cooldown)
+
+
+async def _fetch_search_items_inner(url: str, proxy: str | None, max_retries: int) -> list[AvitoItem] | None:
     for attempt in range(max_retries):
         # Try mobile API first (fast, clean JSON)
         items, api_blocked = await _fetch_mobile_api(url, proxy)
