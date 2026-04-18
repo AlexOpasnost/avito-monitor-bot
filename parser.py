@@ -48,7 +48,7 @@ async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) 
             logger.info("[api] blocked, rotating IP before HTML fallback...")
             _invalidate_session()
             await rotate_ip()
-            await asyncio.sleep(3)
+            await asyncio.sleep(8)
 
         # Try HTML fallback with (possibly fresh) IP
         items, html_blocked = await _fetch_hydration_json(url, proxy)
@@ -63,19 +63,26 @@ async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) 
             logger.warning("HTML also blocked (attempt %d/%d), rotating IP again", attempt + 1, max_retries)
             _invalidate_session()
             await rotate_ip()
-            await asyncio.sleep(5)
+            await asyncio.sleep(8)
 
     logger.error("All %d attempts blocked for %s", max_retries, url[:80])
     return None
 
 
 async def rotate_ip() -> bool:
-    """Call proxy rotation URL (if configured)."""
+    """Call proxy rotation URL (if configured). Logs body so we can
+    verify the API actually rotated and isn't silently returning 200
+    with 'already rotating' or a rate-limit response."""
     if not config.proxy_rotate_url:
         return False
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(config.proxy_rotate_url)
+            body = (resp.text or "").strip()[:300]
+            logger.info(
+                "[proxy] changeip HTTP %d, body=%r",
+                resp.status_code, body,
+            )
             return resp.status_code == 200
     except Exception as e:
         logger.warning("rotate_ip failed: %s", e)
@@ -187,6 +194,15 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
 _cs_session = None
 _cs_created = 0.0
 
+# Modern UAs — cloudscraper's built-in pool has Chrome 54/62/66 (2017-18)
+# which Avito easily fingerprints as outdated. Override with current ones.
+_MODERN_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
 
 def _get_cloudscraper(proxy: str | None):
     """Get or create a cloudscraper session (reuse for cookies)."""
@@ -200,10 +216,13 @@ def _get_cloudscraper(proxy: str | None):
     s = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
+    # Override cloudscraper's outdated UA pool (Chrome 54/62/66) with a
+    # modern one so Avito doesn't flag the request on fingerprint alone.
+    modern_ua = random.choice(_MODERN_USER_AGENTS)
+    s.headers["User-Agent"] = modern_ua
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
-    # Log the UA cloudscraper picked for this session — should be the same
-    # for warmup AND subsequent requests (cloudscraper stores it on session)
+    # Log the UA override — should stay the same for warmup AND main requests
     session_ua = s.headers.get("User-Agent", "?")
     logger.info("[html] session id=%s, User-Agent=%s", id(s), session_ua)
 
