@@ -275,16 +275,135 @@ def _scrape_sync(target_url: str):
         pass
     time.sleep(random.uniform(1, 2))
 
-    # Extract hydration payload
-    try:
-        payload = _driver.execute_script(_EXTRACT_JS)
-    except Exception as e:
-        logger.warning("[parser] execute_script failed: %s", str(e)[:200])
-        return None
+    # Give Avito's SPA extra time to finish JS hydration after scroll
+    time.sleep(5)
 
+    # Diagnostic — what actually loaded?
+    page_title = _safe_title_sync()
+    try:
+        page_len = len(_driver.page_source or "")
+    except Exception:
+        page_len = 0
+    logger.info("[parser] loaded title=%r, page_source=%d chars", page_title[:80], page_len)
+
+    # Try hydration sources one by one
+    payload = None
+    for var in ("__initialData__", "__preloadedState__", "__mfe__"):
+        try:
+            v = _driver.execute_script(f"return window.{var} || null;")
+        except Exception as e:
+            logger.debug("[parser] read window.%s failed: %s", var, str(e)[:120])
+            continue
+        if v:
+            logger.info("[parser] hydration source: window.%s", var)
+            payload = v
+            break
+
+    # data-mfe-state script blobs
     if payload is None:
-        logger.warning("[parser] no hydration data on %s", target_url[:80])
+        try:
+            payload = _driver.execute_script(_MFE_STATE_JS)
+        except Exception as e:
+            logger.debug("[parser] mfe-state script extract failed: %s", str(e)[:120])
+        if payload is not None:
+            logger.info("[parser] hydration source: mfe-state script blob")
+
+    # Last-resort: BeautifulSoup scrape of data-item-id inside catalog-serp
+    if payload is None:
+        logger.warning(
+            "[parser] no hydration JSON — falling back to DOM scrape on %s",
+            target_url[:80],
+        )
+        dom_items = _scrape_dom_fallback(_driver.page_source or "")
+        if dom_items:
+            # Return a synthetic payload that _items_from_payload will accept
+            return {"state": {"data": {"catalog": {"items": dom_items}}}}
+        logger.warning("[parser] DOM fallback also produced no items")
     return payload
+
+
+# JS to pull the first data-mfe-state script blob that has state.data.catalog
+_MFE_STATE_JS = r"""
+const scripts = document.querySelectorAll('script[data-mfe-state="true"]');
+for (const s of scripts) {
+  const txt = (s.textContent || '').trim();
+  if (!txt || txt.includes('sandbox')) continue;
+  try {
+    const data = JSON.parse(txt);
+    if (data && data.state && data.state.data && data.state.data.catalog) {
+      return data;
+    }
+  } catch (e) {}
+}
+return null;
+"""
+
+
+def _scrape_dom_fallback(html: str) -> list[dict]:
+    """Pull items out of rendered HTML using BeautifulSoup. Only looks inside
+    the main catalog container so recommendations/similar widgets are ignored."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.warning("[parser] beautifulsoup4 not installed, DOM fallback unavailable")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    root = (
+        soup.select_one('[data-marker="catalog-serp"]')
+        or soup.select_one('[data-marker="catalog-list"]')
+        or soup
+    )
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for node in root.select("[data-item-id]"):
+        item_id = node.get("data-item-id") or ""
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+
+        # URL
+        link_el = node.select_one(f'a[href*="{item_id}"]') or node.select_one("a[href]")
+        href = link_el.get("href", "") if link_el else ""
+        url_path = href.split("?")[0] if href else f"/{item_id}"
+
+        # Title
+        title_el = (
+            node.select_one('[itemprop="name"]')
+            or node.select_one('[data-marker="item-title"]')
+            or node.select_one("h3")
+        )
+        title = title_el.get_text(strip=True) if title_el else f"Объявление {item_id}"
+
+        # Price
+        price_el = (
+            node.select_one('[itemprop="price"]')
+            or node.select_one('[data-marker="item-price"]')
+        )
+        price_text = price_el.get_text(strip=True) if price_el else ""
+        price_digits = re.sub(r"\D+", "", price_text)
+        price_value = int(price_digits) if price_digits else None
+
+        # Image
+        img_el = node.select_one("img")
+        img_src = ""
+        if img_el:
+            img_src = img_el.get("src") or img_el.get("data-src") or ""
+
+        items.append({
+            "id": item_id,
+            "title": title,
+            "urlPath": url_path,
+            "priceDetailed": (
+                {"value": price_value, "string": price_text} if price_value else (
+                    {"string": price_text} if price_text else {}
+                )
+            ),
+            "images": [{"url": img_src}] if img_src else [],
+        })
+    logger.info("[parser] DOM fallback extracted %d items", len(items))
+    return items
 
 
 def _wait_for_items_sync(target_url: str) -> bool:

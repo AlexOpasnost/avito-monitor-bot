@@ -5,3 +5,4 @@ orjson>=3.10.0
 python-dotenv==1.0.1
 undetected-chromedriver==3.5.5
 selenium>=4.15.0
+beautifulsoup4>=4.12.0
