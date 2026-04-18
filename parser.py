@@ -22,12 +22,13 @@ import httpx
 import orjson
 
 # Optional Selenium imports — only needed at runtime in production.
-# Unit tests don't need them. Catch ALL exceptions (not just ImportError):
-# uc 3.5.5 raises non-ImportError errors on Python 3.13 due to setuptools /
-# distutils removal, which the old ImportError-only clause swallowed silently.
+# Unit tests don't need them.
+# We use seleniumwire.undetected_chromedriver because authenticated proxies
+# (user:pass@host:port) do NOT work with Chromium's --proxy-server flag —
+# selenium-wire's mitmproxy-based tunnel handles auth transparently.
 _uc_import_error: str | None = None
 try:
-    import undetected_chromedriver as uc
+    import seleniumwire.undetected_chromedriver as uc  # type: ignore
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
@@ -100,29 +101,36 @@ def _build_driver_sync():
     """SYNC — must be called via asyncio.to_thread. Returns uc.Chrome."""
     if uc is None:
         raise RuntimeError(
-            f"undetected-chromedriver import failed: {_uc_import_error or 'not installed'}"
+            f"seleniumwire-undetected-chromedriver import failed: {_uc_import_error or 'not installed'}"
         )
     options = uc.ChromeOptions()
     options.add_argument("--lang=ru-RU,ru")
-    options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument(f"--user-agent={_USER_AGENT}")
     options.add_argument("--window-size=1366,768")
 
+    # Proxy goes through selenium-wire (mitmproxy tunnel) so user:pass auth
+    # is handled transparently — Chromium's --proxy-server does NOT support
+    # credentials in the URL.
+    sw_options: dict = {}
     if config.proxy_list:
         proxy = config.proxy_list[0]
-        # undetected-chromedriver's --proxy-server expects host:port (no creds)
-        # Strip scheme + auth if present; auth must be handled separately.
-        m = re.match(r"^(?:https?|socks5)://(?:[^:@]+:[^@]+@)?([^:/]+:\d+)/?$", proxy)
-        if m:
-            options.add_argument(f"--proxy-server={m.group(1)}")
-            logger.info("[parser] proxy bound to driver: %s", m.group(1))
-        else:
-            options.add_argument(f"--proxy-server={proxy}")
-            logger.warning("[parser] proxy URL not parsed cleanly — passed as-is: %s", proxy)
+        sw_options["proxy"] = {
+            "http": proxy,
+            "https": proxy,
+            "no_proxy": "localhost,127.0.0.1",
+        }
+        # Redact creds in log
+        redacted = re.sub(r"://[^@]+@", "://***@", proxy)
+        logger.info("[parser] proxy bound via selenium-wire: %s", redacted)
 
-    driver = uc.Chrome(options=options, headless=config.headless)
+    driver = uc.Chrome(
+        options=options,
+        headless=config.headless,
+        no_sandbox=True,
+        seleniumwire_options=sw_options,
+    )
     driver.set_page_load_timeout(45)
     return driver
 
