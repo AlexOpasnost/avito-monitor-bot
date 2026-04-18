@@ -130,6 +130,8 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
         try:
             scraper = _get_cloudscraper(proxy)
             proxies = {"http": proxy, "https": proxy} if proxy else None
+            req_ua = scraper.headers.get("User-Agent", "?")
+            logger.info("[api] request UA=%s", req_ua)
             resp = scraper.get(
                 full_url,
                 proxies=proxies,
@@ -140,17 +142,20 @@ async def _fetch_mobile_api(url: str, proxy: str | None) -> tuple[list[AvitoItem
                 },
                 timeout=30,
             )
-            return resp.status_code, resp.text
+            return resp.status_code, resp.text, dict(resp.headers)
         except Exception as e:
             logger.debug("[api] cloudscraper error: %s", e)
-            return 0, ""
+            return 0, "", {}
 
     try:
         loop = asyncio.get_running_loop()
-        status, text = await loop.run_in_executor(None, _do_request)
+        status, text, resp_headers = await loop.run_in_executor(None, _do_request)
 
         if status in (429, 403):
-            logger.warning("[api] BLOCKED %d for %s", status, url[:80])
+            logger.warning(
+                "[api] BLOCKED %d for %s — response headers: %s",
+                status, url[:80], resp_headers,
+            )
             return None, True
         if status != 200:
             logger.debug("[api] HTTP %d for %s", status, url[:80])
@@ -196,22 +201,56 @@ def _get_cloudscraper(proxy: str | None):
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
     proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    # Log the UA cloudscraper picked for this session — should be the same
+    # for warmup AND subsequent requests (cloudscraper stores it on session)
+    session_ua = s.headers.get("User-Agent", "?")
+    logger.info("[html] session id=%s, User-Agent=%s", id(s), session_ua)
+
+    # Verify proxy is actually routing traffic — same session, same proxy
+    try:
+        ip_r = s.get("https://api.ipify.org?format=json", proxies=proxies, timeout=15)
+        if ip_r.status_code == 200:
+            logger.info("[html] pre-warmup visible IP via proxy: %s", (ip_r.json() or {}).get("ip", "?"))
+        else:
+            logger.warning("[html] ipify returned HTTP %d", ip_r.status_code)
+    except Exception as e:
+        logger.warning("[html] ipify probe failed: %s", str(e)[:120])
+
     # Warmup: visit BOTH domains for cookies
     try:
         r = s.get("https://www.avito.ru/", proxies=proxies, timeout=20)
-        logger.info("[html] warmup www: HTTP %d, %d cookies", r.status_code, len(s.cookies))
+        logger.info(
+            "[html] warmup www: HTTP %d, %d cookies, UA=%s",
+            r.status_code, len(s.cookies), r.request.headers.get("User-Agent", "?"),
+        )
     except Exception as e:
         logger.warning("[html] warmup www failed: %s", e)
     try:
         r2 = s.get("https://m.avito.ru/", proxies=proxies, timeout=20)
-        logger.info("[html] warmup m: HTTP %d, %d cookies", r2.status_code, len(s.cookies))
+        logger.info(
+            "[html] warmup m: HTTP %d, %d cookies, UA=%s",
+            r2.status_code, len(s.cookies), r2.request.headers.get("User-Agent", "?"),
+        )
     except Exception as e:
         logger.warning("[html] warmup m failed: %s", e)
-    # Cool down after warmup — the mobile-proxy IP is now "warm" from
-    # two requests and Avito rate-limits if the main query follows
-    # immediately. 3-7 s pause mimics a human landing on the main page
-    # and clicking through to search results.
-    cooldown = random.uniform(3, 7)
+
+    # Diagnostic — which cookies did Avito give us?
+    try:
+        cookie_names = sorted({c.name for c in s.cookies})
+        cookie_domains = sorted({c.domain for c in s.cookies})
+        logger.info(
+            "[html] session cookies after warmup: %d (names=%s, domains=%s)",
+            len(s.cookies), cookie_names[:12], cookie_domains,
+        )
+    except Exception as e:
+        logger.debug("[html] cookie dump err: %s", e)
+
+    # Cooldown — bumped to 15-25s. 3-7s wasn't enough; Avito's rate-limit
+    # sliding window seems to be ~10-15s for a mobile-proxy IP that just
+    # did 3 consecutive connects (ipify + www + m). Mimic a human reading
+    # the main page before clicking through to search.
+    cooldown = random.uniform(15, 25)
     logger.info("[html] warmup cooldown %.1fs", cooldown)
     time.sleep(cooldown)
     _cs_session = s
@@ -219,13 +258,16 @@ def _get_cloudscraper(proxy: str | None):
     return s
 
 
-def _fetch_html_sync(url: str, proxy: str | None) -> tuple[int, str] | None:
-    """Fetch Avito HTML with cloudscraper (sync, runs in thread)."""
+def _fetch_html_sync(url: str, proxy: str | None):
+    """Fetch Avito HTML with cloudscraper (sync, runs in thread).
+    Returns (status, html, response_headers) or None on error."""
     try:
         s = _get_cloudscraper(proxy)
         proxies = {"http": proxy, "https": proxy} if proxy else None
+        req_ua = s.headers.get("User-Agent", "?")
+        logger.info("[html] request UA=%s, session id=%s", req_ua, id(s))
         resp = s.get(url, proxies=proxies, timeout=60, allow_redirects=False)
-        return resp.status_code, resp.text
+        return resp.status_code, resp.text, dict(resp.headers)
     except Exception as e:
         logger.debug("[html] sync fetch error: %s", e)
         return None
@@ -252,9 +294,12 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
         resp_data = await loop.run_in_executor(None, lambda: _fetch_html_sync(url, proxy))
         if resp_data is None:
             return None, False
-        status, html = resp_data
+        status, html, resp_headers = resp_data
         if status in (429, 403):
-            logger.warning("[html] BLOCKED %d for %s", status, url[:80])
+            logger.warning(
+                "[html] BLOCKED %d for %s — response headers: %s",
+                status, url[:80], resp_headers,
+            )
             return None, True
         if status in (301, 302, 303, 307, 308):
             logger.warning("[html] REDIRECT %d (block) for %s", status, url[:80])
