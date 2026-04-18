@@ -1,30 +1,36 @@
-"""Avito parser — Playwright (real Chromium) singleton + per-subscription pages.
+"""Avito parser — undetected-chromedriver (real Chrome, low-level patched).
 
 Architecture:
-  - ONE Playwright Chromium (headless on server, headed locally via HEADLESS=false)
-  - ONE BrowserContext (locale ru-RU, tz Europe/Moscow, no_viewport for natural
-    window size, real Chrome Windows UA, mobile proxy if configured)
-  - Anti-detect via add_init_script (no playwright-stealth — it leaks its own
-    patches and is detected by some anti-bot systems)
-  - Per-subscription Page kept open across cycles (page.reload every 5-10 min)
-  - Human-like behavior: random delays before/after navigation, scroll
+  - ONE undetected_chromedriver.Chrome instance for the entire bot lifetime
+  - Selenium is sync — async wrappers run all driver calls in a thread pool
+    via asyncio.to_thread
+  - All Avito interactions are serialized through a single asyncio.Lock so
+    only one navigation happens at a time
+  - Per-request: driver.get(url) -> wait for [data-marker="item"] ->
+    human-like delays + scroll -> execute_script returns hydration payload
+  - On block: rotate IP -> driver.get(url) again
 """
 import asyncio
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import unquote
 
 import httpx
 import orjson
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    async_playwright,
-)
+
+# Optional Selenium imports — only needed at runtime in production.
+# Unit tests don't need them (they only test pure-python parsing helpers).
+try:
+    import undetected_chromedriver as uc
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+except ImportError:  # pragma: no cover
+    uc = None  # type: ignore
+    By = EC = WebDriverWait = None  # type: ignore
 
 from config import config
 
@@ -50,7 +56,7 @@ class AvitoItem:
 
 
 # ---------------------------------------------------------------------------
-# Singleton browser + per-subscription pages
+# Singleton driver
 # ---------------------------------------------------------------------------
 
 _USER_AGENT = (
@@ -58,14 +64,10 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-_pw: Playwright | None = None
-_browser: Browser | None = None
-_context: BrowserContext | None = None
-_pages: dict[str, Page] = {}  # key (URL) -> Page
-_pages_lock = asyncio.Lock()
-# Serialize ALL Avito interactions across the whole bot — only one
-# scrape (reload + evaluate) at a time even with many subs.
-_avito_lock = asyncio.Lock()
+_driver = None  # uc.Chrome | None — type hint omitted so unit tests can import without selenium
+# All Selenium calls go through this lock — Selenium is single-threaded,
+# and Avito should never see two simultaneous requests anyway.
+_driver_lock = asyncio.Lock()
 
 
 # Strict catalog paths inside the hydration payload
@@ -86,139 +88,62 @@ _BLOCK_PHRASES = (
 )
 
 
-def _proxy_dict_for_pw() -> dict | None:
-    """Convert proxy URL into Playwright's proxy dict shape:
-       {"server": "scheme://host:port", "username": ..., "password": ...}"""
-    if not config.proxy_list:
-        return None
-    p = config.proxy_list[0]
-    m = re.match(r"^(https?|socks5)://(?:([^:@]+):([^@]+)@)?([^:/]+):(\d+)/?$", p)
-    if not m:
-        logger.warning("[proxy] cannot parse: %s", p)
-        return None
-    scheme, user, password, host, port = m.groups()
-    out: dict = {"server": f"{scheme}://{host}:{port}"}
-    if user:
-        out["username"] = user
-    if password:
-        out["password"] = password
-    return out
-
-
 # ---------------------------------------------------------------------------
-# Lifecycle (called from bot.py on startup/shutdown)
+# Lifecycle
 # ---------------------------------------------------------------------------
+
+def _build_driver_sync():
+    """SYNC — must be called via asyncio.to_thread. Returns uc.Chrome."""
+    if uc is None:
+        raise RuntimeError("undetected-chromedriver not installed")
+    options = uc.ChromeOptions()
+    options.add_argument("--lang=ru-RU,ru")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(f"--user-agent={_USER_AGENT}")
+    options.add_argument("--window-size=1366,768")
+
+    if config.proxy_list:
+        proxy = config.proxy_list[0]
+        # undetected-chromedriver's --proxy-server expects host:port (no creds)
+        # Strip scheme + auth if present; auth must be handled separately.
+        m = re.match(r"^(?:https?|socks5)://(?:[^:@]+:[^@]+@)?([^:/]+:\d+)/?$", proxy)
+        if m:
+            options.add_argument(f"--proxy-server={m.group(1)}")
+            logger.info("[parser] proxy bound to driver: %s", m.group(1))
+        else:
+            options.add_argument(f"--proxy-server={proxy}")
+            logger.warning("[parser] proxy URL not parsed cleanly — passed as-is: %s", proxy)
+
+    driver = uc.Chrome(options=options, headless=config.headless)
+    driver.set_page_load_timeout(45)
+    return driver
+
 
 async def init_session() -> None:
-    """Launch ONE Chromium + ONE BrowserContext for the entire bot lifetime.
-
-    HEADLESS env var controls the mode:
-      HEADLESS=true  (default) — headless, for server (Railway + xvfb-run)
-      HEADLESS=false           — headed, for local testing (real window)
-    """
-    global _pw, _browser, _context
-    if _browser is not None:
+    """Launch ONE undetected Chrome for the entire bot lifetime."""
+    global _driver
+    if _driver is not None:
         return
-
-    proxy_cfg = _proxy_dict_for_pw()
-    headless = config.headless
-
-    _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=headless,
-        args=[
-            "--start-maximized",
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-        ],
-    )
-    ctx_kwargs: dict = dict(
-        user_agent=_USER_AGENT,
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-        no_viewport=True,  # natural window size, no fixed headless viewport
-        permissions=[],     # deny all — blocks WebRTC, geolocation, etc.
-        extra_http_headers={
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        },
-    )
-    if proxy_cfg:
-        ctx_kwargs["proxy"] = proxy_cfg
-    _context = await _browser.new_context(**ctx_kwargs)
-
-    # Anti-detect init script — replaces playwright-stealth which leaks
-    # its own patches and gets detected by some anti-bot systems.
-    await _context.add_init_script("""
-        // Remove webdriver flag
-        delete navigator.__proto__.webdriver;
-
-        // Fake plugins (headless has empty array)
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5]
-        });
-
-        // Languages matching locale
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['ru-RU', 'ru']
-        });
-
-        // Real Chrome always has this
-        window.chrome = { runtime: {} };
-
-        // Platform matching User-Agent (Windows)
-        Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
-        });
-
-        // Block WebRTC IP leak (prevents exposing datacenter IP via STUN)
-        const origRTC = window.RTCPeerConnection;
-        if (origRTC) {
-            window.RTCPeerConnection = function(...args) {
-                if (args[0]) args[0].iceServers = [];
-                return new origRTC(...args);
-            };
-            window.RTCPeerConnection.prototype = origRTC.prototype;
-        }
-        if (window.webkitRTCPeerConnection) {
-            window.webkitRTCPeerConnection = window.RTCPeerConnection;
-        }
-    """)
+    _driver = await asyncio.to_thread(_build_driver_sync)
     logger.info(
-        "[parser] Playwright launched (headless=%s, proxy=%s, anti-detect=on)",
-        headless, "yes" if proxy_cfg else "no",
+        "[parser] undetected-chromedriver started (headless=%s, proxy=%s)",
+        config.headless, "yes" if config.proxy_list else "no",
     )
 
 
 async def close_session() -> None:
-    global _pw, _browser, _context, _pages
-    for url, page in list(_pages.items()):
-        try:
-            await page.close()
-        except Exception:
-            pass
-    _pages.clear()
-    if _context:
-        try:
-            await _context.close()
-        except Exception:
-            pass
-        _context = None
-    if _browser:
-        try:
-            await _browser.close()
-        except Exception:
-            pass
-        _browser = None
-    if _pw:
-        try:
-            await _pw.stop()
-        except Exception:
-            pass
-        _pw = None
-    logger.info("[parser] Playwright closed")
+    global _driver
+    if _driver is None:
+        return
+    drv = _driver
+    _driver = None
+    try:
+        await asyncio.to_thread(drv.quit)
+    except Exception as e:
+        logger.debug("[parser] driver quit err: %s", e)
+    logger.info("[parser] undetected-chromedriver stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -226,9 +151,6 @@ async def close_session() -> None:
 # ---------------------------------------------------------------------------
 
 async def rotate_ip() -> bool:
-    """Hit the mobile-proxy rotation endpoint to get a fresh IP. The browser
-    keeps the same context+proxy URL — only the underlying mobile IP changes,
-    so a page.reload() will use it automatically."""
     if not config.proxy_rotate_url:
         return False
     try:
@@ -258,7 +180,6 @@ async def check_proxy_ip() -> str | None:
 # ---------------------------------------------------------------------------
 
 def _ensure_sort_by_date(url: str) -> str:
-    """Append &s=104 (sort by date desc) without re-encoding the URL."""
     if re.search(r"[?&]s=\d+", url):
         return url
     sep = "&" if "?" in url else "?"
@@ -266,148 +187,108 @@ def _ensure_sort_by_date(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Page registry — one page per subscription URL, kept open across cycles
-# ---------------------------------------------------------------------------
-
-async def _get_or_create_page(target_url: str) -> Page:
-    """Get the existing page for this URL or create+navigate a new one.
-    Caller MUST hold _avito_lock."""
-    if target_url in _pages:
-        page = _pages[target_url]
-        if not page.is_closed():
-            return page
-        del _pages[target_url]
-
-    page = await _context.new_page()
-
-    # Human-like delay before first navigation
-    await asyncio.sleep(random.uniform(2, 5))
-
-    try:
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
-    except Exception as e:
-        logger.warning("[parser] initial goto failed for %s: %s", target_url[:80], e)
-        try:
-            await page.close()
-        except Exception:
-            pass
-        raise
-
-    # Wait for full hydration
-    await _wait_for_items(page, target_url)
-
-    _pages[target_url] = page
-    logger.info("[parser] page created for %s", target_url[:80])
-    return page
-
-
-# ---------------------------------------------------------------------------
-# Public API
+# Public API — async wrapper around sync Selenium scrape
 # ---------------------------------------------------------------------------
 
 async def fetch_search_items(url: str, *_unused) -> list[AvitoItem] | None:
-    """Reload the per-subscription page, extract catalog items.
-
-    Holds the GLOBAL avito-lock for the entire reload+extract so two
-    subs never reload simultaneously. On block: rotate IP and reload
-    once more; if still blocked, return None and let the scheduler
-    skip the cycle."""
-    if _browser is None:
-        logger.error("[parser] browser not initialised — call init_session() first")
+    """Navigate to URL and return parsed catalog items, or None on failure.
+    Holds the global lock — only one Avito request at a time."""
+    if _driver is None:
+        logger.error("[parser] driver not initialised — call init_session() first")
         return None
 
     target_url = _ensure_sort_by_date(url)
 
-    async with _avito_lock:
+    async with _driver_lock:
         try:
-            page = await _get_or_create_page(target_url)
+            payload = await asyncio.to_thread(_scrape_sync, target_url)
         except Exception as e:
-            logger.warning("[parser] could not create page: %s", str(e)[:200])
+            logger.warning("[parser] scrape error for %s: %s", target_url[:80], str(e)[:200])
             return None
 
-        return await _scrape_page(page, target_url)
+        if payload is None:
+            return None
+
+        items = _items_from_payload(payload)
+        if items is None:
+            logger.warning("[parser] could not extract items from payload on %s", target_url[:80])
+            return None
+        logger.info("[parser] OK %d items for %s", len(items), target_url[:80])
+        return items
 
 
-async def _scrape_page(page: Page, target_url: str) -> list[AvitoItem] | None:
-    # Random pre-reload delay (human doesn't hit F5 instantly every cycle)
-    await asyncio.sleep(random.uniform(2, 5))
+# ---------------------------------------------------------------------------
+# SYNC Selenium scrape — runs in a thread via asyncio.to_thread
+# ---------------------------------------------------------------------------
+
+def _scrape_sync(target_url: str):
+    """Returns the hydration payload (dict/str) or None.
+    May call into the proxy-rotation HTTP client through the event loop —
+    we use asyncio.run_coroutine_threadsafe for that single side-effect."""
+    # Random pre-navigation delay (human pace)
+    time.sleep(random.uniform(2, 5))
 
     try:
-        await page.reload(wait_until="domcontentloaded", timeout=45_000)
+        _driver.get(target_url)
     except Exception as e:
-        logger.warning("[parser] reload failed for %s: %s", target_url[:80], str(e)[:200])
+        logger.warning("[parser] driver.get failed: %s", str(e)[:200])
         return None
 
-    if not await _wait_for_items(page, target_url):
+    # Wait for items to render
+    if not _wait_for_items_sync(target_url):
         return None
 
-    # Check for block
-    title = await _safe_title(page)
+    # Block check
+    title = _safe_title_sync()
     if _looks_like_block(title):
-        if config.proxy_list:
-            logger.warning(
-                "[parser] BLOCKED (title=%r) for %s — rotating IP + fresh goto",
-                title[:60], target_url[:80],
-            )
-            await rotate_ip()
-            await asyncio.sleep(10)
-        else:
-            logger.warning(
-                "[parser] BLOCKED (title=%r) for %s — no proxy, retrying goto",
-                title[:60], target_url[:80],
-            )
-        # Full goto, NOT reload — reload carries cookies/state from blocked response
-        await asyncio.sleep(random.uniform(2, 5))
+        logger.warning(
+            "[parser] BLOCKED (title=%r) for %s — rotating IP and retrying goto",
+            title[:60], target_url[:80],
+        )
+        if config.proxy_rotate_url:
+            _rotate_ip_sync()
+            time.sleep(10)
+        time.sleep(random.uniform(2, 5))
         try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
+            _driver.get(target_url)
         except Exception as e:
-            logger.warning("[parser] goto after rotation failed: %s", str(e)[:200])
+            logger.warning("[parser] driver.get after rotation failed: %s", str(e)[:200])
             return None
-        if not await _wait_for_items(page, target_url):
+        if not _wait_for_items_sync(target_url):
             return None
-        title = await _safe_title(page)
+        title = _safe_title_sync()
         if _looks_like_block(title):
-            logger.warning("[parser] still BLOCKED after rotation+goto (title=%r)", title[:60])
+            logger.warning("[parser] still BLOCKED after rotation (title=%r)", title[:60])
             return None
 
-    # Human-like post-load behavior: wait, scroll, wait, then read data
-    await asyncio.sleep(random.uniform(3, 5))
+    # Human-like post-load behavior
+    time.sleep(random.uniform(3, 5))
     try:
-        await page.mouse.wheel(0, random.randint(300, 700))
+        _driver.execute_script("window.scrollBy(0, arguments[0])", random.randint(300, 700))
     except Exception:
         pass
-    await asyncio.sleep(random.uniform(1, 2))
+    time.sleep(random.uniform(1, 2))
 
     # Extract hydration payload
     try:
-        payload = await page.evaluate(_EXTRACT_JS)
+        payload = _driver.execute_script(_EXTRACT_JS)
     except Exception as e:
-        logger.warning("[parser] page.evaluate failed: %s", str(e)[:200])
+        logger.warning("[parser] execute_script failed: %s", str(e)[:200])
         return None
 
     if payload is None:
         logger.warning("[parser] no hydration data on %s", target_url[:80])
-        return None
-
-    items = _items_from_payload(payload)
-    if items is None:
-        logger.warning("[parser] could not extract items from payload on %s", target_url[:80])
-        return None
-    logger.info("[parser] OK %d items for %s", len(items), target_url[:80])
-    return items
+    return payload
 
 
-async def _wait_for_items(page: Page, target_url: str) -> bool:
-    """Wait for the page to fully hydrate: networkidle + item elements."""
+def _wait_for_items_sync(target_url: str) -> bool:
     try:
-        await page.wait_for_load_state("networkidle", timeout=20_000)
+        WebDriverWait(_driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-marker="item"]'))
+        )
+        return True
     except Exception:
-        pass
-
-    try:
-        await page.wait_for_selector('[data-marker="item"]', timeout=15_000)
-    except Exception:
-        title = await _safe_title(page)
+        title = _safe_title_sync()
         if _looks_like_block(title):
             return True  # caller handles block detection
         logger.warning(
@@ -415,14 +296,27 @@ async def _wait_for_items(page: Page, target_url: str) -> bool:
             target_url[:80], title[:60],
         )
         return True  # still try to extract
-    return True
 
 
-async def _safe_title(page: Page) -> str:
+def _safe_title_sync() -> str:
     try:
-        return await page.title()
+        return _driver.title or ""
     except Exception:
         return ""
+
+
+def _rotate_ip_sync() -> bool:
+    """Sync IP rotation — uses httpx in sync mode, NOT the async one above.
+    Called from within the threaded scrape so we can't await."""
+    if not config.proxy_rotate_url:
+        return False
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(config.proxy_rotate_url)
+            return resp.status_code == 200
+    except Exception as e:
+        logger.warning("rotate_ip (sync) failed: %s", e)
+        return False
 
 
 def _looks_like_block(text: str) -> bool:
@@ -432,29 +326,24 @@ def _looks_like_block(text: str) -> bool:
     return any(p in t for p in _BLOCK_PHRASES)
 
 
-# JS executed inside the page. Tries window globals first, then walks
-# data-mfe-state script tags returning the FIRST blob whose
-# state.data.catalog exists. We do NOT extract items here — Python-side
-# code applies the strict path lookup and item parsing.
+# JS to extract Avito hydration data
 _EXTRACT_JS = r"""
-() => {
-  for (const g of ['__initialData__', '__preloadedState__', '__mfe__']) {
-    const v = window[g];
-    if (v !== undefined && v !== null) return v;
-  }
-  const scripts = document.querySelectorAll('script[data-mfe-state="true"]');
-  for (const s of scripts) {
-    const txt = (s.textContent || '').trim();
-    if (!txt || txt.includes('sandbox')) continue;
-    try {
-      const data = JSON.parse(txt);
-      if (data && data.state && data.state.data && data.state.data.catalog) {
-        return data;
-      }
-    } catch (e) {}
-  }
-  return null;
+for (const g of ['__initialData__', '__preloadedState__', '__mfe__']) {
+  const v = window[g];
+  if (v !== undefined && v !== null) return v;
 }
+const scripts = document.querySelectorAll('script[data-mfe-state="true"]');
+for (const s of scripts) {
+  const txt = (s.textContent || '').trim();
+  if (!txt || txt.includes('sandbox')) continue;
+  try {
+    const data = JSON.parse(txt);
+    if (data && data.state && data.state.data && data.state.data.catalog) {
+      return data;
+    }
+  } catch (e) {}
+}
+return null;
 """
 
 
@@ -463,8 +352,6 @@ _EXTRACT_JS = r"""
 # ---------------------------------------------------------------------------
 
 def _items_from_payload(payload) -> list[AvitoItem] | None:
-    """Walk the hydration payload to the main catalog and parse items.
-    NEVER recurses into recommendations/similar/viewedItems blocks."""
     data = payload
     if isinstance(data, str):
         try:
@@ -505,8 +392,6 @@ def _walk_path(data, path: tuple[str, ...]):
 
 
 def _items_from_raw_list(items_raw) -> list[AvitoItem]:
-    """Convert the raw catalog.items list into AvitoItems. Skips wrappers
-    that are not 'item' type (banners/snippets if Avito ever inlines them)."""
     items: list[AvitoItem] = []
     for raw_item in items_raw:
         if not isinstance(raw_item, dict):
