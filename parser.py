@@ -22,15 +22,19 @@ import httpx
 import orjson
 
 # Optional Selenium imports — only needed at runtime in production.
-# Unit tests don't need them (they only test pure-python parsing helpers).
+# Unit tests don't need them. Catch ALL exceptions (not just ImportError):
+# uc 3.5.5 raises non-ImportError errors on Python 3.13 due to setuptools /
+# distutils removal, which the old ImportError-only clause swallowed silently.
+_uc_import_error: str | None = None
 try:
     import undetected_chromedriver as uc
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
-except ImportError:  # pragma: no cover
+except Exception as _e:  # pragma: no cover
     uc = None  # type: ignore
     By = EC = WebDriverWait = None  # type: ignore
+    _uc_import_error = f"{type(_e).__name__}: {_e}"
 
 from config import config
 
@@ -95,7 +99,9 @@ _BLOCK_PHRASES = (
 def _build_driver_sync():
     """SYNC — must be called via asyncio.to_thread. Returns uc.Chrome."""
     if uc is None:
-        raise RuntimeError("undetected-chromedriver not installed")
+        raise RuntimeError(
+            f"undetected-chromedriver import failed: {_uc_import_error or 'not installed'}"
+        )
     options = uc.ChromeOptions()
     options.add_argument("--lang=ru-RU,ru")
     options.add_argument("--no-sandbox")
