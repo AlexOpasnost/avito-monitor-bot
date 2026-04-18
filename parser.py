@@ -109,6 +109,11 @@ def _build_driver_sync():
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument(f"--user-agent={_USER_AGENT}")
     options.add_argument("--window-size=1366,768")
+    # selenium-wire intercepts HTTPS via a self-signed CA — Chrome must
+    # trust it or every Avito page turns into a "Privacy error" screen.
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--ignore-ssl-errors=yes")
+    options.set_capability("acceptInsecureCerts", True)
 
     # Proxy goes through selenium-wire (mitmproxy tunnel) so user:pass auth
     # is handled transparently — Chromium's --proxy-server does NOT support
