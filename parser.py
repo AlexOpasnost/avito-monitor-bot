@@ -70,18 +70,23 @@ async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) 
 
 
 async def rotate_ip() -> bool:
-    """Call proxy rotation URL (if configured). Logs body so we can
-    verify the API actually rotated and isn't silently returning 200
-    with 'already rotating' or a rate-limit response."""
-    if not config.proxy_rotate_url:
+    """Call proxy rotation URL (if configured). Logs the exact URL being
+    hit AND the response body so we can verify the env var is not
+    truncated and the API actually rotated."""
+    rotate_url = config.proxy_rotate_url
+    if not rotate_url:
         return False
+    # Log the full URL (repr so any truncation / whitespace / special chars
+    # are visible). If the URL ends with just "?" or is missing the
+    # proxy_key= parameter, the env var in .env / Railway is wrong.
+    logger.info("[proxy] rotate URL: %r (len=%d)", rotate_url, len(rotate_url))
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(config.proxy_rotate_url)
+            resp = await client.get(rotate_url)
             body = (resp.text or "").strip()[:300]
             logger.info(
-                "[proxy] changeip HTTP %d, body=%r",
-                resp.status_code, body,
+                "[proxy] changeip HTTP %d, body=%r, final URL=%r",
+                resp.status_code, body, str(resp.url),
             )
             return resp.status_code == 200
     except Exception as e:
