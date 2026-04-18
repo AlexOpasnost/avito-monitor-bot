@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import config
 from database import db
 from parser import AvitoItem, fetch_search_items
 

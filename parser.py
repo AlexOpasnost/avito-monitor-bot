@@ -185,6 +185,7 @@ _cs_created = 0.0
 
 def _get_cloudscraper(proxy: str | None):
     """Get or create a cloudscraper session (reuse for cookies)."""
+    import random
     import time
     global _cs_session, _cs_created
     now = time.time()
@@ -206,6 +207,13 @@ def _get_cloudscraper(proxy: str | None):
         logger.info("[html] warmup m: HTTP %d, %d cookies", r2.status_code, len(s.cookies))
     except Exception as e:
         logger.warning("[html] warmup m failed: %s", e)
+    # Cool down after warmup — the mobile-proxy IP is now "warm" from
+    # two requests and Avito rate-limits if the main query follows
+    # immediately. 3-7 s pause mimics a human landing on the main page
+    # and clicking through to search results.
+    cooldown = random.uniform(3, 7)
+    logger.info("[html] warmup cooldown %.1fs", cooldown)
+    time.sleep(cooldown)
     _cs_session = s
     _cs_created = now
     return s
