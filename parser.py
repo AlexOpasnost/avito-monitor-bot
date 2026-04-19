@@ -459,6 +459,10 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
     # Parse into AvitoItems — skip non-item rows (banners / snippets)
     items: list[AvitoItem] = []
     skipped_non_item = 0
+    missing_image_sample = None  # (item_id, raw_keys) for one bad item
+    missing_location_sample = None
+    missing_desc_sample = None
+    missing_ts_sample = None
     for raw in items_raw:
         if not isinstance(raw, dict):
             continue
@@ -472,14 +476,50 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
         if not (val.get("id") or val.get("itemId")):
             continue
         try:
-            items.append(_parse_api_item(val))
+            parsed = _parse_api_item(val)
+            items.append(parsed)
+            # Capture one sample per missing field — enough to know the
+            # catalog shape without flooding logs.
+            if parsed.image_url is None and missing_image_sample is None:
+                missing_image_sample = (parsed.avito_id, list(val.keys())[:30])
+            if parsed.location is None and missing_location_sample is None:
+                missing_location_sample = (parsed.avito_id, list(val.keys())[:30])
+            if parsed.description is None and missing_desc_sample is None:
+                missing_desc_sample = (parsed.avito_id, list(val.keys())[:30])
+            if parsed.published_timestamp is None and missing_ts_sample is None:
+                missing_ts_sample = (parsed.avito_id, list(val.keys())[:30])
         except Exception:
             pass
+
     logger.info(
         "[html] mfe #%d is CATALOG: %d raw rows -> %d items (%d non-item rows skipped)",
         idx, len(items_raw), len(items), skipped_non_item,
     )
+
+    # Completeness stats — how many items have each field
     if items:
+        total = len(items)
+        with_image = sum(1 for i in items if i.image_url)
+        with_loc = sum(1 for i in items if i.location)
+        with_desc = sum(1 for i in items if i.description)
+        with_ts = sum(1 for i in items if i.published_timestamp)
+        logger.info(
+            "[html] completeness: image=%d/%d, location=%d/%d, desc=%d/%d, date=%d/%d",
+            with_image, total, with_loc, total, with_desc, total, with_ts, total,
+        )
+        if missing_image_sample:
+            logger.info("[html] MISSING image: item=%s, val.keys=%s",
+                        *missing_image_sample)
+        if missing_location_sample:
+            logger.info("[html] MISSING location: item=%s, val.keys=%s",
+                        *missing_location_sample)
+        if missing_desc_sample:
+            logger.info("[html] MISSING description: item=%s, val.keys=%s",
+                        *missing_desc_sample)
+        if missing_ts_sample:
+            logger.info("[html] MISSING date: item=%s, val.keys=%s",
+                        *missing_ts_sample)
+
         sample_paths = [i.url.replace("https://www.avito.ru", "")[:60] for i in items[:3]]
         logger.info("[html] sample item paths: %s", sample_paths)
     return items
