@@ -11,7 +11,14 @@ from aiogram.types import BufferedInputFile
 
 from config import config
 from database import db
-from parser import AvitoItem, download_image_bytes, fetch_search_items
+from parser import (
+    SearchItem,
+    download_image_bytes,
+    fetch_search_items,
+)
+
+# Back-compat alias used in this module
+AvitoItem = SearchItem
 
 logger = logging.getLogger(__name__)
 
@@ -141,30 +148,34 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
     logger.info("Sub #%d loop stopped", sub["id"])
 
 
-async def _process_items(sub: dict, items: list[AvitoItem], bot: Bot):
+async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
     is_first_scan = sub.get("last_checked_at") is None
 
-    # Trust Avito 100% — items already match the URL's filters server-side.
-    # We do NOT do client-side price/category/keyword filtering.
-
+    # Group by source so a single batch insert can be made even if a
+    # subscription accidentally returns items from more than one site
+    # (shouldn't happen, but harmless safety).
     if is_first_scan:
-        ids = [i.avito_id for i in items if i.avito_id]
-        await db.mark_items_sent_batch(sub["id"], ids)
-        logger.info("Sub #%d first scan: marked %d items as seen", sub["id"], len(ids))
+        by_source: dict[str, list[str]] = {}
+        for i in items:
+            if i.external_id:
+                by_source.setdefault(i.source, []).append(i.external_id)
+        for src, ids in by_source.items():
+            await db.mark_items_sent_batch(sub["id"], ids, source=src)
+        total = sum(len(v) for v in by_source.values())
+        logger.info("Sub #%d first scan: marked %d items as seen", sub["id"], total)
         return
 
-    # Find new items
-    new_items: list[AvitoItem] = []
+    # Find new items (not yet in sent_items)
+    new_items: list[SearchItem] = []
     for item in items:
-        if not item.avito_id:
+        if not item.external_id:
             continue
-        if not await db.is_item_sent(sub["id"], item.avito_id):
+        if not await db.is_item_sent(sub["id"], item.external_id, source=item.source):
             new_items.append(item)
 
     if not new_items:
         return
 
-    # Filter by age (skip items older than 2 days)
     now_ts = int(time.time())
     cutoff = now_ts - MAX_AGE_SECONDS
     fresh = [
@@ -172,7 +183,6 @@ async def _process_items(sub: dict, items: list[AvitoItem], bot: Bot):
         if not i.published_timestamp or i.published_timestamp >= cutoff
     ]
 
-    # Limit per cycle
     to_send = fresh[:MAX_ITEMS_PER_CYCLE]
 
     logger.info(
@@ -180,39 +190,47 @@ async def _process_items(sub: dict, items: list[AvitoItem], bot: Bot):
         sub["id"], len(new_items), len(fresh), len(to_send),
     )
 
-    sent_ids: set[str] = set()
+    sent_keys: set[tuple[str, str]] = set()
     for item in to_send:
         try:
             await _send_notification(bot, sub, item)
-            sent_ids.add(item.avito_id)
-            await db.mark_item_sent(sub["id"], item.avito_id)
+            sent_keys.add((item.source, item.external_id))
+            await db.mark_item_sent(sub["id"], item.external_id, source=item.source)
         except Exception as e:
-            logger.warning("Send failed for %s: %s", item.avito_id, e)
+            logger.warning("Send failed for %s/%s: %s", item.source, item.external_id, e)
         await asyncio.sleep(0.5)
 
-    # Mark everything else (too old or beyond the per-cycle limit) as seen
-    leftover_ids = [
-        i.avito_id for i in new_items
-        if i.avito_id and i.avito_id not in sent_ids
-    ]
-    if leftover_ids:
-        await db.mark_items_sent_batch(sub["id"], leftover_ids)
+    # Mark leftovers as seen so we don't re-process them next cycle
+    leftover_by_source: dict[str, list[str]] = {}
+    for i in new_items:
+        key = (i.source, i.external_id)
+        if i.external_id and key not in sent_keys:
+            leftover_by_source.setdefault(i.source, []).append(i.external_id)
+    for src, ids in leftover_by_source.items():
+        await db.mark_items_sent_batch(sub["id"], ids, source=src)
 
 
-async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
+_SOURCE_BUTTON_TEXT = {
+    "avito":   "🔗 Открыть на Авито",
+    "kufar":   "🔗 Открыть на Kufar",
+    "olx":     "🔗 Открыть на OLX",
+    "vinted":  "🔗 Открыть на Vinted",
+    "mercari": "🔗 Открыть на Mercari",
+    "goofish": "🔗 Открыть на Goofish",
+}
+
+
+async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
     text = _format_notification(item)
+    button_text = _SOURCE_BUTTON_TEXT.get(item.source, "🔗 Открыть объявление")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть на Авито", url=item.url)],
+        [InlineKeyboardButton(text=button_text, url=item.url)],
     ])
 
-    # Try photo first — Telegram renders the image above the caption
-    # which gives the nicest look. Fall back to text-only on any error
-    # (bad image URL, Telegram refusing the URL, etc.).
     if item.image_url:
         caption = text if len(text) <= 1024 else text[:1020] + "…"
-        # Download the photo ourselves through the proxy. Telegram's
-        # server can't reach Avito's image CDN directly (Avito blocks
-        # Telegram's IPs and returns a captcha instead of the image).
+        # Download via our proxy — Telegram can't fetch most marketplace
+        # CDNs directly (they block Telegram's server IPs).
         img_bytes = await download_image_bytes(item.image_url)
         if img_bytes:
             try:
@@ -224,13 +242,13 @@ async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
                 return
             except Exception as e:
                 logger.info(
-                    "send_photo (bytes) failed (%s) for %s — falling back to text",
-                    str(e)[:80], item.avito_id,
+                    "send_photo (bytes) failed (%s) for %s/%s — fallback to text",
+                    str(e)[:80], item.source, item.external_id,
                 )
         else:
             logger.info(
-                "[image] could not download %s for item %s",
-                item.image_url[:80], item.avito_id,
+                "[image] could not download %s for %s/%s",
+                item.image_url[:80], item.source, item.external_id,
             )
 
     await bot.send_message(

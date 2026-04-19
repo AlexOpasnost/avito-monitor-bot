@@ -129,13 +129,34 @@ class Database:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS filter_whitelist TEXT"
             )
-            # Ensure url column is TEXT (unbounded) — older databases may
-            # have been created with VARCHAR(N) which truncates long
-            # Avito URLs with filter base64 encoded in f=.
             await conn.execute(
                 "ALTER TABLE subscriptions ALTER COLUMN url TYPE TEXT"
             )
-            # Tracking table so one-shot data migrations run exactly once
+            # Multi-marketplace support — each subscription/sent-item is now
+            # tagged with its source ("avito", "kufar", "olx", ...).
+            await conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'avito'"
+            )
+            await conn.execute(
+                "ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'avito'"
+            )
+            # Backfill any NULLs that may have crept in from older rows.
+            await conn.execute(
+                "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
+            )
+            await conn.execute(
+                "UPDATE sent_items SET source='avito' WHERE source IS NULL"
+            )
+            # Per-(subscription, source, external_id) uniqueness so the same
+            # listing ID across different sources doesn't collide.
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_sent_items_sub_source_extid
+                ON sent_items(subscription_id, source, avito_id)
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sent_items_source ON sent_items(source)"
+            )
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS _migrations (
                     name TEXT PRIMARY KEY,
@@ -198,7 +219,8 @@ class Database:
 
     # --- Subscriptions ---
 
-    async def add_subscription(self, user_id: int, url: str) -> int | None:
+    async def add_subscription(self, user_id: int, url: str,
+                                source: str = "avito") -> int | None:
         async def _op(conn):
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM subscriptions "
@@ -208,8 +230,9 @@ class Database:
             if count >= config.max_subscriptions:
                 return None
             row = await conn.fetchrow(
-                "INSERT INTO subscriptions (user_id, url) VALUES ($1, $2) RETURNING id",
-                user_id, url,
+                "INSERT INTO subscriptions (user_id, url, source) "
+                "VALUES ($1, $2, $3) RETURNING id",
+                user_id, url, source,
             )
             return row["id"]
         return await self._execute(_op)
@@ -227,7 +250,8 @@ class Database:
     async def get_active_subscriptions(self):
         async def _op(conn):
             return await conn.fetch(
-                "SELECT s.id, s.url, s.user_id, s.last_checked_at, u.telegram_id "
+                "SELECT s.id, s.url, s.user_id, s.last_checked_at, "
+                "       COALESCE(s.source, 'avito') AS source, u.telegram_id "
                 "FROM subscriptions s "
                 "JOIN users u ON u.id = s.user_id "
                 "WHERE s.is_active = TRUE AND s.deleted = FALSE"
@@ -240,7 +264,8 @@ class Database:
         every cycle so updates from the user are picked up immediately."""
         async def _op(conn):
             return await conn.fetchrow(
-                "SELECT s.id, s.url, s.user_id, s.last_checked_at, u.telegram_id "
+                "SELECT s.id, s.url, s.user_id, s.last_checked_at, "
+                "       COALESCE(s.source, 'avito') AS source, u.telegram_id "
                 "FROM subscriptions s "
                 "JOIN users u ON u.id = s.user_id "
                 "WHERE s.id = $1 AND s.is_active = TRUE AND s.deleted = FALSE",
@@ -302,32 +327,36 @@ class Database:
 
     # --- Sent Items ---
 
-    async def is_item_sent(self, sub_id: int, avito_id: str) -> bool:
+    async def is_item_sent(self, sub_id: int, external_id: str,
+                            source: str = "avito") -> bool:
         async def _op(conn):
             return await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM sent_items "
-                "WHERE subscription_id = $1 AND avito_id = $2)",
-                sub_id, avito_id,
+                "WHERE subscription_id = $1 AND source = $2 AND avito_id = $3)",
+                sub_id, source, external_id,
             )
         return await self._execute(_op)
 
-    async def mark_item_sent(self, sub_id: int, avito_id: str):
+    async def mark_item_sent(self, sub_id: int, external_id: str,
+                              source: str = "avito"):
         async def _op(conn):
             await conn.execute(
-                "INSERT INTO sent_items (subscription_id, avito_id) VALUES ($1, $2) "
-                "ON CONFLICT DO NOTHING",
-                sub_id, avito_id,
+                "INSERT INTO sent_items (subscription_id, source, avito_id) "
+                "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                sub_id, source, external_id,
             )
         await self._execute(_op)
 
-    async def mark_items_sent_batch(self, sub_id: int, avito_ids: list[str]):
-        if not avito_ids:
+    async def mark_items_sent_batch(self, sub_id: int,
+                                     external_ids: list[str],
+                                     source: str = "avito"):
+        if not external_ids:
             return
         async def _op(conn):
             await conn.executemany(
-                "INSERT INTO sent_items (subscription_id, avito_id) VALUES ($1, $2) "
-                "ON CONFLICT DO NOTHING",
-                [(sub_id, aid) for aid in avito_ids if aid],
+                "INSERT INTO sent_items (subscription_id, source, avito_id) "
+                "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                [(sub_id, source, eid) for eid in external_ids if eid],
             )
         await self._execute(_op)
 

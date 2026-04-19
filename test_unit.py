@@ -1,4 +1,7 @@
-"""Offline unit tests for the cloudscraper parser internals."""
+"""Offline unit tests — no network required.
+
+Tests the Avito plugin's pure-python helpers + the dispatcher contract.
+"""
 import os
 
 os.environ.setdefault("BOT_TOKEN", "test")
@@ -6,80 +9,120 @@ os.environ.setdefault("DATABASE_URL", "postgresql://localhost/test")
 os.environ.setdefault("PROXY_LIST", "")
 os.environ.setdefault("PROXY_ROTATE_URL", "")
 
-from parser import _extract_items_from_json, _parse_api_item
+from parsers import SearchItem, detect_source, supported_sources
+from parsers.avito import (
+    AvitoSource,
+    _city_from_url_path,
+    _extract_image_url,
+    _extract_location,
+    _parse_item,
+)
 
 
-def test_parse_api_item_full():
+# ---------- dispatcher ----------
+
+def test_dispatcher_matches_avito():
+    s = detect_source("https://www.avito.ru/moskva/kvartiry")
+    assert s is not None and s.name == "avito"
+    s = detect_source("https://m.avito.ru/all/foo")
+    assert s is not None and s.name == "avito"
+    print("OK: dispatcher matches avito")
+
+
+def test_dispatcher_rejects_unknown():
+    assert detect_source("https://example.com/anything") is None
+    assert detect_source("") is None
+    assert detect_source(None) is None
+    print("OK: dispatcher rejects unknown")
+
+
+def test_supported_sources():
+    sources = supported_sources()
+    assert "avito" in sources
+    print(f"OK: supported sources = {sources}")
+
+
+# ---------- avito plugin internals ----------
+
+def test_avito_source_matches():
+    src = AvitoSource()
+    assert src.matches("https://www.avito.ru/x")
+    assert src.matches("https://m.avito.ru/x")
+    assert not src.matches("https://kufar.by/x")
+    print("OK: AvitoSource.matches")
+
+
+def test_parse_item_full():
     val = {
         "id": 12345,
         "title": "iPhone 13",
         "priceDetailed": {"value": 50000, "string": "50 000 ₽"},
         "urlPath": "/moskva/telefony/iphone_12345",
-        "images": [{"864x648": "https://example.com/img.jpg"}],
+        "images": [{"864x864": "https://avito.st/image/x.jpg"}],
         "location": {"name": "Москва"},
     }
-    item = _parse_api_item(val)
-    assert item.avito_id == "12345"
+    item = _parse_item(val)
+    assert isinstance(item, SearchItem)
+    assert item.source == "avito"
+    assert item.external_id == "12345"
     assert item.title == "iPhone 13"
     assert item.price_value == 50000
     assert item.url == "https://www.avito.ru/moskva/telefony/iphone_12345"
-    assert item.image_url == "https://example.com/img.jpg"
+    assert item.image_url == "https://avito.st/image/x.jpg"
     assert item.location == "Москва"
-    print("OK: _parse_api_item (full shape)")
+    print("OK: _parse_item full shape")
 
 
-def test_parse_api_item_plain_price():
+def test_parse_item_plain_price():
     val = {"id": 7, "title": "X", "price": 1000, "urlPath": "/x/7"}
-    item = _parse_api_item(val)
-    assert item.avito_id == "7"
+    item = _parse_item(val)
+    assert item.external_id == "7"
     assert item.price_value == 1000
-    print("OK: _parse_api_item (plain int price)")
+    print("OK: _parse_item plain int price")
 
 
-def test_extract_items_from_json_direct_catalog():
-    data = {"catalog": {"items": [
-        {"value": {"id": 1, "title": "A", "urlPath": "/a", "price": 100}},
-        {"value": {"id": 2, "title": "B", "urlPath": "/b", "price": 200}},
-        {"value": {"id": 3, "title": "C", "urlPath": "/c", "price": 300}},
-    ]}}
-    items = _extract_items_from_json(data)
-    assert len(items) == 3
-    assert items[0].avito_id == "1"
-    print("OK: _extract_items_from_json (catalog.items)")
-
-
-def test_extract_items_from_json_nested():
-    # _extract_items_from_json recurses into dict values > 1000 chars,
-    # so pad the nested block so the recursion guard is satisfied.
-    filler = {"description": "x" * 1500}
-    data = {
-        "state": {"data": {"catalog": {"items": [
-            {"value": {"id": 10, "urlPath": "/x/10", "price": 1, **filler}},
-            {"value": {"id": 11, "urlPath": "/x/11", "price": 1, **filler}},
-            {"value": {"id": 12, "urlPath": "/x/12", "price": 1, **filler}},
-        ]}}},
-    }
-    items = _extract_items_from_json(data)
-    assert len(items) == 3, f"got {len(items)}"
-    assert {i.avito_id for i in items} == {"10", "11", "12"}
-    print("OK: _extract_items_from_json (nested)")
-
-
-def test_parse_item_image_variants():
+def test_image_extraction():
     # variants shape
     val = {
-        "id": 1, "urlPath": "/x", "price": 100,
-        "images": [{"variants": {"864x648": "https://example.com/v.jpg"}}],
+        "id": 1, "urlPath": "/x", "price": 1,
+        "images": [{"variants": {"864x648": "https://avito.st/v.jpg"}}],
     }
-    item = _parse_api_item(val)
-    assert item.image_url == "https://example.com/v.jpg"
-    print("OK: image from images[0].variants")
+    assert _extract_image_url(val) == "https://avito.st/v.jpg"
+    # Strict: no .jpg, no avito host -> rejected
+    val = {"images": [{"url": "https://example.com/share/123"}]}
+    assert _extract_image_url(val) is None
+    print("OK: _extract_image_url (strict + variants)")
+
+
+def test_location_from_path():
+    assert _city_from_url_path("/moskva/foo/bar") == "Москва"
+    assert _city_from_url_path("/sankt-peterburg/x") == "Санкт-Петербург"
+    assert _city_from_url_path("/balakovo/x") == "Балаково"
+    # Unknown slug -> Title Case
+    assert _city_from_url_path("/xxx-yyy/x") == "Xxx yyy"
+    # /all/ — country-wide
+    assert _city_from_url_path("/all/foo") is None
+    print("OK: _city_from_url_path")
+
+
+def test_location_fallback():
+    val = {"urlPath": "/moskva/odezhda/x", "location": {}}
+    assert _extract_location(val) == "Москва"
+    val = {"location": {"name": "Самара"}}
+    assert _extract_location(val) == "Самара"
+    val = {"geo": {"formattedAddress": "Москва, метро Арбатская"}}
+    assert _extract_location(val) == "Москва, метро Арбатская"
+    print("OK: _extract_location fallback chain")
 
 
 if __name__ == "__main__":
-    test_parse_api_item_full()
-    test_parse_api_item_plain_price()
-    test_extract_items_from_json_direct_catalog()
-    test_extract_items_from_json_nested()
-    test_parse_item_image_variants()
+    test_dispatcher_matches_avito()
+    test_dispatcher_rejects_unknown()
+    test_supported_sources()
+    test_avito_source_matches()
+    test_parse_item_full()
+    test_parse_item_plain_price()
+    test_image_extraction()
+    test_location_from_path()
+    test_location_fallback()
     print("\nALL UNIT TESTS PASSED")

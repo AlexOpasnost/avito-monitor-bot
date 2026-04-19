@@ -13,7 +13,7 @@ from aiogram.types import (
 
 from config import config
 from database import db
-from parser import fetch_search_items
+from parser import detect_source, fetch_search_items, supported_sources
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -21,17 +21,15 @@ router = Router()
 _GENERIC_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
-def _extract_avito_url(message_or_text) -> str | None:
-    """Pull an Avito URL out of the raw message text or caption.
+def _extract_marketplace_url(message_or_text) -> tuple[str, str] | None:
+    """Pull a supported-marketplace URL out of the raw message text/caption.
 
-    Accepts either an aiogram Message object or a raw string. Always
-    reads from message.text / message.caption — never from
-    message.entities, whose offsets/lengths are clipped by Telegram's
-    UI for long URLs.
+    Returns (source_name, url) on success, None otherwise. The URL is
+    accepted only if one of the registered sources matches it (avito,
+    kufar, olx, vinted, mercari, ...).
 
-    Strips invisible characters that iOS / Android Telegram sometimes
-    inject into pasted URLs (zero-width space, soft hyphen, NBSP)."""
-    # Accept either a Message or a plain str
+    Reads from message.text / message.caption directly; never from
+    message.entities (clipped for long URLs)."""
     if isinstance(message_or_text, str):
         text = message_or_text
     else:
@@ -43,30 +41,37 @@ def _extract_avito_url(message_or_text) -> str | None:
     if not text:
         return None
 
-    # Remove invisible unicode that can appear inside a pasted URL:
-    #   \u200B zero-width space, \u200C ZWNJ, \u200D ZWJ, \u2060 word joiner,
-    #   \u00AD soft hyphen, \uFEFF BOM, \u00A0 NBSP, \u2028/\u2029 line sep
+    # Strip invisible unicode that iOS/Android Telegram sometimes injects
     for ch in ("\u200B", "\u200C", "\u200D", "\u2060", "\u00AD",
                "\uFEFF", "\u00A0", "\u2028", "\u2029"):
         text = text.replace(ch, "")
     text = text.strip()
-    # DO NOT replace ~ with - : Avito's f= alphabet uses `~` as a
-    # meaningful, distinct character. Replacing it corrupts the filter
-    # blob and Avito falls back to an unfiltered catalog.
+    # NOTE: do NOT replace ~ with - here — Avito's f= alphabet treats
+    # them as different characters; the same is true for some other
+    # marketplaces' filter encodings.
 
     m = _GENERIC_URL_RE.search(text)
     if not m:
         return None
     url = m.group(0).rstrip(".,);]")
 
-    # Sanity check — must be Avito (drop random URLs)
-    if "avito.ru" not in url.lower():
+    source = detect_source(url)
+    if source is None:
         return None
 
     head = url[:50]
     tail = url[-50:] if len(url) > 50 else ""
-    logger.info("[extract-url] len=%d, head=%r, tail=%r", len(url), head, tail)
-    return url
+    logger.info(
+        "[extract-url] source=%s, len=%d, head=%r, tail=%r",
+        source.name, len(url), head, tail,
+    )
+    return source.name, url
+
+
+# Back-compat shim — old code expected just the URL string.
+def _extract_avito_url(message_or_text) -> str | None:
+    result = _extract_marketplace_url(message_or_text)
+    return result[1] if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -239,23 +244,23 @@ async def cmd_stop(message: Message):
 
 @router.message(F.text)
 async def handle_url(message: Message):
-    # Read raw text — NOT entities (Telegram clips entity offsets for very
-    # long URLs even though message.text itself is delivered intact).
-    # Pass the Message — function reads .text and .caption internally
-    url = _extract_avito_url(message)
-    if not url:
+    extracted = _extract_marketplace_url(message)
+    if not extracted:
+        sources_pretty = ", ".join(supported_sources())
         await message.answer(
-            "Отправь ссылку на поиск Авито.\n\n"
+            "Отправь ссылку на поиск с одного из поддерживаемых сайтов:\n"
+            f"<i>{sources_pretty}</i>\n\n"
             "Например: <code>https://www.avito.ru/moskva/kvartiry</code>",
             parse_mode="HTML",
         )
         return
+    source_name, url = extracted
 
     user_id = await db.get_or_create_user(
         message.from_user.id, message.from_user.username,
     )
 
-    sub_id = await db.add_subscription(user_id, url)
+    sub_id = await db.add_subscription(user_id, url, source=source_name)
     if sub_id is None:
         await message.answer(
             f"⚠️ Достигнут лимит — максимум {config.max_subscriptions} отслеживаний.\n"
@@ -263,23 +268,21 @@ async def handle_url(message: Message):
         )
         return
 
-    # Initial scan: open the URL once, mark every current listing as seen so
-    # the user does not get flooded with all 50 results on the first cycle.
     await message.answer(
-        f"⏳ <b>Отслеживание #{sub_id} добавлено</b>\n"
-        f"Открываю Авито и записываю текущие объявления...",
+        f"⏳ <b>Отслеживание #{sub_id} добавлено</b> ({source_name})\n"
+        f"Открываю страницу и записываю текущие объявления...",
         parse_mode="HTML",
     )
     try:
         proxy = config.proxy_list[0] if config.proxy_list else None
         initial_items = await fetch_search_items(url, proxy)
-    except Exception as e:
+    except Exception:
         logger.exception("initial scan failed for sub #%d", sub_id)
         initial_items = None
 
     if initial_items:
-        ids = [i.avito_id for i in initial_items if i.avito_id]
-        await db.mark_items_sent_batch(sub_id, ids)
+        ids = [i.external_id for i in initial_items if i.external_id]
+        await db.mark_items_sent_batch(sub_id, ids, source=source_name)
         await db.update_last_checked(sub_id)
         seeded = len(ids)
     else:
