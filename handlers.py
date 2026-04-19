@@ -18,20 +18,31 @@ from parser import fetch_search_items
 logger = logging.getLogger(__name__)
 router = Router()
 
-_AVITO_URL_RE = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+", re.IGNORECASE)
+_GENERIC_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
-def _extract_avito_url(text: str) -> str | None:
-    """Pull an Avito URL out of the raw message text.
+def _extract_avito_url(message_or_text) -> str | None:
+    """Pull an Avito URL out of the raw message text or caption.
 
-    Reads directly from message.text — never from message.entities,
-    whose offsets/lengths are clipped by Telegram's UI for long URLs.
+    Accepts either an aiogram Message object or a raw string. Always
+    reads from message.text / message.caption — never from
+    message.entities, whose offsets/lengths are clipped by Telegram's
+    UI for long URLs.
 
     Strips invisible characters that iOS / Android Telegram sometimes
-    inject into pasted URLs (zero-width space, soft hyphen, NBSP) —
-    these break the \\S+ match and cause silent truncation."""
+    inject into pasted URLs (zero-width space, soft hyphen, NBSP)."""
+    # Accept either a Message or a plain str
+    if isinstance(message_or_text, str):
+        text = message_or_text
+    else:
+        text = (
+            getattr(message_or_text, "text", None)
+            or getattr(message_or_text, "caption", None)
+            or ""
+        )
     if not text:
         return None
+
     # Remove invisible unicode that can appear inside a pasted URL:
     #   \u200B zero-width space, \u200C ZWNJ, \u200D ZWJ, \u2060 word joiner,
     #   \u00AD soft hyphen, \uFEFF BOM, \u00A0 NBSP, \u2028/\u2029 line sep
@@ -41,11 +52,19 @@ def _extract_avito_url(text: str) -> str | None:
     text = text.strip()
     # Telegram sometimes swaps URL-safe base64 `-` with `~`
     text = text.replace("~", "-")
-    m = _AVITO_URL_RE.search(text)
+
+    m = _GENERIC_URL_RE.search(text)
     if not m:
         return None
     url = m.group(0).rstrip(".,);]")
-    logger.info("[extract-url] len=%d, url=%r", len(url), url[:200])
+
+    # Sanity check — must be Avito (drop random URLs)
+    if "avito.ru" not in url.lower():
+        return None
+
+    head = url[:50]
+    tail = url[-50:] if len(url) > 50 else ""
+    logger.info("[extract-url] len=%d, head=%r, tail=%r", len(url), head, tail)
     return url
 
 
@@ -221,7 +240,8 @@ async def cmd_stop(message: Message):
 async def handle_url(message: Message):
     # Read raw text — NOT entities (Telegram clips entity offsets for very
     # long URLs even though message.text itself is delivered intact).
-    url = _extract_avito_url(message.text or "")
+    # Pass the Message — function reads .text and .caption internally
+    url = _extract_avito_url(message)
     if not url:
         await message.answer(
             "Отправь ссылку на поиск Авито.\n\n"

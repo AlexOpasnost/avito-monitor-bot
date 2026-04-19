@@ -135,9 +135,50 @@ class Database:
             await conn.execute(
                 "ALTER TABLE subscriptions ALTER COLUMN url TYPE TEXT"
             )
+            # Tracking table so one-shot data migrations run exactly once
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            await self._apply_once(conn, "cleanup_2026_04_19",
+                                    self._cleanup_subscriptions_2026_04_19)
             logger.info("Migrations applied")
         except Exception as e:
             logger.debug("Migration note: %s", e)
+
+    async def _apply_once(self, conn, name: str, op):
+        """Run a one-shot migration exactly once, tracked in _migrations."""
+        already = await conn.fetchval(
+            "SELECT 1 FROM _migrations WHERE name = $1", name,
+        )
+        if already:
+            return
+        logger.info("Applying one-shot migration: %s", name)
+        await op(conn)
+        await conn.execute(
+            "INSERT INTO _migrations (name) VALUES ($1) ON CONFLICT DO NOTHING",
+            name,
+        )
+        logger.info("One-shot migration %s done", name)
+
+    async def _cleanup_subscriptions_2026_04_19(self, conn):
+        """Wipe every subscription + sent_items row.
+
+        Reason: URLs saved by older bot versions are truncated (invisible
+        unicode / VARCHAR column / old regex). Users will re-add their
+        subscriptions and the new code saves the full URL."""
+        sent_deleted = await conn.fetchval(
+            "WITH d AS (DELETE FROM sent_items RETURNING 1) SELECT COUNT(*) FROM d"
+        )
+        subs_deleted = await conn.fetchval(
+            "WITH d AS (DELETE FROM subscriptions RETURNING 1) SELECT COUNT(*) FROM d"
+        )
+        logger.warning(
+            "cleanup_2026_04_19: deleted %s sent_items + %s subscriptions",
+            sent_deleted, subs_deleted,
+        )
 
     # --- Users ---
 
