@@ -50,8 +50,9 @@ def _extract_avito_url(message_or_text) -> str | None:
                "\uFEFF", "\u00A0", "\u2028", "\u2029"):
         text = text.replace(ch, "")
     text = text.strip()
-    # Telegram sometimes swaps URL-safe base64 `-` with `~`
-    text = text.replace("~", "-")
+    # DO NOT replace ~ with - : Avito's f= alphabet uses `~` as a
+    # meaningful, distinct character. Replacing it corrupts the filter
+    # blob and Avito falls back to an unfiltered catalog.
 
     m = _GENERIC_URL_RE.search(text)
     if not m:
