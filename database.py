@@ -129,6 +129,12 @@ class Database:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS filter_whitelist TEXT"
             )
+            # Ensure url column is TEXT (unbounded) — older databases may
+            # have been created with VARCHAR(N) which truncates long
+            # Avito URLs with filter base64 encoded in f=.
+            await conn.execute(
+                "ALTER TABLE subscriptions ALTER COLUMN url TYPE TEXT"
+            )
             logger.info("Migrations applied")
         except Exception as e:
             logger.debug("Migration note: %s", e)

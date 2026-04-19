@@ -24,23 +24,29 @@ _AVITO_URL_RE = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/\S+", re.IGNORECAS
 def _extract_avito_url(text: str) -> str | None:
     """Pull an Avito URL out of the raw message text.
 
-    IMPORTANT: this works directly on `message.text` (which Telegram delivers
-    in full even when the UI visually truncates the link). We do NOT touch
-    `message.entities` — entity offsets/lengths get clipped by Telegram's
-    UI for long URLs and would give us a truncated string.
+    Reads directly from message.text — never from message.entities,
+    whose offsets/lengths are clipped by Telegram's UI for long URLs.
 
-    No truncation/length validation here — the parser handles whatever URL
-    we save. If the URL really is broken, the scrape will just return
-    nothing and the scheduler's retry covers it."""
+    Strips invisible characters that iOS / Android Telegram sometimes
+    inject into pasted URLs (zero-width space, soft hyphen, NBSP) —
+    these break the \\S+ match and cause silent truncation."""
     if not text:
         return None
+    # Remove invisible unicode that can appear inside a pasted URL:
+    #   \u200B zero-width space, \u200C ZWNJ, \u200D ZWJ, \u2060 word joiner,
+    #   \u00AD soft hyphen, \uFEFF BOM, \u00A0 NBSP, \u2028/\u2029 line sep
+    for ch in ("\u200B", "\u200C", "\u200D", "\u2060", "\u00AD",
+               "\uFEFF", "\u00A0", "\u2028", "\u2029"):
+        text = text.replace(ch, "")
     text = text.strip()
     # Telegram sometimes swaps URL-safe base64 `-` with `~`
     text = text.replace("~", "-")
     m = _AVITO_URL_RE.search(text)
     if not m:
         return None
-    return m.group(0).rstrip(".,);]")
+    url = m.group(0).rstrip(".,);]")
+    logger.info("[extract-url] len=%d, url=%r", len(url), url[:200])
+    return url
 
 
 # ---------------------------------------------------------------------------
