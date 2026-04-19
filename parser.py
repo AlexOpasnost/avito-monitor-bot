@@ -374,10 +374,9 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
 
 
 def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None:
-    """Walk every <script data-mfe-state="true"> and return items from the
-    FIRST one whose state.data.catalog.items is a non-empty list. Return
-    empty list if the catalog MFE is present but empty (legitimate zero-
-    results). Return None if no catalog MFE is found at all."""
+    """Walk every <script data-mfe-state="true">, dump top-level state.data
+    keys of each, then find the mfe whose catalog actually applied the URL
+    filters (mainCategoryId / totalCount / searchHash present)."""
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -388,7 +387,9 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
     mfe_scripts = soup.select('script[data-mfe-state="true"]')
     logger.info("[html] found %d mfe-state scripts", len(mfe_scripts))
 
-    catalog_found = False
+    # First pass — parse each script's state.data and log its top-level
+    # keys so we can tell which one actually applied the filter.
+    parsed_mfes = []  # list of (idx, state_data_dict)
     for idx, script in enumerate(mfe_scripts):
         body = (script.text or "").strip()
         if not body or "sandbox" in body[:200]:
@@ -400,85 +401,88 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
             continue
         if not isinstance(data, dict):
             continue
+        state_data = (data.get("state") or {}).get("data")
+        if not isinstance(state_data, dict):
+            logger.info("[html] mfe #%d: no state.data", idx)
+            continue
+        logger.info("[html] mfe #%d state.data keys: %s",
+                    idx, list(state_data.keys())[:30])
+        parsed_mfes.append((idx, state_data))
 
-        catalog = (
-            data.get("state", {}) if isinstance(data.get("state"), dict) else {}
-        ).get("data", {})
+    # Second pass — pick the mfe whose catalog has filter metadata.
+    # Fields that indicate Avito actually applied our filter (f=):
+    filter_marker_fields = (
+        "mainCategoryId", "categoryId", "totalCount", "count",
+        "searchHash", "searchRequestId", "searchParams", "appliedFilters",
+    )
+
+    # Candidate catalogs — (idx, catalog_dict, has_filter_markers)
+    candidates = []
+    for idx, state_data in parsed_mfes:
+        catalog = state_data.get("catalog")
         if not isinstance(catalog, dict):
             continue
-        catalog = catalog.get("catalog")
-        if not isinstance(catalog, dict):
-            continue
-
-        # This IS the catalog MFE
-        catalog_found = True
         items_raw = catalog.get("items")
         if not isinstance(items_raw, list):
-            logger.info("[html] mfe #%d is catalog but items not a list", idx)
-            return []
-
-        # DIAGNOSTIC — what did Avito actually search for?
-        # The catalog block normally carries the params it applied
-        # (searchParams / appliedFilters / filters / categoryId /
-        # locationId / mainCategoryId). If these don't match our URL
-        # filters, Avito is ignoring f= for some reason.
-        _dbg = {
-            "mainCategoryId":   catalog.get("mainCategoryId"),
-            "categoryId":       catalog.get("categoryId"),
-            "locationId":       catalog.get("locationId"),
-            "count":            catalog.get("count"),
-            "totalCount":       catalog.get("totalCount"),
-            "searchHash":       catalog.get("searchHash"),
-            "searchRequestId":  str(catalog.get("searchRequestId"))[:40] if catalog.get("searchRequestId") else None,
-        }
-        logger.info("[html] catalog meta: %s", _dbg)
-        # Top-level catalog keys (so we can spot where filter info hides)
-        logger.info("[html] catalog keys: %s", list(catalog.keys())[:30])
-        # Log searchParams / filters / breadcrumbs if present
-        for field in ("searchParams", "appliedFilters", "filters",
-                      "breadcrumbs", "queryParams", "params",
-                      "formState", "requestParams"):
-            val = catalog.get(field)
-            if val is not None:
-                txt = str(val)
-                logger.info("[html] catalog.%s (len=%d): %s",
-                            field, len(txt), txt[:400])
-
-        # Parse into AvitoItems — skip non-item rows (banners / snippets)
-        items: list[AvitoItem] = []
-        skipped_non_item = 0
-        for raw in items_raw:
-            if not isinstance(raw, dict):
-                continue
-            rtype = (raw.get("type") or "").strip()
-            # Reject known non-catalog-result types
-            if rtype and rtype not in ("item", ""):
-                skipped_non_item += 1
-                continue
-            val = raw.get("value", raw) if "value" in raw else raw
-            if not isinstance(val, dict):
-                continue
-            if not (val.get("id") or val.get("itemId")):
-                continue
-            try:
-                items.append(_parse_api_item(val))
-            except Exception:
-                pass
+            continue
+        has_markers = any(catalog.get(k) not in (None, "") for k in filter_marker_fields)
         logger.info(
-            "[html] mfe #%d is CATALOG: %d raw rows -> %d items (%d non-item rows skipped)",
-            idx, len(items_raw), len(items), skipped_non_item,
+            "[html] mfe #%d catalog: %d items, filter-markers=%s, keys=%s",
+            idx, len(items_raw), has_markers, list(catalog.keys())[:20],
         )
-        if items:
-            # Sanity-check: log first 3 item url paths so we can verify
-            # they're in the expected subcategory. Mismatch here = bug
-            # upstream (URL vs. Avito response disagreement).
-            sample_paths = [i.url.replace("https://www.avito.ru", "")[:60] for i in items[:3]]
-            logger.info("[html] sample item paths: %s", sample_paths)
-        return items
+        if has_markers:
+            _dbg = {k: catalog.get(k) for k in filter_marker_fields}
+            logger.info("[html] mfe #%d filter meta: %s", idx, _dbg)
+        candidates.append((idx, catalog, has_markers))
 
-    if not catalog_found:
+    if not candidates:
+        logger.warning("[html] no catalog MFE found")
         return None
-    return []
+
+    # Prefer a catalog WITH filter markers — that's the real search result.
+    # Fall back to the first one if none have markers (so we still return
+    # something rather than silently failing).
+    picked = next(((i, c) for i, c, m in candidates if m), None)
+    if picked is None:
+        logger.warning(
+            "[html] NO catalog has filter markers — falling back to first. "
+            "This means Avito served the page unfiltered; items will NOT "
+            "match the user's f= filter."
+        )
+        idx, catalog = candidates[0][0], candidates[0][1]
+    else:
+        idx, catalog = picked
+        logger.info("[html] picked mfe #%d as the filter-applied catalog", idx)
+
+    items_raw = catalog.get("items") or []
+
+    # Parse into AvitoItems — skip non-item rows (banners / snippets)
+    items: list[AvitoItem] = []
+    skipped_non_item = 0
+    for raw in items_raw:
+        if not isinstance(raw, dict):
+            continue
+        rtype = (raw.get("type") or "").strip()
+        if rtype and rtype not in ("item", ""):
+            skipped_non_item += 1
+            continue
+        val = raw.get("value", raw) if "value" in raw else raw
+        if not isinstance(val, dict):
+            continue
+        if not (val.get("id") or val.get("itemId")):
+            continue
+        try:
+            items.append(_parse_api_item(val))
+        except Exception:
+            pass
+    logger.info(
+        "[html] mfe #%d is CATALOG: %d raw rows -> %d items (%d non-item rows skipped)",
+        idx, len(items_raw), len(items), skipped_non_item,
+    )
+    if items:
+        sample_paths = [i.url.replace("https://www.avito.ru", "")[:60] for i in items[:3]]
+        logger.info("[html] sample item paths: %s", sample_paths)
+    return items
 
 
 # ---------------------------------------------------------------------------
