@@ -24,6 +24,13 @@ class Config:
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     )
+    # Branding + paywall
+    brand_name: str = "AutoSearch"
+    basic_price_rub: int = 990
+    pro_price_rub: int = 2490
+    payment_url_basic: str = ""     # real payment link (YooMoney / Robokassa / …)
+    payment_url_pro: str = ""
+    support_handle: str = ""        # e.g. "@autosearch_support"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,6 +47,12 @@ class Config:
             admin_id=int(os.getenv("ADMIN_ID", "0")),
             max_concurrent_requests=int(os.getenv("MAX_CONCURRENT_REQUESTS", "3")),
             headless=os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes"),
+            brand_name=os.getenv("BRAND_NAME", "AutoSearch"),
+            basic_price_rub=int(os.getenv("BASIC_PRICE_RUB", "990")),
+            pro_price_rub=int(os.getenv("PRO_PRICE_RUB", "2490")),
+            payment_url_basic=os.getenv("PAYMENT_URL_BASIC", ""),
+            payment_url_pro=os.getenv("PAYMENT_URL_PRO", ""),
+            support_handle=os.getenv("SUPPORT_HANDLE", ""),
         )
 
 

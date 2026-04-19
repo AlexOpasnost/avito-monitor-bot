@@ -84,30 +84,73 @@ async def cmd_start(message: Message):
     user_id = await db.get_or_create_user(
         message.from_user.id, message.from_user.username,
     )
-    reactivated = await db.reactivate_all(user_id)
+    # Silently reactivate any paused subs — returning users don't need to
+    # re-do /start clicks to get their monitor back.
+    await db.reactivate_all(user_id)
 
-    if reactivated > 0:
-        await message.answer(
-            f"▶️ <b>Возобновлено {reactivated} отслеживаний!</b>\n\n"
-            "Мониторинг запущен. Новые объявления придут автоматически.\n\n"
-            "/list — активные отслеживания\n"
-            "/delete — удалить\n"
-            "/stop — пауза",
-            parse_mode="HTML",
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"💎 Базовый — {config.basic_price_rub}₽/мес",
+            callback_data="buy:basic",
+        )],
+        [InlineKeyboardButton(
+            text=f"⚡ Профессиональный — {config.pro_price_rub}₽/мес",
+            callback_data="buy:pro",
+        )],
+    ])
+    await message.answer(
+        f"Добро пожаловать в <b>{config.brand_name}</b>! 🔍\n\n"
+        "Оформи подписку и начни поиск лучших лотов "
+        "на ресейл площадках.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+_TARIFF_META = {
+    "basic": ("Базовый", "basic_price_rub", "payment_url_basic"),
+    "pro": ("Профессиональный", "pro_price_rub", "payment_url_pro"),
+}
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def callback_buy_tariff(callback: CallbackQuery):
+    tariff = callback.data.split(":", 1)[1]
+    meta = _TARIFF_META.get(tariff)
+    if meta is None:
+        await callback.answer("Неизвестный тариф", show_alert=True)
+        return
+    name, price_attr, url_attr = meta
+    price = getattr(config, price_attr)
+    pay_url = getattr(config, url_attr)
+
+    if pay_url:
+        pay_button = InlineKeyboardButton(
+            text=f"💳 Оплатить {name}", url=pay_url,
         )
     else:
-        await message.answer(
-            "<b>Avito Monitor</b> — мгновенные уведомления о новых объявлениях\n\n"
-            "<b>Как добавить отслеживание:</b>\n"
-            "1. Настрой поиск на Авито (город, категория, цена, фильтры)\n"
-            "2. Скопируй ссылку из адресной строки\n"
-            "3. Отправь её сюда — длинные ссылки тоже принимаются\n\n"
-            f"Лимит: {config.max_subscriptions} отслеживаний одновременно\n\n"
-            "/list — мои отслеживания\n"
-            "/profile — статистика\n"
-            "/stop — пауза",
-            parse_mode="HTML",
+        # No real payment URL configured yet — dead-end the click into a
+        # "contact support" alert instead of shipping a broken URL.
+        pay_button = InlineKeyboardButton(
+            text=f"💳 Оплатить {name}", callback_data=f"pay:{tariff}",
         )
+
+    await callback.message.answer(
+        f"Оплата тарифа «<b>{name}</b>» — <b>{price} ₽</b>\n\n"
+        "Нажмите кнопку ниже для перехода к оплате:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[pay_button]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay:"))
+async def callback_pay_fallback(callback: CallbackQuery):
+    if config.support_handle:
+        text = f"Для оплаты напишите {config.support_handle}"
+    else:
+        text = "Оплата временно недоступна. Попробуйте позже."
+    await callback.answer(text, show_alert=True)
 
 
 @router.message(Command("profile"))
