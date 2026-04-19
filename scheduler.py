@@ -219,6 +219,17 @@ _SOURCE_BUTTON_TEXT = {
     "goofish": "🔗 Открыть на Goofish",
 }
 
+# Per-source Referer for image downloads — Avito's CDN refuses requests
+# without the Avito Referer; other sites have similar checks.
+_SOURCE_IMAGE_REFERER = {
+    "avito":   "https://www.avito.ru/",
+    "kufar":   "https://www.kufar.by/",
+    "olx":     "https://www.olx.com/",
+    "vinted":  "https://www.vinted.com/",
+    "mercari": "https://jp.mercari.com/",
+    "goofish": "https://www.goofish.com/",
+}
+
 
 async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
     text = _format_notification(item)
@@ -229,9 +240,15 @@ async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
 
     if item.image_url:
         caption = text if len(text) <= 1024 else text[:1020] + "…"
-        # Download via our proxy — Telegram can't fetch most marketplace
-        # CDNs directly (they block Telegram's server IPs).
-        img_bytes = await download_image_bytes(item.image_url)
+        # Download via the SAME source-host session that already has
+        # warm cookies — passing host=item.source avoids spinning up
+        # a fresh "generic" session with its own warmup (~7s) on every
+        # image. Per-source Referer placates picky CDNs.
+        img_bytes = await download_image_bytes(
+            item.image_url,
+            host=item.source,
+            referer=_SOURCE_IMAGE_REFERER.get(item.source),
+        )
         if img_bytes:
             try:
                 await bot.send_photo(
