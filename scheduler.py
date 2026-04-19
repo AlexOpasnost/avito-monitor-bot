@@ -80,8 +80,22 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
 
     while not stop_event.is_set():
         try:
+            # Always re-read URL from DB — never trust the snapshot we got
+            # at task spawn time. User may have edited / re-added the
+            # subscription with a longer/cleaner URL.
+            fresh = await db.get_subscription(sub["id"])
+            if fresh is None:
+                logger.info("Sub #%d deleted/deactivated — exiting loop", sub["id"])
+                return
+            sub["url"] = fresh["url"]
+            sub["last_checked_at"] = fresh["last_checked_at"]
+            sub["telegram_id"] = fresh["telegram_id"]
+
             async with sem:
                 proxy = config.proxy_list[0] if config.proxy_list else None
+                logger.info(
+                    "Sub #%d cycle: url len=%d", sub["id"], len(sub["url"]),
+                )
                 items = await fetch_search_items(sub["url"], proxy)
                 # Spacing held INSIDE the semaphore so the next sub waits
                 # 5-15 s before its own scrape starts.

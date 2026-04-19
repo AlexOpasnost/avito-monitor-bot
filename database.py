@@ -234,6 +234,20 @@ class Database:
             )
         return await self._execute(_op)
 
+    async def get_subscription(self, sub_id: int):
+        """Return a single live subscription row, or None if it was
+        deleted/deactivated. Used by the scheduler to re-read URL on
+        every cycle so updates from the user are picked up immediately."""
+        async def _op(conn):
+            return await conn.fetchrow(
+                "SELECT s.id, s.url, s.user_id, s.last_checked_at, u.telegram_id "
+                "FROM subscriptions s "
+                "JOIN users u ON u.id = s.user_id "
+                "WHERE s.id = $1 AND s.is_active = TRUE AND s.deleted = FALSE",
+                sub_id,
+            )
+        return await self._execute(_op)
+
     async def deactivate_subscription(self, sub_id: int):
         async def _op(conn):
             await conn.execute(
