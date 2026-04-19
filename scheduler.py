@@ -1,7 +1,6 @@
 """Per-subscription async scheduler."""
 import asyncio
 import logging
-import random
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -20,9 +19,9 @@ MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
 
 
 async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
-    # Hard-coded sem=1: spec requires "never fire two subscriptions
-    # simultaneously". Avito rate-limits per source IP/proxy pool.
-    logger.info("Scheduler started (per-sub interval=300-600s, sem=1, stagger=5-15s)")
+    # Hard-coded sem=1: never fire two subscriptions simultaneously.
+    # parser.py also holds its own lock, so this is belt-and-suspenders.
+    logger.info("Scheduler started (per-sub interval=60s, sem=1, no stagger)")
     sem = asyncio.Semaphore(1)
     tasks: dict[int, asyncio.Task] = {}
 
@@ -69,11 +68,8 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
 
 async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asyncio.Event):
     """One loop per subscription. Uses a global semaphore (1) so only one
-    subscription fetches at a time, plus an in-sem stagger of 5-15s so
-    consecutive scrapes are spaced out across the proxy pool."""
-    # Initial stagger: spread sub startups across 0-60 s so they don't all
-    # try to grab the semaphore at once on bot start.
-    await asyncio.sleep(random.uniform(0, 60))
+    subscription fetches at a time. No startup or inter-request stagger —
+    60-s cycle spacing is all we need."""
     logger.info("Sub #%d loop started", sub["id"])
 
     consecutive_failures = 0
@@ -93,13 +89,12 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
 
             async with sem:
                 proxy = config.proxy_list[0] if config.proxy_list else None
+                _url = sub["url"]
                 logger.info(
-                    "Sub #%d cycle: url len=%d", sub["id"], len(sub["url"]),
+                    "[scheduler] Sub #%d cycle: using url='%s...%s' (len=%d)",
+                    sub["id"], _url[:80], _url[-30:], len(_url),
                 )
-                items = await fetch_search_items(sub["url"], proxy)
-                # Spacing held INSIDE the semaphore so the next sub waits
-                # 5-15 s before its own scrape starts.
-                await asyncio.sleep(random.uniform(5.0, 15.0))
+                items = await fetch_search_items(_url, proxy)
 
             if items is None:
                 consecutive_failures += 1
@@ -134,12 +129,9 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             except Exception:
                 pass
 
-        # Random 5-10 min wait between cycles. Avito blocks predictable
-        # short-interval polling on behavioral fingerprint — wider spread
-        # looks much more like a human refreshing the page occasionally.
-        wait = random.randint(300, 600)
+        # Fixed 60s between cycles — user requirement.
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=wait)
+            await asyncio.wait_for(stop_event.wait(), timeout=60)
             break
         except asyncio.TimeoutError:
             pass

@@ -52,43 +52,31 @@ async def fetch_search_items(url: str, proxy: str | None, max_retries: int = 3) 
     a 5-10 s gap before the next caller can start."""
     async with _avito_lock:
         logger.debug("[parser] avito-lock acquired by %s", url[:80])
-        try:
-            return await _fetch_search_items_inner(url, proxy, max_retries)
-        finally:
-            cooldown = random.uniform(5.0, 10.0)
-            logger.info("[parser] post-request cooldown %.1fs (lock held)", cooldown)
-            await asyncio.sleep(cooldown)
+        # No post-request cooldown — lock itself prevents parallel
+        # scrapes, scheduler runs each sub once per 60s anyway.
+        return await _fetch_search_items_inner(url, proxy, max_retries)
 
 
 async def _fetch_search_items_inner(url: str, proxy: str | None, max_retries: int) -> list[AvitoItem] | None:
+    """Hit the EXACT URL the user provided, verbatim. No URL rewriting,
+    no param whitelist, no m↔www conversion — just GET it through
+    cloudscraper and parse the hydration JSON from the response HTML."""
     for attempt in range(max_retries):
-        # Try mobile API first (fast, clean JSON)
-        items, api_blocked = await _fetch_mobile_api(url, proxy)
-        if items is not None:
-            logger.info("[api] fetched %d items for %s", len(items), url[:80])
-            return items
-
-        # API blocked — rotate IP FIRST, then try HTML with fresh IP + fresh session
-        if api_blocked:
-            logger.info("[api] blocked, rotating IP before HTML fallback...")
-            _invalidate_session()
-            await rotate_ip()
-            await asyncio.sleep(8)
-
-        # Try HTML fallback with (possibly fresh) IP
         items, html_blocked = await _fetch_hydration_json(url, proxy)
         if items is not None:
             logger.info("[html] fetched %d items for %s", len(items), url[:80])
             return items
 
-        if not api_blocked and not html_blocked:
+        if not html_blocked:
             return None
 
-        if html_blocked:
-            logger.warning("HTML also blocked (attempt %d/%d), rotating IP again", attempt + 1, max_retries)
-            _invalidate_session()
-            await rotate_ip()
-            await asyncio.sleep(8)
+        logger.warning(
+            "HTML blocked (attempt %d/%d), rotating IP and retrying",
+            attempt + 1, max_retries,
+        )
+        _invalidate_session()
+        await rotate_ip()
+        await asyncio.sleep(8)
 
     logger.error("All %d attempts blocked for %s", max_retries, url[:80])
     return None
@@ -295,11 +283,9 @@ def _get_cloudscraper(proxy: str | None):
     except Exception as e:
         logger.debug("[html] cookie dump err: %s", e)
 
-    # Cooldown — bumped to 15-25s. 3-7s wasn't enough; Avito's rate-limit
-    # sliding window seems to be ~10-15s for a mobile-proxy IP that just
-    # did 3 consecutive connects (ipify + www + m). Mimic a human reading
-    # the main page before clicking through to search.
-    cooldown = random.uniform(15, 25)
+    # Short cooldown after warmup (5-7s). Enough for the mobile-proxy
+    # IP to settle between the warmup connects and the real request.
+    cooldown = random.uniform(5, 7)
     logger.info("[html] warmup cooldown %.1fs", cooldown)
     time.sleep(cooldown)
     _cs_session = s
