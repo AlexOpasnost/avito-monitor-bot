@@ -275,11 +275,10 @@ def _format_notification(item: AvitoItem) -> str:
     ]
 
     if item.description:
-        desc = _escape(item.description).strip()
-        if len(desc) > DESC_MAX:
-            desc = desc[: DESC_MAX - 1].rstrip() + "…"
-        lines.append("──────────────")
-        lines.append(f"<i>{desc}</i>")
+        desc = _prettify_description(item.description, DESC_MAX)
+        if desc:
+            lines.append("──────────────")
+            lines.append(f"<i>{_escape(desc)}</i>")
 
     if item.seller_name:
         lines.append(f"\n👤 {_escape(item.seller_name)}")
@@ -291,5 +290,73 @@ def _escape(s: str) -> str:
     if not s:
         return ""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# Soft max per card — keep descriptions compact so the notification
+# reads at a glance. Hard cap passed in if the card is tighter.
+_DESC_SOFT_MAX = 400
+
+
+def _prettify_description(raw: str, hard_max: int) -> str:
+    """Clean up a seller's free-form description for a Telegram card.
+
+    - normalizes whitespace (no tripled newlines, no double spaces)
+    - strips zero-width / soft-hyphen / NBSP junk
+    - collapses "word.,word" typos
+    - truncates at sentence boundary near the soft limit, fallback to
+      hard_max with ellipsis
+    """
+    import re as _re
+    if not raw:
+        return ""
+    text = raw
+    # Drop invisible / bidi chars that occasionally sneak into
+    # copy-pasted descriptions and make them look dirty.
+    for ch in ("\u200B", "\u200C", "\u200D", "\u2060", "\u00AD",
+               "\uFEFF", "\u00A0"):
+        text = text.replace(ch, " ")
+    # Windows line endings -> \n
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Collapse 3+ newlines to 2 (paragraph), 2 spaces to 1
+    text = _re.sub(r"\n{3,}", "\n\n", text)
+    text = _re.sub(r"[ \t]{2,}", " ", text)
+    # "word.," / "word. ," punctuation glitches
+    text = _re.sub(r"\.\s*,", ".", text)
+    text = _re.sub(r",\s*\.", ".", text)
+    # Strip trailing whitespace on each line
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    text = text.strip()
+
+    if not text:
+        return ""
+
+    soft_limit = min(_DESC_SOFT_MAX, hard_max)
+    if len(text) <= soft_limit:
+        return text
+
+    # Try to cut at sentence boundary near the soft limit
+    window = text[: soft_limit]
+    sentence_end = max(
+        window.rfind(". "), window.rfind("! "),
+        window.rfind("? "), window.rfind(".\n"),
+        window.rfind("!\n"), window.rfind("?\n"),
+    )
+    if sentence_end >= soft_limit // 2:
+        return text[: sentence_end + 1].rstrip() + " …"
+
+    # Fall back to word boundary near hard_max
+    if len(text) > hard_max:
+        text = text[: hard_max - 2]
+        sp = text.rfind(" ")
+        if sp > hard_max // 2:
+            text = text[:sp]
+        return text.rstrip() + "…"
+
+    # Between soft and hard: end at last space
+    cut = text[:soft_limit]
+    sp = cut.rfind(" ")
+    if sp > soft_limit // 2:
+        cut = cut[:sp]
+    return cut.rstrip() + " …"
 
 
