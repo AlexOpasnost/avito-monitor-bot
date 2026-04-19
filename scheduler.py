@@ -202,8 +202,12 @@ async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Открыть на Авито", url=item.url)],
     ])
+
+    # Try photo first — Telegram renders the image above the caption
+    # which gives the nicest look. Fall back to text-only on any error
+    # (bad image URL, Telegram refusing the URL, etc.).
     if item.image_url:
-        caption = text if len(text) <= 1024 else text[:1020] + "..."
+        caption = text if len(text) <= 1024 else text[:1020] + "…"
         try:
             await bot.send_photo(
                 sub["telegram_id"], photo=item.image_url,
@@ -211,7 +215,10 @@ async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
             )
             return
         except Exception as e:
-            logger.debug("send_photo failed (%s), fallback to text", e)
+            logger.info(
+                "send_photo failed (%s) — falling back to text for %s",
+                str(e)[:100], item.avito_id,
+            )
 
     await bot.send_message(
         sub["telegram_id"], text,
@@ -221,17 +228,49 @@ async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
 
 
 def _format_notification(item: AvitoItem) -> str:
-    lines = [f"<b>{_escape(item.title)}</b>"]
-    lines.append(f"💰 <b>{_escape(item.price)}</b>")
-    if item.location:
-        lines.append(f"📍 {_escape(item.location)}")
-    if item.description:
-        lines.append(f"\n<i>{_escape(item.description)}</i>")
-    if item.seller_name:
-        lines.append(f"\n👤 {_escape(item.seller_name)}")
+    """Unified pretty notification format.
+
+    Layout (always same order, missing fields collapse their line):
+        <title>
+        💰 <price>
+        📍 <location>
+        📅 <HH:MM DD.MM.YYYY MSK>
+        ──────────────
+        <description>
+        👤 <seller>
+    """
+    title = _escape(item.title) or "Без названия"
+    price = _escape(item.price) or "Цена не указана"
+    location = _escape(item.location) or "—"
+
     if item.published_timestamp:
         dt = datetime.fromtimestamp(item.published_timestamp, MSK)
-        lines.append(f"📅 {dt.strftime('%H:%M %d.%m.%Y')}")
+        when = dt.strftime("%H:%M %d.%m.%Y")
+    else:
+        when = "—"
+
+    # Telegram photo caption limit is 1024 chars — leave room for the
+    # header so description has predictable budget.
+    HEADER_BUDGET = 260  # title + price + location + date + separator + small margin
+    DESC_MAX = 1024 - HEADER_BUDGET  # ≈ 764 chars
+
+    lines = [
+        f"<b>{title}</b>",
+        f"💰 <b>{price}</b>",
+        f"📍 {location}",
+        f"📅 {when}",
+    ]
+
+    if item.description:
+        desc = _escape(item.description).strip()
+        if len(desc) > DESC_MAX:
+            desc = desc[: DESC_MAX - 1].rstrip() + "…"
+        lines.append("──────────────")
+        lines.append(f"<i>{desc}</i>")
+
+    if item.seller_name:
+        lines.append(f"\n👤 {_escape(item.seller_name)}")
+
     return "\n".join(lines)
 
 

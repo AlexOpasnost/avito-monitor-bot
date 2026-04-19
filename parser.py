@@ -551,25 +551,9 @@ def _parse_api_item(val: dict) -> AvitoItem:
     else:
         item_url = url_path or "https://www.avito.ru"
 
-    # Image
-    image_url = None
-    images = val.get("images") or []
-    if images and isinstance(images[0], dict):
-        img0 = images[0]
-        image_url = (
-            img0.get("864x648")
-            or img0.get("636x476")
-            or img0.get("432x324")
-            or img0.get("url")
-        )
-        # Sometimes image is a dict of size->url under "variants"
-        if not image_url and isinstance(img0.get("variants"), dict):
-            variants = img0["variants"]
-            image_url = (
-                variants.get("864x648")
-                or variants.get("636x476")
-                or next(iter(variants.values()), None)
-            )
+    # Image — Avito has used many shapes over time. Walk everything
+    # that looks like an image dict and pick the biggest http URL.
+    image_url = _extract_image_url(val)
 
     # Location
     location = None
@@ -615,3 +599,66 @@ def _parse_api_item(val: dict) -> AvitoItem:
         seller_name=seller_name,
         published_timestamp=ts,
     )
+
+
+# ---------------------------------------------------------------------------
+# Image extraction — Avito uses different keys per endpoint
+# ---------------------------------------------------------------------------
+
+_IMAGE_SIZE_KEYS = (
+    # Square crops — Avito's modern default
+    "864x864", "636x636", "472x472", "432x432",
+    # Rectangular legacy
+    "864x648", "636x476", "540x405", "432x324", "318x238",
+    # Catch-all
+    "main", "big", "biggest", "default", "url",
+)
+
+
+def _extract_image_url(val: dict) -> str | None:
+    """Walk the item's payload and return the first http-ish image URL.
+    Handles: images: [{sizeKey: url}], images: [{variants: {...}}],
+    image / cover / mainImage / thumbnail."""
+    for key in ("images", "imagesAlt", "photos", "gallery"):
+        lst = val.get(key)
+        if isinstance(lst, list) and lst:
+            url = _image_from_dict(lst[0])
+            if url:
+                return url
+    for key in ("image", "cover", "mainImage", "thumbnail"):
+        obj = val.get(key)
+        if isinstance(obj, dict):
+            url = _image_from_dict(obj)
+            if url:
+                return url
+        elif isinstance(obj, str) and obj.startswith("http"):
+            return obj
+    return None
+
+
+def _image_from_dict(obj) -> str | None:
+    if isinstance(obj, str) and obj.startswith("http"):
+        return obj
+    if not isinstance(obj, dict):
+        return None
+    for k in _IMAGE_SIZE_KEYS:
+        v = obj.get(k)
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    for nest_key in ("variants", "sizes", "urls"):
+        nested = obj.get(nest_key)
+        if isinstance(nested, dict):
+            for k in _IMAGE_SIZE_KEYS:
+                v = nested.get(k)
+                if isinstance(v, str) and v.startswith("http"):
+                    return v
+            for v in nested.values():
+                if isinstance(v, str) and v.startswith("http"):
+                    return v
+    # Last resort — any http value that looks like an image URL
+    for v in obj.values():
+        if isinstance(v, str) and v.startswith("http") and (
+            ".jpg" in v or ".jpeg" in v or ".png" in v or ".webp" in v
+        ):
+            return v
+    return None
