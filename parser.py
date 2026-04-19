@@ -300,8 +300,17 @@ def _fetch_html_sync(url: str, proxy: str | None):
         s = _get_cloudscraper(proxy)
         proxies = {"http": proxy, "https": proxy} if proxy else None
         req_ua = s.headers.get("User-Agent", "?")
+        # Log the full URL right before the request — want to confirm
+        # cloudscraper didn't mangle the base64 in f= or drop a param.
+        logger.info(
+            "[html] REQUEST url=%r (len=%d)", url, len(url),
+        )
         logger.info("[html] request UA=%s, session id=%s", req_ua, id(s))
         resp = s.get(url, proxies=proxies, timeout=60, allow_redirects=False)
+        logger.info(
+            "[html] response final_url=%r, status=%d",
+            str(resp.url), resp.status_code,
+        )
         return resp.status_code, resp.text, dict(resp.headers)
     except Exception as e:
         logger.debug("[html] sync fetch error: %s", e)
@@ -407,6 +416,33 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
         if not isinstance(items_raw, list):
             logger.info("[html] mfe #%d is catalog but items not a list", idx)
             return []
+
+        # DIAGNOSTIC — what did Avito actually search for?
+        # The catalog block normally carries the params it applied
+        # (searchParams / appliedFilters / filters / categoryId /
+        # locationId / mainCategoryId). If these don't match our URL
+        # filters, Avito is ignoring f= for some reason.
+        _dbg = {
+            "mainCategoryId":   catalog.get("mainCategoryId"),
+            "categoryId":       catalog.get("categoryId"),
+            "locationId":       catalog.get("locationId"),
+            "count":            catalog.get("count"),
+            "totalCount":       catalog.get("totalCount"),
+            "searchHash":       catalog.get("searchHash"),
+            "searchRequestId":  str(catalog.get("searchRequestId"))[:40] if catalog.get("searchRequestId") else None,
+        }
+        logger.info("[html] catalog meta: %s", _dbg)
+        # Top-level catalog keys (so we can spot where filter info hides)
+        logger.info("[html] catalog keys: %s", list(catalog.keys())[:30])
+        # Log searchParams / filters / breadcrumbs if present
+        for field in ("searchParams", "appliedFilters", "filters",
+                      "breadcrumbs", "queryParams", "params",
+                      "formState", "requestParams"):
+            val = catalog.get(field)
+            if val is not None:
+                txt = str(val)
+                logger.info("[html] catalog.%s (len=%d): %s",
+                            field, len(txt), txt[:400])
 
         # Parse into AvitoItems — skip non-item rows (banners / snippets)
         items: list[AvitoItem] = []
