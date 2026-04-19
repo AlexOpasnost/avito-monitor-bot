@@ -119,11 +119,14 @@ async def _fetch_inner(url, proxy, max_retries):
         if not blocked:
             return None
         logger.warning(
-            "[olx] blocked (attempt %d/%d), rotating IP and retrying",
-            attempt + 1, max_retries,
+            "[olx] blocked (attempt %d/%d), rotating session%s",
+            attempt + 1, max_retries, " + IP" if proxy else "",
         )
         invalidate_session(_HOST)
-        await rotate_ip()
+        # Rotating the mobile proxy is only useful when OLX was actually
+        # reached through it; we normally run direct (proxy=None).
+        if proxy:
+            await rotate_ip()
         await asyncio.sleep(5)
     logger.error("[olx] all %d attempts blocked for %s", max_retries, url[:80])
     return None

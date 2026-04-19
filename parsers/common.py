@@ -39,6 +39,28 @@ def pick_user_agent() -> str:
 # Proxy
 # ---------------------------------------------------------------------------
 
+# Sources that MUST route through the mobile proxy (geo-blocked from
+# datacenters / Railway-region IPs). Anything else goes direct from the
+# container's outbound IP — mobile proxies are usually Russian and can't
+# reach EU marketplaces (OLX, Vinted, Mercari) at all.
+_PROXIED_SOURCES: frozenset[str] = frozenset({"avito", "kufar"})
+
+
+def proxy_for_source(source_name: str | None) -> str | None:
+    """Pick the right proxy for this marketplace, or None to go direct.
+
+    Centralizes the "should we proxy this?" decision so handlers, scheduler
+    and image-download all make the same choice.
+    """
+    if not source_name:
+        return None
+    if source_name not in _PROXIED_SOURCES:
+        return None
+    if not config.proxy_list:
+        return None
+    return config.proxy_list[0]
+
+
 async def rotate_ip() -> bool:
     """Call proxy rotation URL (if configured). Logs full URL + body."""
     rotate_url = config.proxy_rotate_url
@@ -150,12 +172,14 @@ async def download_image_bytes(url: str, host: str = "generic",
                                 proxy: str | None = None) -> bytes | None:
     """Download an image via the shared session + proxy. Returns bytes on
     success, None otherwise. Telegram can't reach most marketplace CDNs
-    directly; we act as the fetcher."""
+    directly; we act as the fetcher.
+
+    If `proxy` is not explicitly given, choose per-source: Russian mobile
+    proxy for proxied sources, direct otherwise (OLX/Vinted/Mercari CDNs
+    expect EU-reachable IPs)."""
     if not url:
         return None
-    actual_proxy = proxy if proxy is not None else (
-        config.proxy_list[0] if config.proxy_list else None
-    )
+    actual_proxy = proxy if proxy is not None else proxy_for_source(host)
 
     def _do():
         try:

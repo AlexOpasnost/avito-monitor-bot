@@ -70,11 +70,12 @@ async def _fetch_inner(
         if not blocked:
             return None
         logger.warning(
-            "[kufar] blocked (attempt %d/%d), rotating IP and retrying",
-            attempt + 1, max_retries,
+            "[kufar] blocked (attempt %d/%d), rotating session%s",
+            attempt + 1, max_retries, " + IP" if proxy else "",
         )
         invalidate_session(_HOST)
-        await rotate_ip()
+        if proxy:
+            await rotate_ip()
         await asyncio.sleep(5)
     logger.error("[kufar] all %d attempts blocked for %s", max_retries, url[:80])
     return None

@@ -14,6 +14,7 @@ from aiogram.types import (
 from config import config
 from database import db
 from parser import detect_source, fetch_search_items, supported_sources
+from parsers.common import proxy_for_source
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -274,7 +275,7 @@ async def handle_url(message: Message):
         parse_mode="HTML",
     )
     try:
-        proxy = config.proxy_list[0] if config.proxy_list else None
+        proxy = proxy_for_source(source_name)
         initial_items = await fetch_search_items(url, proxy)
     except Exception:
         logger.exception("initial scan failed for sub #%d", sub_id)

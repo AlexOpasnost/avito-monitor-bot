@@ -40,6 +40,33 @@ from parsers.olx import (
 
 # ---------- dispatcher ----------
 
+def test_proxy_for_source():
+    """Per-source proxy routing: Avito/Kufar go through mobile proxy when
+    one is configured, OLX/Vinted/Mercari always go direct."""
+    from parsers import common as _common
+    from parsers.common import proxy_for_source
+
+    orig = _common.config.proxy_list
+    try:
+        # With a proxy configured
+        _common.config.proxy_list = ["http://user:pass@mproxy.site:17751"]
+        assert proxy_for_source("avito") == "http://user:pass@mproxy.site:17751"
+        assert proxy_for_source("kufar") == "http://user:pass@mproxy.site:17751"
+        assert proxy_for_source("olx") is None
+        assert proxy_for_source("vinted") is None
+        assert proxy_for_source("mercari") is None
+        assert proxy_for_source("") is None
+        assert proxy_for_source(None) is None
+        # With no proxy configured — even proxied sources get None
+        _common.config.proxy_list = []
+        assert proxy_for_source("avito") is None
+        assert proxy_for_source("kufar") is None
+        assert proxy_for_source("olx") is None
+    finally:
+        _common.config.proxy_list = orig
+    print("OK: proxy_for_source per-source routing")
+
+
 def test_dispatcher_matches_avito():
     s = detect_source("https://www.avito.ru/moskva/kvartiry")
     assert s is not None and s.name == "avito"
@@ -483,6 +510,7 @@ def test_olx_extract_items_organic_vs_promoted():
 
 
 if __name__ == "__main__":
+    test_proxy_for_source()
     test_dispatcher_matches_avito()
     test_dispatcher_matches_kufar()
     test_dispatcher_matches_olx()

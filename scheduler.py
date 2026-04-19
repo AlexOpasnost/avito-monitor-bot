@@ -13,9 +13,11 @@ from config import config
 from database import db
 from parser import (
     SearchItem,
+    detect_source,
     download_image_bytes,
     fetch_search_items,
 )
+from parsers.common import proxy_for_source
 
 # Back-compat alias used in this module
 AvitoItem = SearchItem
@@ -97,11 +99,14 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             sub["telegram_id"] = fresh["telegram_id"]
 
             async with sem:
-                proxy = config.proxy_list[0] if config.proxy_list else None
                 _url = sub["url"]
+                src = detect_source(_url)
+                source_name = src.name if src else ""
+                proxy = proxy_for_source(source_name)
                 logger.info(
-                    "[scheduler] Sub #%d cycle: using url='%s...%s' (len=%d)",
-                    sub["id"], _url[:80], _url[-30:], len(_url),
+                    "[scheduler] Sub #%d cycle: source=%s proxy=%s url='%s...%s' (len=%d)",
+                    sub["id"], source_name or "?", "mobile" if proxy else "direct",
+                    _url[:80], _url[-30:], len(_url),
                 )
                 items = await fetch_search_items(_url, proxy)
 
@@ -248,6 +253,7 @@ async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
             item.image_url,
             host=item.source,
             referer=_SOURCE_IMAGE_REFERER.get(item.source),
+            proxy=proxy_for_source(item.source),
         )
         if img_bytes:
             try:
