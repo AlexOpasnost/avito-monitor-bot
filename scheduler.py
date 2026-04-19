@@ -216,8 +216,8 @@ async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
             return
         except Exception as e:
             logger.info(
-                "send_photo failed (%s) — falling back to text for %s",
-                str(e)[:100], item.avito_id,
+                "send_photo failed (%s) for %s — image_url=%r — falling back to text",
+                str(e)[:80], item.avito_id, item.image_url,
             )
 
     await bot.send_message(

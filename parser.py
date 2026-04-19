@@ -409,14 +409,15 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
                     idx, list(state_data.keys())[:30])
         parsed_mfes.append((idx, state_data))
 
-    # Second pass — pick the mfe whose catalog has filter metadata.
-    # Fields that indicate Avito actually applied our filter (f=):
+    # Second pass — pick the mfe whose STATE.DATA has filter metadata.
+    # Avito puts totalCount/searchHash/filtersV2 at state.data level, NOT
+    # inside state.data.catalog. So check state.data first.
     filter_marker_fields = (
-        "mainCategoryId", "categoryId", "totalCount", "count",
-        "searchHash", "searchRequestId", "searchParams", "appliedFilters",
+        "totalCount", "totalElements", "mainCount", "count",
+        "searchHash", "filtersV2", "filtersGroup", "searchCore", "mcId",
     )
 
-    # Candidate catalogs — (idx, catalog_dict, has_filter_markers)
+    # Candidate catalogs — (idx, catalog_dict, state_data, has_filter_markers)
     candidates = []
     for idx, state_data in parsed_mfes:
         catalog = state_data.get("catalog")
@@ -425,29 +426,25 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None
         items_raw = catalog.get("items")
         if not isinstance(items_raw, list):
             continue
-        has_markers = any(catalog.get(k) not in (None, "") for k in filter_marker_fields)
+        has_markers = any(state_data.get(k) not in (None, "") for k in filter_marker_fields)
         logger.info(
-            "[html] mfe #%d catalog: %d items, filter-markers=%s, keys=%s",
+            "[html] mfe #%d catalog: %d items, filter-markers=%s (at state.data), catalog.keys=%s",
             idx, len(items_raw), has_markers, list(catalog.keys())[:20],
         )
         if has_markers:
-            _dbg = {k: catalog.get(k) for k in filter_marker_fields}
+            _dbg = {k: state_data.get(k) for k in filter_marker_fields
+                    if state_data.get(k) not in (None, "")}
             logger.info("[html] mfe #%d filter meta: %s", idx, _dbg)
-        candidates.append((idx, catalog, has_markers))
+        candidates.append((idx, catalog, state_data, has_markers))
 
     if not candidates:
         logger.warning("[html] no catalog MFE found")
         return None
 
-    # Prefer a catalog WITH filter markers — that's the real search result.
-    # Fall back to the first one if none have markers (so we still return
-    # something rather than silently failing).
-    picked = next(((i, c) for i, c, m in candidates if m), None)
+    picked = next(((i, c) for i, c, _s, m in candidates if m), None)
     if picked is None:
         logger.warning(
-            "[html] NO catalog has filter markers — falling back to first. "
-            "This means Avito served the page unfiltered; items will NOT "
-            "match the user's f= filter."
+            "[html] no catalog MFE has filter markers — using first candidate"
         )
         idx, catalog = candidates[0][0], candidates[0][1]
     else:
@@ -595,11 +592,13 @@ def _parse_api_item(val: dict) -> AvitoItem:
     # that looks like an image dict and pick the biggest http URL.
     image_url = _extract_image_url(val)
 
-    # Location
-    location = None
-    loc = val.get("location") or {}
-    if isinstance(loc, dict):
-        location = loc.get("name")
+    # Location — Avito uses several shapes across endpoints:
+    #   location: {"name": "Москва"}                   (old API)
+    #   location: {"id": N, "slug": "moskva"}          (new — no name here)
+    #   geo: {"formattedAddress": "Москва, метро..."}  (new primary)
+    #   addressDetailed: {"text": "...", "name": "..."}
+    #   geoReferences: [{"content": "Москва"}]
+    location = _extract_location(val)
 
     # Description
     desc = val.get("description") or ""
@@ -645,20 +644,37 @@ def _parse_api_item(val: dict) -> AvitoItem:
 # Image extraction — Avito uses different keys per endpoint
 # ---------------------------------------------------------------------------
 
+# Strict: ONLY explicit size keys. Not "url" / "main" — those can point
+# to share/item pages, not image CDN, and Telegram chokes on non-images.
 _IMAGE_SIZE_KEYS = (
     # Square crops — Avito's modern default
-    "864x864", "636x636", "472x472", "432x432",
+    "864x864", "636x636", "540x540", "472x472", "432x432",
     # Rectangular legacy
-    "864x648", "636x476", "540x405", "432x324", "318x238",
-    # Catch-all
-    "main", "big", "biggest", "default", "url",
+    "864x648", "636x476", "540x405", "432x324", "318x238", "208x208",
+    "140x105", "72x54",
 )
+
+# Hostnames that Avito actually serves images from. Reject anything else
+# so we don't hand Telegram an avito.ru/item/12345 (HTML) and get a
+# "wrong type of the web page content" error.
+_IMAGE_HOST_HINTS = ("avito.st", "avito.ru/images", "avatars.mds.yandex", "80.img.avito.st")
+
+
+def _looks_like_image_url(u: str) -> bool:
+    if not isinstance(u, str) or not u.startswith("http"):
+        return False
+    low = u.lower()
+    # Extension hint
+    if any(ext in low for ext in (".jpg", ".jpeg", ".png", ".webp", ".avif")):
+        return True
+    # Avito CDN hostnames
+    if any(h in low for h in _IMAGE_HOST_HINTS):
+        return True
+    return False
 
 
 def _extract_image_url(val: dict) -> str | None:
-    """Walk the item's payload and return the first http-ish image URL.
-    Handles: images: [{sizeKey: url}], images: [{variants: {...}}],
-    image / cover / mainImage / thumbnail."""
+    """Walk the payload for an image URL that Telegram will actually accept."""
     for key in ("images", "imagesAlt", "photos", "gallery"):
         lst = val.get(key)
         if isinstance(lst, list) and lst:
@@ -671,34 +687,83 @@ def _extract_image_url(val: dict) -> str | None:
             url = _image_from_dict(obj)
             if url:
                 return url
-        elif isinstance(obj, str) and obj.startswith("http"):
+        elif isinstance(obj, str) and _looks_like_image_url(obj):
             return obj
     return None
 
 
 def _image_from_dict(obj) -> str | None:
-    if isinstance(obj, str) and obj.startswith("http"):
-        return obj
+    if isinstance(obj, str):
+        return obj if _looks_like_image_url(obj) else None
     if not isinstance(obj, dict):
         return None
+    # Explicit size keys first (preferring larger)
     for k in _IMAGE_SIZE_KEYS:
         v = obj.get(k)
-        if isinstance(v, str) and v.startswith("http"):
+        if _looks_like_image_url(v):
             return v
+    # Nested "variants" / "sizes" / "urls" dicts
     for nest_key in ("variants", "sizes", "urls"):
         nested = obj.get(nest_key)
         if isinstance(nested, dict):
             for k in _IMAGE_SIZE_KEYS:
                 v = nested.get(k)
-                if isinstance(v, str) and v.startswith("http"):
+                if _looks_like_image_url(v):
                     return v
             for v in nested.values():
-                if isinstance(v, str) and v.startswith("http"):
+                if _looks_like_image_url(v):
                     return v
-    # Last resort — any http value that looks like an image URL
+    # Any field value that looks like an image URL
     for v in obj.values():
-        if isinstance(v, str) and v.startswith("http") and (
-            ".jpg" in v or ".jpeg" in v or ".png" in v or ".webp" in v
-        ):
+        if _looks_like_image_url(v):
             return v
+    return None
+
+
+def _extract_location(val: dict) -> str | None:
+    """Try every known shape Avito uses for the location string."""
+    # Direct location dict
+    loc = val.get("location")
+    if isinstance(loc, dict):
+        for k in ("name", "namePrepositional", "nameLocative",
+                  "formattedAddress", "text"):
+            v = loc.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    elif isinstance(loc, str) and loc.strip():
+        return loc.strip()
+
+    # geo block (new Avito SPA favorite)
+    geo = val.get("geo")
+    if isinstance(geo, dict):
+        for k in ("formattedAddress", "address", "name", "text"):
+            v = geo.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # geoReferences is a list of {"content": "Москва", ...}
+        refs = geo.get("geoReferences")
+        if isinstance(refs, list):
+            parts = [r.get("content") for r in refs
+                     if isinstance(r, dict) and r.get("content")]
+            if parts:
+                return ", ".join(parts)
+
+    # addressDetailed
+    addr = val.get("addressDetailed")
+    if isinstance(addr, dict):
+        for k in ("text", "name", "address", "formatted"):
+            v = addr.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    elif isinstance(addr, str) and addr.strip():
+        return addr.strip()
+
+    # Flat geoReferences at top level
+    refs = val.get("geoReferences")
+    if isinstance(refs, list):
+        parts = [r.get("content") for r in refs
+                 if isinstance(r, dict) and r.get("content")]
+        if parts:
+            return ", ".join(parts)
+
     return None
