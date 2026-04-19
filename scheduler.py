@@ -7,9 +7,11 @@ from datetime import datetime, timezone, timedelta
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from aiogram.types import BufferedInputFile
+
 from config import config
 from database import db
-from parser import AvitoItem, fetch_search_items
+from parser import AvitoItem, download_image_bytes, fetch_search_items
 
 logger = logging.getLogger(__name__)
 
@@ -208,16 +210,27 @@ async def _send_notification(bot: Bot, sub: dict, item: AvitoItem):
     # (bad image URL, Telegram refusing the URL, etc.).
     if item.image_url:
         caption = text if len(text) <= 1024 else text[:1020] + "…"
-        try:
-            await bot.send_photo(
-                sub["telegram_id"], photo=item.image_url,
-                caption=caption, parse_mode="HTML", reply_markup=keyboard,
-            )
-            return
-        except Exception as e:
+        # Download the photo ourselves through the proxy. Telegram's
+        # server can't reach Avito's image CDN directly (Avito blocks
+        # Telegram's IPs and returns a captcha instead of the image).
+        img_bytes = await download_image_bytes(item.image_url)
+        if img_bytes:
+            try:
+                await bot.send_photo(
+                    sub["telegram_id"],
+                    photo=BufferedInputFile(img_bytes, filename="photo.jpg"),
+                    caption=caption, parse_mode="HTML", reply_markup=keyboard,
+                )
+                return
+            except Exception as e:
+                logger.info(
+                    "send_photo (bytes) failed (%s) for %s — falling back to text",
+                    str(e)[:80], item.avito_id,
+                )
+        else:
             logger.info(
-                "send_photo failed (%s) for %s — image_url=%r — falling back to text",
-                str(e)[:80], item.avito_id, item.image_url,
+                "[image] could not download %s for item %s",
+                item.image_url[:80], item.avito_id,
             )
 
     await bot.send_message(

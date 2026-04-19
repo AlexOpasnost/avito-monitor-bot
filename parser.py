@@ -82,6 +82,48 @@ async def _fetch_search_items_inner(url: str, proxy: str | None, max_retries: in
     return None
 
 
+async def download_image_bytes(url: str) -> bytes | None:
+    """Download an image through the same cloudscraper session + proxy
+    we use for HTML. Telegram can't fetch images from Avito's CDN
+    directly (Avito blocks Telegram's IPs), so we act as the fetcher."""
+    if not url:
+        return None
+    proxy = config.proxy_list[0] if config.proxy_list else None
+
+    def _do_download():
+        try:
+            s = _get_cloudscraper(proxy)
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            resp = s.get(
+                url,
+                proxies=proxies,
+                timeout=15,
+                headers={"Referer": "https://www.avito.ru/"},
+            )
+            if resp.status_code != 200:
+                logger.debug("[image] HTTP %d for %s", resp.status_code, url[:80])
+                return None
+            content = resp.content
+            if not content or len(content) < 500:
+                return None
+            # Quick magic-byte sanity check
+            if content.startswith((b"\xff\xd8\xff",      # JPEG
+                                   b"\x89PNG",            # PNG
+                                   b"RIFF",               # WEBP (container)
+                                   b"GIF8")):
+                return content
+            logger.debug("[image] not an image: %s, first bytes=%r",
+                         url[:80], content[:8])
+            return None
+        except Exception as e:
+            logger.debug("[image] download err: %s", e)
+            return None
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _do_download)
+
+
 async def rotate_ip() -> bool:
     """Call proxy rotation URL (if configured). Logs the exact URL being
     hit AND the response body so we can verify the env var is not
@@ -720,8 +762,111 @@ def _image_from_dict(obj) -> str | None:
     return None
 
 
+_CITY_SLUG_MAP = {
+    "moskva": "Москва",
+    "sankt-peterburg": "Санкт-Петербург",
+    "novosibirsk": "Новосибирск",
+    "ekaterinburg": "Екатеринбург",
+    "nizhniy_novgorod": "Нижний Новгород",
+    "kazan": "Казань",
+    "chelyabinsk": "Челябинск",
+    "omsk": "Омск",
+    "samara": "Самара",
+    "rostov-na-donu": "Ростов-на-Дону",
+    "ufa": "Уфа",
+    "krasnoyarsk": "Красноярск",
+    "perm": "Пермь",
+    "voronezh": "Воронеж",
+    "volgograd": "Волгоград",
+    "krasnodar": "Краснодар",
+    "saratov": "Саратов",
+    "tyumen": "Тюмень",
+    "tolyatti": "Тольятти",
+    "izhevsk": "Ижевск",
+    "barnaul": "Барнаул",
+    "ulyanovsk": "Ульяновск",
+    "irkutsk": "Иркутск",
+    "khabarovsk": "Хабаровск",
+    "vladivostok": "Владивосток",
+    "yaroslavl": "Ярославль",
+    "makhachkala": "Махачкала",
+    "tomsk": "Томск",
+    "orenburg": "Оренбург",
+    "kemerovo": "Кемерово",
+    "novokuznetsk": "Новокузнецк",
+    "ryazan": "Рязань",
+    "astrakhan": "Астрахань",
+    "penza": "Пенза",
+    "lipetsk": "Липецк",
+    "kirov": "Киров",
+    "cheboksary": "Чебоксары",
+    "kaliningrad": "Калининград",
+    "tula": "Тула",
+    "stavropol": "Ставрополь",
+    "simferopol": "Симферополь",
+    "sochi": "Сочи",
+    "bryansk": "Брянск",
+    "ivanovo": "Иваново",
+    "magnitogorsk": "Магнитогорск",
+    "tver": "Тверь",
+    "belgorod": "Белгород",
+    "arkhangelsk": "Архангельск",
+    "vladimir": "Владимир",
+    "kursk": "Курск",
+    "smolensk": "Смоленск",
+    "kaluga": "Калуга",
+    "orel": "Орёл",
+    "cherepovets": "Череповец",
+    "vologda": "Вологда",
+    "volzhskiy": "Волжский",
+    "surgut": "Сургут",
+    "vladikavkaz": "Владикавказ",
+    "tambov": "Тамбов",
+    "sterlitamak": "Стерлитамак",
+    "groznyy": "Грозный",
+    "kostroma": "Кострома",
+    "mytishchi": "Мытищи",
+    "novorossiysk": "Новороссийск",
+    "taganrog": "Таганрог",
+    "murmansk": "Мурманск",
+    "blagoveshchensk": "Благовещенск",
+    "yakutsk": "Якутск",
+    "pskov": "Псков",
+    "syktyvkar": "Сыктывкар",
+    "ulan-ude": "Улан-Удэ",
+    "podolsk": "Подольск",
+    "dzerzhinsk": "Дзержинск",
+    "novyy_urengoy": "Новый Уренгой",
+    "maykop": "Майкоп",
+    "voskresensk": "Воскресенск",
+    "mosrentgen": "Мосрентген",
+}
+
+
+def _city_from_url_path(url_path: str) -> str | None:
+    """Extract city slug from urlPath like /moskva/odezhda_.../item and
+    convert to human name. First segment is the city slug on every Avito
+    item URL."""
+    if not url_path:
+        return None
+    parts = url_path.lstrip("/").split("/", 1)
+    if not parts or not parts[0]:
+        return None
+    slug = parts[0].lower()
+    if slug == "all":
+        return None  # country-wide URL — no city
+    if slug in _CITY_SLUG_MAP:
+        return _CITY_SLUG_MAP[slug]
+    # Unknown slug — convert kebab/snake to Title Case
+    pretty = slug.replace("-", " ").replace("_", " ").strip()
+    if pretty:
+        return pretty[:1].upper() + pretty[1:]
+    return None
+
+
 def _extract_location(val: dict) -> str | None:
-    """Try every known shape Avito uses for the location string."""
+    """Try every known shape Avito uses for the location string, falling
+    back to the city slug from urlPath which is ALWAYS present."""
     # Direct location dict
     loc = val.get("location")
     if isinstance(loc, dict):
@@ -733,14 +878,13 @@ def _extract_location(val: dict) -> str | None:
     elif isinstance(loc, str) and loc.strip():
         return loc.strip()
 
-    # geo block (new Avito SPA favorite)
+    # geo block
     geo = val.get("geo")
     if isinstance(geo, dict):
         for k in ("formattedAddress", "address", "name", "text"):
             v = geo.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
-        # geoReferences is a list of {"content": "Москва", ...}
         refs = geo.get("geoReferences")
         if isinstance(refs, list):
             parts = [r.get("content") for r in refs
@@ -758,12 +902,5 @@ def _extract_location(val: dict) -> str | None:
     elif isinstance(addr, str) and addr.strip():
         return addr.strip()
 
-    # Flat geoReferences at top level
-    refs = val.get("geoReferences")
-    if isinstance(refs, list):
-        parts = [r.get("content") for r in refs
-                 if isinstance(r, dict) and r.get("content")]
-        if parts:
-            return ", ".join(parts)
-
-    return None
+    # Last resort — first segment of urlPath ("/moskva/...")
+    return _city_from_url_path(val.get("urlPath") or "")
