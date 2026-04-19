@@ -350,158 +350,99 @@ async def _fetch_hydration_json(url: str, proxy: str | None) -> tuple[list[Avito
         logger.debug("[html] exception: %s", e)
         return None, False
 
-    # Method 1: data-mfe-state hydration JSON (Duff89 method — BeautifulSoup)
+    # STRICT extraction — ONLY from the mfe-state script whose payload
+    # holds state.data.catalog.items. Avito loads 10+ MFE scripts per
+    # page (header, footer, recommendations, similar items, recently-
+    # viewed, catalog, ...) and all of them stash an "items" array
+    # somewhere in their hydration JSON. Picking any loose "items" list
+    # pulls in irrelevant items that do NOT match the user's filter.
+    items = _extract_catalog_items_strict(html, url)
+    if items is None:
+        logger.warning("[html] no catalog MFE on page (size=%d)", len(html))
+        return None, False
+    logger.info("[html] parsed %d catalog items (strict)", len(items))
+    return items, False
+
+
+def _extract_catalog_items_strict(html: str, url: str) -> list[AvitoItem] | None:
+    """Walk every <script data-mfe-state="true"> and return items from the
+    FIRST one whose state.data.catalog.items is a non-empty list. Return
+    empty list if the catalog MFE is present but empty (legitimate zero-
+    results). Return None if no catalog MFE is found at all."""
     try:
         from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        for script in soup.select("script"):
-            if (script.get("type") == "mime/invalid"
-                and script.get("data-mfe-state") == "true"
-                and "sandbox" not in (script.text or "")):
-                data = orjson.loads(html_lib.unescape(script.text))
-                if data.get("i18n", {}).get("hasMessages", {}):
-                    catalog = data.get("state", {}).get("data", {}).get("catalog", {})
-                    items_raw = catalog.get("items") or []
-                    items: list[AvitoItem] = []
-                    for raw in items_raw:
-                        if isinstance(raw, dict) and raw.get("type") and raw.get("type") != "item":
-                            continue
-                        val = raw.get("value") if isinstance(raw, dict) and "value" in raw else raw
-                        if not isinstance(val, dict):
-                            continue
-                        try:
-                            items.append(_parse_api_item(val))
-                        except Exception:
-                            pass
-                    if items:
-                        logger.info("[html] parsed %d items from mfe-state (Duff89 method)", len(items))
-                        return items, False
-                    else:
-                        logger.info("[html] mfe-state found (i18n OK) but catalog empty, keys: %s",
-                                   list(data.get("state", {}).get("data", {}).keys())[:8])
     except ImportError:
-        logger.debug("[html] BeautifulSoup not installed, skipping mfe-state method")
-    except Exception as e:
-        logger.debug("[html] mfe-state parse err: %s", e)
+        logger.warning("[html] beautifulsoup4 not installed")
+        return None
 
-    # Method 2: __initialData__ (URL-encoded JSON in older Avito pages)
-    from urllib.parse import unquote
-    init_match = re.search(r'window\.__initialData__\s*=\s*"(.+?)"\s*;', html, re.DOTALL)
-    if init_match:
+    soup = BeautifulSoup(html, "html.parser")
+    mfe_scripts = soup.select('script[data-mfe-state="true"]')
+    logger.info("[html] found %d mfe-state scripts", len(mfe_scripts))
+
+    catalog_found = False
+    for idx, script in enumerate(mfe_scripts):
+        body = (script.text or "").strip()
+        if not body or "sandbox" in body[:200]:
+            continue
         try:
-            raw_json = unquote(init_match.group(1))
-            data = orjson.loads(raw_json)
-            items = _extract_items_from_json(data)
-            if items:
-                logger.info("[html] parsed %d items from __initialData__", len(items))
-                return items, False
+            data = orjson.loads(html_lib.unescape(body))
         except Exception as e:
-            logger.debug("[html] __initialData__ parse err: %s", e)
-
-    # Method 3: __preloadedState__ or __mfe__ (URL-encoded JSON in quotes)
-    for var_name in ['__preloadedState__', '__preloadedState_', '__mfe__']:
-        marker = f'window.{var_name}'
-        idx = html.find(marker)
-        if idx < 0:
+            logger.debug("[html] mfe #%d JSON decode err: %s", idx, str(e)[:80])
             continue
-        # Find the opening quote after =
-        eq_idx = html.find('=', idx)
-        if eq_idx < 0:
-            continue
-        # Skip whitespace after =
-        start = eq_idx + 1
-        while start < len(html) and html[start] in ' \t\n\r':
-            start += 1
-        if start >= len(html):
+        if not isinstance(data, dict):
             continue
 
-        try:
-            if html[start] == '"':
-                # URL-encoded string: "...encoded..."
-                end = html.find('";', start + 1)
-                if end < 0:
-                    end = html.find('"', start + 1)
-                if end > start:
-                    encoded = html[start + 1:end]
-                    decoded = unquote(encoded)
-                    data = orjson.loads(decoded)
-            elif html[start] == '{':
-                # Raw JSON object — find matching }
-                depth = 0
-                i = start
-                while i < min(len(html), start + 5_000_000):
-                    if html[i] == '{':
-                        depth += 1
-                    elif html[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            data = orjson.loads(html[start:i + 1])
-                            break
-                    i += 1
-                else:
-                    continue
-            else:
+        catalog = (
+            data.get("state", {}) if isinstance(data.get("state"), dict) else {}
+        ).get("data", {})
+        if not isinstance(catalog, dict):
+            continue
+        catalog = catalog.get("catalog")
+        if not isinstance(catalog, dict):
+            continue
+
+        # This IS the catalog MFE
+        catalog_found = True
+        items_raw = catalog.get("items")
+        if not isinstance(items_raw, list):
+            logger.info("[html] mfe #%d is catalog but items not a list", idx)
+            return []
+
+        # Parse into AvitoItems — skip non-item rows (banners / snippets)
+        items: list[AvitoItem] = []
+        skipped_non_item = 0
+        for raw in items_raw:
+            if not isinstance(raw, dict):
                 continue
+            rtype = (raw.get("type") or "").strip()
+            # Reject known non-catalog-result types
+            if rtype and rtype not in ("item", ""):
+                skipped_non_item += 1
+                continue
+            val = raw.get("value", raw) if "value" in raw else raw
+            if not isinstance(val, dict):
+                continue
+            if not (val.get("id") or val.get("itemId")):
+                continue
+            try:
+                items.append(_parse_api_item(val))
+            except Exception:
+                pass
+        logger.info(
+            "[html] mfe #%d is CATALOG: %d raw rows -> %d items (%d non-item rows skipped)",
+            idx, len(items_raw), len(items), skipped_non_item,
+        )
+        if items:
+            # Sanity-check: log first 3 item url paths so we can verify
+            # they're in the expected subcategory. Mismatch here = bug
+            # upstream (URL vs. Avito response disagreement).
+            sample_paths = [i.url.replace("https://www.avito.ru", "")[:60] for i in items[:3]]
+            logger.info("[html] sample item paths: %s", sample_paths)
+        return items
 
-            items = _extract_items_from_json(data)
-            if items:
-                logger.info("[html] parsed %d items from %s", len(items), var_name)
-                return items, False
-            else:
-                # Log deeper structure to find where items hide
-                keys_info = list(data.keys())[:8] if isinstance(data, dict) else "?"
-                logger.info("[html] %s found but no items (keys: %s)", var_name, keys_info)
-                # Dig into first-level values
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if isinstance(v, dict):
-                            sub_keys = list(v.keys())[:8]
-                            size = len(str(v))
-                            if size > 5000:
-                                logger.info("[html]   %s.%s (%d chars): %s", var_name, k, size, sub_keys)
-                                # Try second level
-                                for k2, v2 in v.items():
-                                    if isinstance(v2, dict) and len(str(v2)) > 5000:
-                                        logger.info("[html]     %s.%s.%s (%d chars): %s",
-                                                   var_name, k, k2, len(str(v2)), list(v2.keys())[:8])
-        except Exception as e:
-            logger.debug("[html] %s parse error: %s", var_name, e)
-
-    # Debug: what JS vars and scripts are on the page?
-    js_vars = re.findall(r'window\.(__\w+__)\s*=', html[:50000])
-    mfe_scripts = re.findall(r'data-mfe-state', html[:50000])
-    logger.info("[html] JS vars: %s, mfe-state tags: %d, page size: %d",
-                js_vars[:5], len(mfe_scripts), len(html))
-
-    # Method 4: data-item-id from HTML (last resort)
-    item_ids = re.findall(r'data-item-id="(\d+)"', html)
-    if len(item_ids) >= 3:
-        items = []
-        for item_id in item_ids:
-            # Extract minimal info: title from nearby link
-            idx = html.find(f'data-item-id="{item_id}"')
-            block = html[idx:idx + 3000] if idx >= 0 else ""
-            title_m = re.search(r'title="([^"]{5,80})"', block)
-            title = title_m.group(1) if title_m else f"Объявление {item_id}"
-            # Skip junk titles
-            if "избранное" in title.lower() or "сравнение" in title.lower():
-                title_m2 = re.search(r'href="[^"]*"[^>]*>([^<]{5,80})<', block)
-                title = title_m2.group(1).strip() if title_m2 else f"Объявление {item_id}"
-            url_m = re.search(rf'href="(/[^"]*?{item_id}[^"]*?)"', block)
-            url_path = url_m.group(1).split("?")[0] if url_m else f"/{item_id}"
-            price_m = re.search(r'(\d[\d\s]*\d)\s*₽', block)
-            price = (price_m.group(1).strip() + " ₽") if price_m else ""
-            items.append(AvitoItem(
-                avito_id=item_id, title=title, price=price, price_value=None,
-                url=f"https://www.avito.ru{url_path}",
-                image_url=None, location=None, description=None,
-                seller_name=None, published_timestamp=None,
-            ))
-        logger.info("[html] parsed %d items from data-item-id", len(items))
-        return items, False
-
-    logger.warning("[html] no items found in HTML (size=%d)", len(html))
-    return None, False
+    if not catalog_found:
+        return None
+    return []
 
 
 # ---------------------------------------------------------------------------
