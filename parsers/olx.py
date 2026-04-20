@@ -1,21 +1,34 @@
-"""OLX (olx.pl / olx.ua / olx.ro / olx.com.br / ...) marketplace parser.
+"""OLX (olx.pl / olx.ua / olx.ro / olx.com.br / …) marketplace parser.
 
-OLX does NOT ship a server-side hydration JSON blob on listing pages. Data
-lives in the rendered DOM: `[data-cy="l-card"]` nodes, one per ad.
+OLX has a public-but-unauthenticated JSON API at /api/v1/offers that
+returns full item data (photos, prices with currency, absolute ISO 8601
+dates, description, seller) — much richer than scraping the DOM.
 
-CRITICAL — organic vs promoted:
-    Promoted ads (paid "TOP" placements) are mixed into the list and are
-    NOT sorted by date. We detect them via href `search_reason=search|promoted`
-    and SKIP them. Only organic items (`search_reason=search|organic`) are
-    returned, so the monitor stays coherent when the user filters by "newest".
+The listing HTML server-side-renders only the first ~5 cards with real
+<img src> URLs; everything below the fold is a placeholder SVG (the
+real URL never arrives until JS scrolls into view). So for reliable
+photos on every item we MUST use the API.
+
+Strategy:
+  1. If the URL path matches /oferty/q-<term>/ we have a free-text
+     search and we can build the API URL directly (query=<term>).
+  2. Otherwise the URL is category-based; we fetch the HTML once,
+     extract `CID<N>-` from any item href, and use category_id=<N>.
+  3. Any `search[...]=...` params from the original URL are forwarded
+     to the API as-is.
+Promoted/top_ad listings are filtered out so the monitor stays in sync
+with the user's "newest first" sort.
 """
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import logging
 import re
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, urlunparse
+from datetime import datetime
+from urllib.parse import quote, urlparse
+
+import orjson
 
 from .base import SearchItem
 from .common import (
@@ -30,125 +43,38 @@ from .common import (
 logger = logging.getLogger(__name__)
 
 _HOST = "olx"
-# olx.pl, olx.ua, olx.ro, olx.bg, olx.pt, olx.kz, olx.uz, olx.ba, olx.com.br, ...
 _OLX_URL_RE = re.compile(
     r"https?://(?:www\.|m\.)?olx\.(?:com\.[a-z]{2}|[a-z]{2,3})/",
     re.IGNORECASE,
 )
 
-# "Today" literal per UI locale — covers the regions where OLX still operates.
-# Values normalized to lowercase for matching.
-_TODAY_WORDS = (
-    "dzisiaj",      # PL
-    "сьогодні",     # UA
-    "сегодня",      # RU (kz, uz)
-    "astăzi",       # RO
-    "astazi",       # RO w/o diacritics
-    "днес",         # BG
-    "danas",        # BA/HR/RS
-    "hoje",         # PT, BR
-    "today",        # EN fallback
-)
+# Photo CDN template: the API returns links like
+# "https://ireland.apollo.olxcdn.com:443/v1/files/<id>-PL/image;s={width}x{height}"
+# We fill in a fixed size — 600x600 is big enough for a Telegram photo
+# and the CDN supports arbitrary sizes.
+_PHOTO_W, _PHOTO_H = 600, 600
 
-# "Yesterday" literal per locale — useful when OLX shows "Yesterday at HH:MM"
-_YESTERDAY_WORDS = (
-    "wczoraj",      # PL
-    "вчора",        # UA
-    "вчера",        # RU, BG
-    "ieri",         # RO
-    "juče",         # BA/HR/RS
-    "ontem",        # PT, BR
-    "yesterday",    # EN
-)
-
-# HH:MM extractor
-_TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
-
-# Numeric absolute date: "19.04.2026"
-_ABS_DATE_NUMERIC_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
-
-# Absolute date with month name: "19 kwietnia 2026", "19 kwietnia",
-# "3 жовтня 2026", etc. Year is optional — defaults to current.
-_ABS_DATE_WORD_RE = re.compile(r"(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?", re.UNICODE)
-
-# Month word → month number. Covers every OLX UI language we care about.
-# Both nominative and genitive forms since some regions use "kwiecień"
-# and others "kwietnia" ("19 of April" vs "April 19").
-_MONTH_NAMES: dict[str, int] = {
-    # Polish
-    "styczeń": 1, "stycznia": 1, "sty": 1,
-    "luty": 2, "lutego": 2, "lut": 2,
-    "marzec": 3, "marca": 3, "mar": 3,
-    "kwiecień": 4, "kwietnia": 4, "kwi": 4,
-    "maj": 5, "maja": 5,
-    "czerwiec": 6, "czerwca": 6, "cze": 6,
-    "lipiec": 7, "lipca": 7, "lip": 7,
-    "sierpień": 8, "sierpnia": 8, "sie": 8,
-    "wrzesień": 9, "września": 9, "wrz": 9,
-    "październik": 10, "października": 10, "paź": 10,
-    "listopad": 11, "listopada": 11, "lis": 11,
-    "grudzień": 12, "grudnia": 12, "gru": 12,
-    # Ukrainian
-    "січень": 1, "січня": 1,
-    "лютий": 2, "лютого": 2,
-    "березень": 3, "березня": 3,
-    "квітень": 4, "квітня": 4,
-    "травень": 5, "травня": 5,
-    "червень": 6, "червня": 6,
-    "липень": 7, "липня": 7,
-    "серпень": 8, "серпня": 8,
-    "вересень": 9, "вересня": 9,
-    "жовтень": 10, "жовтня": 10,
-    "листопад_ua": 11,  # same spelling as PL; handled by PL entry above
-    "грудень": 12, "грудня": 12,
-    # Russian (for olx.kz / olx.uz)
-    "январь": 1, "января": 1, "янв": 1,
-    "февраль": 2, "февраля": 2, "фев": 2,
-    "март": 3, "марта": 3,
-    "апрель": 4, "апреля": 4, "апр": 4,
-    # "май" already above
-    "июнь": 6, "июня": 6, "июн": 6,
-    "июль": 7, "июля": 7, "июл": 7,
-    "август": 8, "августа": 8, "авг": 8,
-    "сентябрь": 9, "сентября": 9, "сен": 9,
-    "октябрь": 10, "октября": 10, "окт": 10,
-    "ноябрь": 11, "ноября": 11, "ноя": 11,
-    "декабрь": 12, "декабря": 12, "дек": 12,
-    # Romanian
-    "ianuarie": 1, "februarie": 2, "martie": 3, "aprilie": 4,
-    "iunie": 6, "iulie": 7,
-    "septembrie": 9, "octombrie": 10, "noiembrie": 11, "decembrie": 12,
-    # Portuguese (olx.pt, olx.com.br)
-    "janeiro": 1, "fevereiro": 2, "março": 3, "abril": 4,
-    "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
-    "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
-    # English (fallback)
-    "january": 1, "february": 2, "march": 3, "april": 4,
-    "june": 6, "july": 7,
-    "september": 9, "october": 10, "november": 11, "december": 12,
-    "jan": 1, "feb": 2, "apr": 4, "jun": 6, "jul": 7,
-    "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+# Rough USD exchange rates (April 2026). Used only for a parenthetical
+# "~N $" hint next to the native price; precision doesn't matter much
+# for a monitor. Can be overridden via env later if needed.
+_USD_RATES: dict[str, float] = {
+    "USD": 1.0,
+    "EUR": 1.08,        # olx.pt and cross-region
+    "PLN": 0.25,        # olx.pl
+    "UAH": 0.024,       # olx.ua
+    "RON": 0.22,        # olx.ro
+    "BGN": 0.57,        # olx.bg
+    "BRL": 0.20,        # olx.com.br
+    "KZT": 0.002,       # olx.kz
+    "UZS": 0.000077,    # olx.uz
+    "BAM": 0.58,        # olx.ba
+    "RUB": 0.011,       # rare but possible
 }
 
-# Digits for price extraction
-_DIGITS_RE = re.compile(r"[\d\s]+")
-
-# Thumbnail size — OLX CDN templates: ";s=<w>x<h>;q=<q>"
-_IMG_SIZE_RE = re.compile(r";s=\d+x\d+", re.IGNORECASE)
-
-# Local TZ per country — OLX displays times in the user's regional timezone.
-# Approximate mapping from domain TLD; good enough for "today" anchoring.
-_TLD_TZ = {
-    "pl": "Europe/Warsaw",
-    "ua": "Europe/Kyiv",
-    "ro": "Europe/Bucharest",
-    "bg": "Europe/Sofia",
-    "pt": "Europe/Lisbon",
-    "kz": "Asia/Almaty",
-    "uz": "Asia/Tashkent",
-    "ba": "Europe/Sarajevo",
-    "com.br": "America/Sao_Paulo",
-}
+# In case the API returns a category-only URL path (no /oferty/q-...),
+# we extract the numeric category id from any item href on the HTML
+# listing page: /d/oferta/<slug>-CID<N>-ID<hash>.html
+_CID_IN_HREF_RE = re.compile(r"CID(\d+)-ID")
 
 
 class OlxSource:
@@ -174,11 +100,13 @@ class OlxSource:
 # Fetch pipeline
 # ---------------------------------------------------------------------------
 
-async def _fetch_inner(url, proxy, max_retries):
-    origin = _origin_for(url)
-    warmup = (origin + "/",) if origin else ()
+async def _fetch_inner(url: str, proxy: str | None, max_retries: int) -> list[SearchItem] | None:
+    api_url = await _build_api_url(url, proxy)
+    if api_url is None:
+        logger.error("[olx] could not build API URL for %s", url[:100])
+        return None
     for attempt in range(max_retries):
-        items, blocked = await _fetch_html(url, proxy, warmup)
+        items, blocked = await _fetch_api(api_url, url, proxy)
         if items is not None:
             logger.info("[olx] fetched %d items for %s", len(items), url[:80])
             return items
@@ -189,8 +117,6 @@ async def _fetch_inner(url, proxy, max_retries):
             attempt + 1, max_retries, " + IP" if proxy else "",
         )
         invalidate_session(_HOST)
-        # Rotating the mobile proxy is only useful when OLX was actually
-        # reached through it; we normally run direct (proxy=None).
         if proxy:
             await rotate_ip()
         await asyncio.sleep(5)
@@ -198,46 +124,162 @@ async def _fetch_inner(url, proxy, max_retries):
     return None
 
 
-async def _fetch_html(url, proxy, warmup):
+async def _fetch_api(api_url: str, user_url: str, proxy: str | None):
     loop = asyncio.get_running_loop()
     resp_data = await loop.run_in_executor(
-        None, lambda: _fetch_html_sync(url, proxy, warmup),
+        None, lambda: _fetch_api_sync(api_url, proxy),
     )
     if resp_data is None:
         return None, False
-    status, html, _headers = resp_data
-
+    status, body = resp_data
     if status in (429, 403):
-        logger.warning("[olx] BLOCKED %d for %s", status, url[:80])
-        return None, True
-    if status in (301, 302, 303, 307, 308):
-        logger.warning("[olx] REDIRECT %d (block) for %s", status, url[:80])
+        logger.warning("[olx] API BLOCKED %d", status)
         return None, True
     if status != 200:
-        logger.debug("[olx] HTTP %d for %s", status, url[:80])
+        logger.debug("[olx] API HTTP %d for %s", status, api_url[:100])
         return None, False
-    logger.info("[olx] page loaded: %d, size=%d", status, len(html))
-
-    items = _extract_items(html, url)
-    if items is None:
-        logger.warning("[olx] no l-card nodes in page (size=%d)", len(html))
+    try:
+        data = orjson.loads(body)
+    except Exception as e:
+        logger.warning("[olx] API JSON decode err: %s", str(e)[:80])
         return None, False
+    items = _parse_api_response(data, user_url)
     return items, False
 
 
-def _fetch_html_sync(url, proxy, warmup):
+def _fetch_api_sync(api_url: str, proxy: str | None):
     try:
-        s = get_cloudscraper(_HOST, warmup_urls=list(warmup), proxy=proxy)
+        origin = _origin_for(api_url) or "https://www.olx.pl"
+        s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
         proxies = proxies_dict(proxy)
-        logger.info("[olx] REQUEST url=%r (len=%d)", url, len(url))
-        resp = s.get(url, proxies=proxies, timeout=60, allow_redirects=True)
-        logger.info(
-            "[olx] response final_url=%r, status=%d",
-            str(resp.url), resp.status_code,
+        headers = {"Accept": "application/json"}
+        logger.info("[olx] API REQUEST url=%r", api_url)
+        resp = s.get(
+            api_url, proxies=proxies, timeout=30, headers=headers,
+            allow_redirects=True,
         )
-        return resp.status_code, resp.text, dict(resp.headers)
+        logger.info("[olx] API response status=%d, size=%d",
+                    resp.status_code, len(resp.text))
+        return resp.status_code, resp.text
     except Exception as e:
-        logger.debug("[olx] sync fetch error: %s", e)
+        logger.debug("[olx] API sync fetch error: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# URL → API URL translation
+# ---------------------------------------------------------------------------
+
+# Matches a query-term segment: /oferty/q-<slug>/ or /q-<slug>/
+_QUERY_IN_PATH_RE = re.compile(r"/q-([^/?]+)", re.IGNORECASE)
+
+
+async def _build_api_url(url: str, proxy: str | None) -> str | None:
+    p = urlparse(url)
+    if not p.netloc:
+        return None
+    origin = f"{p.scheme or 'https'}://{p.netloc}"
+    base = f"{origin}/api/v1/offers"
+
+    # Parse the user's query string into (key, value) pairs, preserving
+    # encoded brackets so search[filter_enum_state][0]=new passes through
+    # the API unchanged.
+    original_pairs = _parse_raw_query(p.query or "")
+
+    # Strategy 1: free-text query like /oferty/q-iphone/
+    m = _QUERY_IN_PATH_RE.search(p.path or "")
+    if m:
+        term = m.group(1).replace("-", " ")
+        pairs = [("query", term)] + original_pairs
+        return base + "?" + _encode_pairs(pairs)
+
+    # Strategy 2: category-based path — fetch the HTML listing once,
+    # extract the category id from any item href's "CID<N>-" marker.
+    cid = await _extract_category_id(url, proxy)
+    if cid is not None:
+        pairs = [("category_id", str(cid))] + original_pairs
+        return base + "?" + _encode_pairs(pairs)
+
+    # Strategy 3: last-resort — pass through only the search[…] filters.
+    # Without a category the result will be the whole catalog filtered
+    # by generic params; prefer returning SOMETHING over nothing.
+    if original_pairs:
+        logger.warning("[olx] no query term / category_id extracted, using bare search params")
+        return base + "?" + _encode_pairs(original_pairs)
+
+    logger.warning("[olx] URL has neither query nor category markers: %s", url[:100])
+    return base
+
+
+def _parse_raw_query(q: str) -> list[tuple[str, str]]:
+    """Split a raw query string, tolerant of bracket notation.
+
+    Values are returned URL-decoded; we re-encode when reassembling.
+    """
+    from urllib.parse import unquote
+    out: list[tuple[str, str]] = []
+    if not q:
+        return out
+    for chunk in q.split("&"):
+        if not chunk:
+            continue
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+        else:
+            k, v = chunk, ""
+        out.append((unquote(k), unquote(v)))
+    return out
+
+
+def _encode_pairs(pairs) -> str:
+    # quote() with safe="[]" preserves bracket notation the API expects
+    # for search[filter_enum_...][N]=... keys.
+    return "&".join(
+        f"{quote(k, safe='[]')}={quote(v, safe='[],:%')}" for k, v in pairs
+    )
+
+
+async def _extract_category_id(url: str, proxy: str | None) -> int | None:
+    """Fetch the HTML listing once and pick a category_id out of any
+    item href. Cheap: only the first ~20 KB is inspected."""
+    loop = asyncio.get_running_loop()
+    html_text = await loop.run_in_executor(
+        None, lambda: _fetch_html_head_sync(url, proxy),
+    )
+    if not html_text:
+        return None
+    m = _CID_IN_HREF_RE.search(html_text)
+    if m is None:
+        logger.warning("[olx] no CID<N>- marker found in HTML of %s", url[:100])
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _fetch_html_head_sync(url: str, proxy: str | None) -> str | None:
+    try:
+        origin = _origin_for(url) or "https://www.olx.pl"
+        s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
+        proxies = proxies_dict(proxy)
+        logger.info("[olx] HTML probe for category_id: %s", url[:100])
+        resp = s.get(url, proxies=proxies, timeout=30, allow_redirects=True, stream=True)
+        try:
+            # First 200 KB is plenty to hit a few l-card hrefs
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=32 * 1024):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= 200 * 1024:
+                    break
+            body = b"".join(chunks).decode("utf-8", errors="ignore")
+            return body
+        finally:
+            resp.close()
+    except Exception as e:
+        logger.debug("[olx] html-head fetch error: %s", e)
         return None
 
 
@@ -251,57 +293,47 @@ def _origin_for(url: str) -> str:
     return ""
 
 
-def _tld_for(url: str) -> str:
-    try:
-        host = urlparse(url).netloc.lower()
-        if host.endswith(".com.br"):
-            return "com.br"
-        return host.rsplit(".", 1)[-1]
-    except Exception:
-        return ""
-
-
 # ---------------------------------------------------------------------------
-# DOM extraction
+# API response parsing
 # ---------------------------------------------------------------------------
 
-def _extract_items(html: str, url: str) -> list[SearchItem] | None:
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        logger.warning("[olx] beautifulsoup4 not installed")
+def _parse_api_response(data: dict, user_url: str) -> list[SearchItem] | None:
+    raw = data.get("data")
+    if not isinstance(raw, list):
+        logger.warning("[olx] API response has no data[] array, keys=%s",
+                       list(data.keys())[:10])
         return None
+    metadata = data.get("metadata") or {}
+    total = metadata.get("total_elements") or metadata.get("visible_total_count")
+    source = metadata.get("source") or {}
+    organic_idx = source.get("organic")
+    if not isinstance(organic_idx, list):
+        organic_idx = None
 
-    soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select('[data-cy="l-card"]')
-    if not cards:
-        return None
-
-    origin = _origin_for(url) or "https://www.olx.pl"
-    tz = _tz_for_url(url)
-
-    total_raw = _extract_total(soup)
     logger.info(
-        "[olx] %d l-cards, total=%s, tz=%s",
-        len(cards), total_raw, getattr(tz, "key", str(tz)),
+        "[olx] API listing: %d entries, total=%s, organic_idx=%s",
+        len(raw), total,
+        ("whole list" if organic_idx is None else f"{len(organic_idx)} indexes"),
     )
 
     items: list[SearchItem] = []
     skipped_promoted = 0
-    for card in cards:
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        # Filter promoted / top_ad ads to keep the "newest first" order
+        # stable across cycles.
+        if organic_idx is not None and idx not in organic_idx:
+            skipped_promoted += 1
+            continue
+        promo = entry.get("promotion") or {}
+        if promo.get("top_ad"):
+            skipped_promoted += 1
+            continue
         try:
-            it = _parse_card(card, origin, tz)
-            if it is None:
-                skipped_promoted += 1
-                continue
-            items.append(it)
+            items.append(_parse_api_item(entry))
         except Exception as e:
-            logger.debug("[olx] parse card err: %s", e)
-
-    logger.info(
-        "[olx] parsed %d organic items (skipped %d promoted)",
-        len(items), skipped_promoted,
-    )
+            logger.debug("[olx] parse api item err: %s", e)
 
     if items:
         total_cnt = len(items)
@@ -310,45 +342,47 @@ def _extract_items(html: str, url: str) -> list[SearchItem] | None:
         with_desc = sum(1 for i in items if i.description)
         with_ts = sum(1 for i in items if i.published_timestamp)
         logger.info(
-            "[olx] completeness: image=%d/%d, location=%d/%d, desc=%d/%d, date=%d/%d",
+            "[olx] completeness: image=%d/%d, location=%d/%d, desc=%d/%d, date=%d/%d"
+            " (skipped %d promoted)",
             with_image, total_cnt, with_loc, total_cnt,
-            with_desc, total_cnt, with_ts, total_cnt,
+            with_desc, total_cnt, with_ts, total_cnt, skipped_promoted,
         )
-        sample = [i.url.replace(origin, "")[:50] for i in items[:3]]
-        logger.info("[olx] sample item paths: %s", sample)
     return items
 
 
-def _extract_total(soup) -> str | None:
-    node = soup.select_one('[data-testid="total-count"]')
-    if node is None:
-        return None
-    return (node.get_text() or "").strip() or None
+def _parse_api_item(entry: dict) -> SearchItem:
+    ext_id = str(entry.get("id") or "")
+    title = (entry.get("title") or "").strip()
+    item_url = (entry.get("url") or "").strip()
+    if not item_url:
+        # Fall back to a canonical-ish URL if api omitted it
+        item_url = f"https://www.olx.pl/d/oferta/-ID{ext_id}.html"
 
+    # Strip HTML from description, decode entities, trim whitespace.
+    desc_raw = entry.get("description") or ""
+    description = _clean_description(desc_raw) or None
 
-def _parse_card(card, origin: str, tz) -> SearchItem | None:
-    ext_id = (card.get("id") or "").strip()
-    if not ext_id:
-        return None
+    # Published timestamp: prefer last_refresh (user sees refreshed ads
+    # as new), fall back to created.
+    ts_str = entry.get("last_refresh_time") or entry.get("created_time")
+    ts = _parse_iso(ts_str)
 
-    link = card.select_one('a[href*="/oferta/"], a[href*="/d/oferta/"]')
-    if link is None:
-        return None
-    href = link.get("href") or ""
-    # Skip paid "TOP" placements — they break date-sorted monitoring.
-    if _is_promoted(href):
-        return None
+    # Price — extract from params list
+    price_str, price_value, currency = _parse_price(entry.get("params") or [])
+    if price_value and currency:
+        usd = _usd_estimate(price_value, currency)
+        if usd and currency.upper() != "USD":
+            price_str = f"{price_str} (~{usd} $)"
 
-    item_url = _absolutize(href, origin)
+    # Location
+    loc = _parse_location(entry.get("location") or {})
 
-    title_node = card.select_one('[data-cy="ad-card-title"] h4, [data-cy="ad-card-title"] h6')
-    if title_node is None:
-        title_node = card.select_one('h4, h6')
-    title = (title_node.get_text() or "").strip() if title_node else ""
+    # First photo
+    image_url = _extract_photo(entry.get("photos") or [])
 
-    price_str, price_value = _extract_price(card)
-    image_url = _extract_image_url(card)
-    loc_text, ts = _extract_location_and_date(card, tz)
+    # Seller name
+    user = entry.get("user") or {}
+    seller = (user.get("name") or "").strip() or None
 
     return SearchItem(
         source="olx",
@@ -358,186 +392,127 @@ def _parse_card(card, origin: str, tz) -> SearchItem | None:
         price_value=price_value,
         url=item_url,
         image_url=image_url,
-        location=loc_text,
-        description=None,   # description only on item page
-        seller_name=None,   # seller only on item page
+        location=loc,
+        description=description,
+        seller_name=seller,
         published_timestamp=ts,
     )
 
 
-def _is_promoted(href: str) -> bool:
-    h = href.lower()
-    # search_reason may be URL-encoded (%7C) or not (|)
-    return (
-        "search_reason=search%7cpromoted" in h
-        or "search_reason=search|promoted" in h
-    )
+def _parse_iso(s) -> int | None:
+    """Parse "2026-04-20T18:55:59+02:00" → unix seconds (int).
 
-
-def _absolutize(href: str, origin: str) -> str:
-    if href.startswith("http://") or href.startswith("https://"):
-        # Strip tracking query ?search_reason=... for a cleaner canonical URL
-        return _strip_search_reason(href)
-    if not href.startswith("/"):
-        href = "/" + href
-    return _strip_search_reason(origin + href)
-
-
-def _strip_search_reason(url: str) -> str:
+    datetime.fromisoformat in Python 3.11 handles offset natively; the
+    result is tz-aware, so .timestamp() gives correct UTC seconds.
+    """
+    if not isinstance(s, str) or not s:
+        return None
     try:
-        p = urlparse(url)
-        if not p.query:
-            return url
-        parts = [q for q in p.query.split("&") if not q.lower().startswith("search_reason=")]
-        return urlunparse(p._replace(query="&".join(parts)))
-    except Exception:
-        return url
+        # Python 3.11 accepts "+HH:MM" and trailing "Z"
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Price / image / location / date
-# ---------------------------------------------------------------------------
-
-def _extract_price(card) -> tuple[str, int | None]:
-    node = card.select_one('[data-testid="ad-price"]')
-    if node is None:
-        return "Цена не указана", None
-    raw = (node.get_text(" ", strip=True) or "").strip()
-    if not raw:
-        return "Цена не указана", None
-    # Pull out the leading numeric chunk for price_value
-    m = _DIGITS_RE.search(raw)
-    value = None
-    if m:
-        digits = re.sub(r"\D", "", m.group(0))
+def _parse_price(params) -> tuple[str, int | None, str | None]:
+    if not isinstance(params, list):
+        return "Цена не указана", None, None
+    price_obj = None
+    for p in params:
+        if isinstance(p, dict) and p.get("key") == "price":
+            v = p.get("value")
+            if isinstance(v, dict):
+                price_obj = v
+                break
+    if price_obj is None:
+        return "Цена не указана", None, None
+    label = (price_obj.get("label") or "").strip() or None
+    value_raw = price_obj.get("value")
+    currency = price_obj.get("currency")
+    price_value = None
+    if isinstance(value_raw, (int, float)):
+        price_value = int(value_raw)
+    elif isinstance(value_raw, str):
+        digits = re.sub(r"\D", "", value_raw)
         if digits:
             try:
-                value = int(digits)
-            except ValueError:
-                value = None
-    # Cosmetic cleanup: insert a space between "złdo negocjacji" → "zł do negocjacji"
-    raw = re.sub(r"([a-zA-Zł€$])(do|від|od|до)\b", r"\1 \2", raw)
-    return raw, value
-
-
-def _extract_image_url(card) -> str | None:
-    img = card.select_one("img")
-    if img is None:
-        return None
-    # OLX server-renders listing cards with lazy-loaded images — initial
-    # `src` is usually a placeholder SVG; the real URL lives in `srcset`
-    # or `data-src`. Try each spot before giving up.
-    for attr in ("src", "data-src", "data-lazy-src", "data-original"):
-        url = _clean_olx_image_url(img.get(attr) or "")
-        if url:
-            return url
-    srcset = img.get("srcset") or ""
-    if srcset:
-        first = srcset.strip().split(",")[0].strip().split(" ")[0]
-        url = _clean_olx_image_url(first)
-        if url:
-            return url
-    return None
-
-
-def _clean_olx_image_url(raw: str) -> str | None:
-    if not raw:
-        return None
-    # Reject placeholder SVG / relative paths
-    if raw.startswith("/") or raw.endswith(".svg"):
-        return None
-    if not raw.startswith("http"):
-        return None
-    # Upscale CDN thumbnail spec: ";s=216x152" → ";s=512x512"
-    return _IMG_SIZE_RE.sub(";s=512x512", raw, count=1)
-
-
-def _extract_location_and_date(card, tz) -> tuple[str | None, int | None]:
-    node = card.select_one('[data-testid="location-date"]')
-    if node is None:
-        return None, None
-    raw = (node.get_text() or "").strip()
-    if not raw:
-        return None, None
-    # Format: "<City[, District]> - <Date phrase>"
-    if " - " in raw:
-        loc, date_part = raw.rsplit(" - ", 1)
-        loc = loc.strip() or None
-        ts = _parse_relative_date(date_part.strip(), tz)
-    else:
-        loc, ts = raw, None
-    return loc, ts
-
-
-def _parse_relative_date(phrase: str, tz) -> int | None:
-    if not phrase:
-        return None
-    low = phrase.lower()
-    time_m = _TIME_RE.search(low)
-    hh, mm = (0, 0)
-    if time_m:
-        try:
-            hh, mm = int(time_m.group(1)), int(time_m.group(2))
-        except ValueError:
-            hh, mm = 0, 0
-
-    now = datetime.now(tz) if tz is not None else datetime.now(timezone.utc)
-
-    if any(w in low for w in _TODAY_WORDS):
-        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        # If the parsed time is in the future relative to "now" (e.g. clock
-        # skew / tz mismatch), accept as-is — scheduler's age filter is
-        # tolerant.
-        return int(target.timestamp())
-
-    if any(w in low for w in _YESTERDAY_WORDS):
-        target = (now - timedelta(days=1)).replace(
-            hour=hh, minute=mm, second=0, microsecond=0,
-        )
-        return int(target.timestamp())
-
-    # "19.04.2026" form
-    m = _ABS_DATE_NUMERIC_RE.search(low)
-    if m:
-        try:
-            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            target = datetime(year, month, day, hh, mm, tzinfo=tz)
-            return int(target.timestamp())
-        except ValueError:
-            pass
-
-    # "19 kwietnia 2026" form (year optional)
-    m = _ABS_DATE_WORD_RE.search(low)
-    if m:
-        day_s, month_word, year_s = m.group(1), m.group(2), m.group(3)
-        month = _MONTH_NAMES.get(month_word)
-        if month:
-            try:
-                day = int(day_s)
-                year = int(year_s) if year_s else now.year
-                target = datetime(year, month, day, hh, mm, tzinfo=tz)
-                # If the resulting date is wildly in the future (seeing
-                # "15 grudnia" in January → it's last year's ad, not next
-                # year's), wrap back a year.
-                if (target - now).days > 30:
-                    target = target.replace(year=year - 1)
-                return int(target.timestamp())
+                price_value = int(digits)
             except ValueError:
                 pass
+    if not label:
+        if price_value and currency:
+            label = f"{price_value} {currency}"
+        else:
+            label = "Цена не указана"
+    if price_obj.get("negotiable"):
+        label = f"{label} до торга"
+    if price_obj.get("arranged"):
+        label = "Договорная"
+    return label, price_value, currency
 
-    return None
+
+def _usd_estimate(value: int | float, currency: str) -> int | None:
+    rate = _USD_RATES.get((currency or "").upper())
+    if not rate:
+        return None
+    usd = int(round(float(value) * rate))
+    return usd if usd > 0 else None
 
 
-def _tz_for_url(url: str):
-    tld = _tld_for(url)
-    tz_name = _TLD_TZ.get(tld)
-    if not tz_name:
-        return timezone.utc
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(tz_name)
-    except Exception:
-        return timezone.utc
+def _parse_location(loc: dict) -> str | None:
+    if not isinstance(loc, dict):
+        return None
+    city = (loc.get("city") or {}).get("name") if isinstance(loc.get("city"), dict) else None
+    district = (loc.get("district") or {}).get("name") if isinstance(loc.get("district"), dict) else None
+    region = (loc.get("region") or {}).get("name") if isinstance(loc.get("region"), dict) else None
+    parts = [x for x in (city, district, region) if isinstance(x, str) and x.strip()]
+    if not parts:
+        return None
+    # Dedupe consecutive equal parts (e.g. city == region)
+    deduped = []
+    for p in parts:
+        if not deduped or deduped[-1] != p:
+            deduped.append(p)
+    return ", ".join(deduped)
+
+
+def _extract_photo(photos: list) -> str | None:
+    if not photos or not isinstance(photos, list):
+        return None
+    first = photos[0]
+    if not isinstance(first, dict):
+        return None
+    link = (first.get("link") or "").strip()
+    if not link:
+        return None
+    # Template: "...{width}x{height}". Fill in.
+    url = link.replace("{width}", str(_PHOTO_W)).replace("{height}", str(_PHOTO_H))
+    if not url.startswith("http"):
+        return None
+    return url
+
+
+# Simple HTML → plain text. The API returns seller descriptions that
+# contain <strong>, <br />, etc. Strip tags, unescape entities, collapse
+# runs of whitespace.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _clean_description(raw: str) -> str:
+    if not isinstance(raw, str):
+        return ""
+    # Convert common block tags to newlines before stripping
+    txt = re.sub(r"(?i)<br\s*/?>", "\n", raw)
+    txt = re.sub(r"(?i)</p>", "\n\n", txt)
+    txt = _HTML_TAG_RE.sub("", txt)
+    txt = html_lib.unescape(txt)
+    # Collapse whitespace
+    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +520,7 @@ def _tz_for_url(url: str):
 # ---------------------------------------------------------------------------
 
 async def olx_download_image(url: str, proxy: str | None = None) -> bytes | None:
-    # Referer domain hard-coded to .pl is OK — olxcdn accepts any olx.*
+    # olxcdn accepts any olx.* as Referer; .pl hard-coded is safe.
     return await download_image_bytes(
         url, host=_HOST, referer="https://www.olx.pl/", proxy=proxy,
     )

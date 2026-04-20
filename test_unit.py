@@ -29,12 +29,16 @@ from parsers.kufar import (
 )
 from parsers.olx import (
     OlxSource,
-    _absolutize as _olx_absolutize,
-    _extract_items as _olx_extract_items,
-    _is_promoted as _olx_is_promoted,
-    _parse_relative_date as _olx_parse_date,
-    _strip_search_reason as _olx_strip_search_reason,
-    _tz_for_url as _olx_tz_for_url,
+    _clean_description as _olx_clean_desc,
+    _encode_pairs as _olx_encode_pairs,
+    _extract_photo as _olx_extract_photo,
+    _parse_api_item as _olx_parse_api_item,
+    _parse_api_response as _olx_parse_api_response,
+    _parse_iso as _olx_parse_iso,
+    _parse_location as _olx_parse_location,
+    _parse_price as _olx_parse_price,
+    _parse_raw_query as _olx_parse_raw_query,
+    _usd_estimate as _olx_usd_estimate,
 )
 
 
@@ -337,250 +341,239 @@ def test_olx_source_matches():
     print("OK: OlxSource.matches")
 
 
-def test_olx_is_promoted():
-    assert _olx_is_promoted("/d/oferta/foo.html?search_reason=search%7Cpromoted")
-    assert _olx_is_promoted("/d/oferta/foo.html?search_reason=search|promoted")
-    assert _olx_is_promoted("/d/oferta/foo.html?x=1&search_reason=search%7Cpromoted")
-    assert not _olx_is_promoted("/d/oferta/foo.html?search_reason=search%7Corganic")
-    assert not _olx_is_promoted("/d/oferta/foo.html?search_reason=search|organic")
-    assert not _olx_is_promoted("/d/oferta/foo.html")
-    print("OK: _olx_is_promoted")
+def test_olx_parse_iso():
+    # API returns times like "2026-04-20T18:55:59+02:00" — tz-aware.
+    # 18:55:59 +02:00 = 16:55:59 UTC = 1776704159
+    assert _olx_parse_iso("2026-04-20T18:55:59+02:00") == 1776704159
+    # Z-suffix form (same absolute moment, UTC-local)
+    assert _olx_parse_iso("2026-04-20T16:55:59Z") == 1776704159
+    # None / empty / junk
+    assert _olx_parse_iso(None) is None
+    assert _olx_parse_iso("") is None
+    assert _olx_parse_iso("garbage") is None
+    print("OK: _olx_parse_iso")
 
 
-def test_olx_strip_search_reason():
-    u = _olx_strip_search_reason(
-        "https://www.olx.pl/d/oferta/foo.html?search_reason=search%7Corganic"
+def test_olx_parse_price():
+    # Standard shape from /api/v1/offers
+    params = [
+        {"key": "category", "value": {"label": "Computers"}},
+        {"key": "price", "value": {
+            "value": 5400.0, "currency": "PLN",
+            "label": "5 400 zł", "negotiable": False, "arranged": False,
+        }},
+    ]
+    label, value, cur = _olx_parse_price(params)
+    assert label == "5 400 zł"
+    assert value == 5400
+    assert cur == "PLN"
+
+    # Negotiable flag decorates the label
+    params[1]["value"]["negotiable"] = True
+    label, _, _ = _olx_parse_price(params)
+    assert "до торга" in label
+
+    # Arranged-only price (no number)
+    params = [{"key": "price", "value": {"arranged": True, "label": ""}}]
+    label, value, _ = _olx_parse_price(params)
+    assert label == "Договорная"
+
+    # Missing price param
+    assert _olx_parse_price([{"key": "state", "value": {"key": "new"}}]) == (
+        "Цена не указана", None, None,
     )
-    assert u == "https://www.olx.pl/d/oferta/foo.html"
-    # Other params preserved
-    u = _olx_strip_search_reason(
-        "https://www.olx.pl/d/oferta/foo.html?a=1&search_reason=search%7Corganic&b=2"
-    )
-    assert "a=1" in u and "b=2" in u and "search_reason" not in u
-    # Plain URL unchanged
-    u = _olx_strip_search_reason("https://www.olx.pl/d/oferta/foo.html")
-    assert u == "https://www.olx.pl/d/oferta/foo.html"
-    print("OK: _olx_strip_search_reason")
+    print("OK: _olx_parse_price")
 
 
-def test_olx_absolutize():
-    u = _olx_absolutize("/d/oferta/foo.html?search_reason=search%7Corganic",
-                        "https://www.olx.pl")
-    assert u == "https://www.olx.pl/d/oferta/foo.html"
-    # Already absolute
-    u = _olx_absolutize(
-        "https://www.olx.pl/d/oferta/foo.html?search_reason=search%7Corganic",
-        "https://www.olx.pl",
-    )
-    assert u == "https://www.olx.pl/d/oferta/foo.html"
-    # Href without leading slash
-    u = _olx_absolutize("d/oferta/foo.html", "https://www.olx.pl")
-    assert u == "https://www.olx.pl/d/oferta/foo.html"
-    print("OK: _olx_absolutize")
+def test_olx_usd_estimate():
+    # PLN 5400 → ~$1350
+    usd = _olx_usd_estimate(5400, "PLN")
+    assert usd and 1200 <= usd <= 1500
+    # EUR stays close
+    usd = _olx_usd_estimate(100, "EUR")
+    assert usd and 100 <= usd <= 120
+    # USD stays identical
+    assert _olx_usd_estimate(100, "USD") == 100
+    # Unknown currency -> None
+    assert _olx_usd_estimate(100, "XXX") is None
+    # Zero or None-ish
+    assert _olx_usd_estimate(0, "PLN") is None
+    print("OK: _olx_usd_estimate")
 
 
-def test_olx_tz_mapping():
-    # Always returns a tzinfo-compatible object (ZoneInfo when tzdata is
-    # available on the host, UTC fallback otherwise — both are valid for
-    # runtime).
-    from datetime import datetime
-    for u in ("https://www.olx.pl/x", "https://www.olx.ua/x",
-              "https://www.olx.com.br/x", "https://www.olx.xx/x"):
-        tz = _olx_tz_for_url(u)
-        # Must work as a tzinfo
-        dt = datetime.now(tz)
-        assert dt.tzinfo is tz
-    print("OK: _olx_tz_for_url")
-
-
-def test_olx_parse_relative_date():
-    from datetime import datetime, timezone as tz_, timedelta
-    # Use a fixed-offset tz so the test runs identically on any host
-    # (Windows may lack tzdata for IANA zones).
-    tz = tz_(timedelta(hours=2))
-
-    # "Dzisiaj o 21:25"
-    ts = _olx_parse_date("Dzisiaj o 21:25", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.hour == 21 and dt.minute == 25
-    # It should be today's date in Warsaw tz
-    today_pl = datetime.now(tz).date()
-    assert dt.date() == today_pl
-
-    # "Odświeżono dzisiaj o 11:02" also contains "dzisiaj"
-    ts = _olx_parse_date("Odświeżono dzisiaj o 11:02", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.hour == 11 and dt.minute == 2
-
-    # Ukrainian
-    ts = _olx_parse_date("Сьогодні о 09:30", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.hour == 9 and dt.minute == 30
-
-    # "Wczoraj o 23:00" = yesterday
-    ts = _olx_parse_date("Wczoraj o 23:00", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.hour == 23 and dt.minute == 0
-    yesterday = (datetime.now(tz) - timedelta(days=1)).date()
-    assert dt.date() == yesterday
-
-    # Polish absolute date "19 kwietnia 2026" (genitive form)
-    ts = _olx_parse_date("19 kwietnia 2026", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.year == 2026 and dt.month == 4 and dt.day == 19
-
-    # Polish month in nominative (rare but possible)
-    ts = _olx_parse_date("3 kwiecień 2026", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.month == 4 and dt.day == 3
-
-    # Ukrainian "19 квітня 2026"
-    ts = _olx_parse_date("19 квітня 2026", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.month == 4 and dt.day == 19
-
-    # Numeric "19.04.2026"
-    ts = _olx_parse_date("19.04.2026", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.year == 2026 and dt.month == 4 and dt.day == 19
-
-    # With HH:MM prefix: "15:32 19.04.2026"
-    ts = _olx_parse_date("15:32 19.04.2026", tz)
-    assert ts is not None
-    dt = datetime.fromtimestamp(ts, tz)
-    assert dt.hour == 15 and dt.minute == 32 and dt.day == 19
-
-    # Unknown month word → None
-    ts = _olx_parse_date("19 blornstag 2026", tz)
-    assert ts is None
-
+def test_olx_parse_location():
+    # City + region
+    loc = {
+        "city": {"name": "Warszawa"}, "region": {"name": "Mazowieckie"},
+    }
+    assert _olx_parse_location(loc) == "Warszawa, Mazowieckie"
+    # City + district + region
+    loc = {
+        "city": {"name": "Warszawa"},
+        "district": {"name": "Mokotów"},
+        "region": {"name": "Mazowieckie"},
+    }
+    assert _olx_parse_location(loc) == "Warszawa, Mokotów, Mazowieckie"
+    # Deduplicates when city == region (e.g. Warszawa/Warszawa)
+    loc = {"city": {"name": "Warszawa"}, "region": {"name": "Warszawa"}}
+    assert _olx_parse_location(loc) == "Warszawa"
+    # Only region
+    assert _olx_parse_location({"region": {"name": "Silesia"}}) == "Silesia"
     # Empty
-    assert _olx_parse_date("", tz) is None
-    print("OK: _olx_parse_relative_date")
+    assert _olx_parse_location({}) is None
+    print("OK: _olx_parse_location")
 
 
-def test_olx_image_lazy_load_fallback():
-    from bs4 import BeautifulSoup
-    from parsers.olx import _extract_image_url
+def test_olx_extract_photo():
+    # Template URL with {width}x{height} placeholders
+    photos = [{"link": "https://ireland.apollo.olxcdn.com:443/v1/files/abc-PL/image;s={width}x{height}"}]
+    url = _olx_extract_photo(photos)
+    assert url and "600x600" in url and "{width}" not in url
 
-    # Case 1: src has real URL → use it
-    html = '<div><img src="https://ireland.apollo.olxcdn.com:443/v1/files/abc-PL/image;s=216x152;q=50"/></div>'
-    img_card = BeautifulSoup(html, "html.parser").select_one("div")
-    url = _extract_image_url(img_card)
-    assert url and url.startswith("https://ireland.apollo.olxcdn.com")
-    assert ";s=512x512" in url
+    # Empty list
+    assert _olx_extract_photo([]) is None
 
-    # Case 2: src is placeholder SVG, data-src has real URL
-    html = (
-        '<div><img src="/app/static/media/no_thumbnail.15f456ec5.svg" '
-        'data-src="https://ireland.apollo.olxcdn.com:443/v1/files/xyz-PL/image;s=216x152;q=50"/></div>'
+    # Link missing
+    assert _olx_extract_photo([{"id": 1}]) is None
+
+    # Non-http link → rejected
+    assert _olx_extract_photo([{"link": "/static/placeholder.svg"}]) is None
+    print("OK: _olx_extract_photo")
+
+
+def test_olx_clean_description():
+    raw = "<strong>Hello</strong> world<br />next line"
+    assert _olx_clean_desc(raw) == "Hello world\nnext line"
+
+    # Entities decode
+    assert _olx_clean_desc("a &amp; b") == "a & b"
+
+    # <p> becomes paragraph break; consecutive newlines collapse
+    assert _olx_clean_desc("<p>a</p><p>b</p>") == "a\n\nb"
+
+    # Non-string input
+    assert _olx_clean_desc(None) == ""  # type: ignore[arg-type]
+    print("OK: _olx_clean_description")
+
+
+def test_olx_raw_query_encoding_roundtrip():
+    # Parse a realistic OLX query string with bracket notation, then
+    # re-encode, and make sure the result the API would actually accept
+    # keeps the brackets and `:` separators.
+    pairs = _olx_parse_raw_query(
+        "search%5Bfilter_enum_state%5D%5B0%5D=new"
+        "&search%5Border%5D=created_at%3Adesc"
     )
-    img_card = BeautifulSoup(html, "html.parser").select_one("div")
-    url = _extract_image_url(img_card)
-    assert url and "xyz-PL" in url
-    assert ";s=512x512" in url
+    assert ("search[filter_enum_state][0]", "new") in pairs
+    assert ("search[order]", "created_at:desc") in pairs
 
-    # Case 3: src is placeholder, srcset has real URL (most common for OLX)
-    html = (
-        '<div><img src="/app/static/media/no_thumbnail.15f456ec5.svg" '
-        'srcset="https://ireland.apollo.olxcdn.com:443/v1/files/qqq-PL/image;s=150x188;q=50 150w, '
-        'https://ireland.apollo.olxcdn.com:443/v1/files/qqq-PL/image;s=270x338;q=50 300w"/></div>'
-    )
-    img_card = BeautifulSoup(html, "html.parser").select_one("div")
-    url = _extract_image_url(img_card)
-    assert url and "qqq-PL" in url
-    assert ";s=512x512" in url
-
-    # Case 4: nothing usable → None
-    html = '<div><img src="/app/static/media/no_thumbnail.15f456ec5.svg"/></div>'
-    img_card = BeautifulSoup(html, "html.parser").select_one("div")
-    assert _extract_image_url(img_card) is None
-
-    # Case 5: no img at all
-    html = '<div></div>'
-    img_card = BeautifulSoup(html, "html.parser").select_one("div")
-    assert _extract_image_url(img_card) is None
-    print("OK: _olx image lazy-load fallbacks (src -> data-src -> srcset)")
+    enc = _olx_encode_pairs(pairs)
+    assert "search[filter_enum_state][0]=new" in enc
+    # `:` is preserved inside the value
+    assert "created_at:desc" in enc
+    print("OK: _olx raw-query parse + encode")
 
 
-def _olx_card_html(card_inner: str, card_id: str) -> str:
-    return (
-        f'<html><body>'
-        f'<div data-cy="l-card" data-testid="l-card" id="{card_id}">'
-        f'{card_inner}</div></body></html>'
-    )
+def _olx_api_sample_item():
+    """Snapshot of a real API response entry with all the fields we care
+    about populated. Feeds _parse_api_item for a shape-level check."""
+    return {
+        "id": 1068316812,
+        "url": "https://www.olx.pl/d/oferta/apple-iphone-13-pro-CID99-ID1aiy0k.html",
+        "title": "Apple iPhone 13 Pro Sierra Blue 128 GB",
+        "last_refresh_time": "2026-04-20T18:31:53+02:00",
+        "created_time": "2026-04-20T18:26:27+02:00",
+        "description": "<strong>Sprzedam</strong><br />w super stanie",
+        "promotion": {"top_ad": False},
+        "params": [
+            {"key": "price", "value": {
+                "value": 2500.0, "currency": "PLN",
+                "label": "2 500 zł", "negotiable": False, "arranged": False,
+            }},
+        ],
+        "user": {"name": "Michał"},
+        "location": {
+            "city": {"name": "Warszawa"}, "region": {"name": "Mazowieckie"},
+        },
+        "photos": [
+            {"link": "https://ireland.apollo.olxcdn.com:443/v1/files/foo-PL/image;s={width}x{height}"},
+            {"link": "https://ireland.apollo.olxcdn.com:443/v1/files/bar-PL/image;s={width}x{height}"},
+        ],
+    }
 
 
-def test_olx_extract_items_organic_vs_promoted():
-    # One promoted + two organic cards. Expect only 2 items, promoted filtered.
-    html = """
-<html><body>
-<span data-testid="total-count">Znaleźliśmy ponad 1000 ogłoszeń</span>
+def test_olx_parse_api_item_full_shape():
+    item = _olx_parse_api_item(_olx_api_sample_item())
+    assert item.source == "olx"
+    assert item.external_id == "1068316812"
+    assert item.title == "Apple iPhone 13 Pro Sierra Blue 128 GB"
+    # Price has USD hint appended (PLN 2500 ≈ $625)
+    assert "2 500 zł" in item.price and "$" in item.price
+    assert item.price_value == 2500
+    assert item.url.endswith(".html")
+    assert item.location == "Warszawa, Mazowieckie"
+    assert item.description == "Sprzedam\nw super stanie"
+    assert item.seller_name == "Michał"
+    assert item.image_url and "600x600" in item.image_url
+    # 2026-04-20T18:31:53+02:00 → 16:31:53 UTC → 1776702713
+    assert item.published_timestamp == 1776702713
+    print("OK: olx _parse_api_item full shape")
 
-<div data-cy="l-card" id="111">
-  <a href="/d/oferta/promo-CID99-IDxxx.html?search_reason=search%7Cpromoted">
-    <img src="https://ireland.apollo.olxcdn.com:443/v1/files/promo-PL/image;s=216x152;q=50"/>
-  </a>
-  <div data-cy="ad-card-title"><h4>Promoted Item</h4></div>
-  <p data-testid="ad-price">100 zł</p>
-  <p data-testid="location-date">Warszawa - Dzisiaj o 10:00</p>
-</div>
 
-<div data-cy="l-card" id="222">
-  <a href="/d/oferta/organic1-CID99-IDaaa.html?search_reason=search%7Corganic">
-    <img src="https://ireland.apollo.olxcdn.com:443/v1/files/org1-PL/image;s=216x152;q=50"/>
-  </a>
-  <div data-cy="ad-card-title"><h4>Organic One</h4></div>
-  <p data-testid="ad-price">2 009 zł</p>
-  <p data-testid="location-date">Poznań, Jeżyce - Dzisiaj o 11:02</p>
-</div>
-
-<div data-cy="l-card" id="333">
-  <a href="/d/oferta/organic2-CID99-IDbbb.html?search_reason=search%7Corganic">
-    <img src="/app/static/media/no_thumbnail.15f456ec5.svg"/>
-  </a>
-  <div data-cy="ad-card-title"><h4>Organic Two</h4></div>
-  <p data-testid="ad-price">3 500 złdo negocjacji</p>
-  <p data-testid="location-date">Katowice, Dąb - 03 kwietnia 2026</p>
-</div>
-</body></html>
-"""
-    items = _olx_extract_items(html, "https://www.olx.pl/oferty/q-iphone/")
+def test_olx_parse_api_response_filters_promoted():
+    resp = {
+        "data": [
+            {
+                "id": 111, "title": "Promoted Car",
+                "url": "https://www.olx.pl/d/oferta/a-CID5-IDxxx.html",
+                "last_refresh_time": "2026-04-20T10:00:00+02:00",
+                "promotion": {"top_ad": True},
+                "params": [{"key": "price", "value": {
+                    "value": 1000, "currency": "PLN", "label": "1 000 zł",
+                }}],
+                "photos": [{"link": "https://ireland.apollo.olxcdn.com:443/v1/files/a-PL/image;s={width}x{height}"}],
+                "location": {"city": {"name": "Kraków"}},
+            },
+            {
+                "id": 222, "title": "Organic iPhone",
+                "url": "https://www.olx.pl/d/oferta/b-CID99-IDyyy.html",
+                "last_refresh_time": "2026-04-20T11:00:00+02:00",
+                "promotion": {"top_ad": False},
+                "params": [{"key": "price", "value": {
+                    "value": 2000, "currency": "PLN", "label": "2 000 zł",
+                }}],
+                "photos": [{"link": "https://ireland.apollo.olxcdn.com:443/v1/files/b-PL/image;s={width}x{height}"}],
+                "location": {"city": {"name": "Poznań"}},
+            },
+            {
+                "id": 333, "title": "Organic etui",
+                "url": "https://www.olx.pl/d/oferta/c-CID99-IDzzz.html",
+                "last_refresh_time": "2026-04-20T12:00:00+02:00",
+                "promotion": {},
+                "params": [{"key": "price", "value": {
+                    "value": 30, "currency": "PLN", "label": "30 zł",
+                }}],
+                "photos": [{"link": "https://ireland.apollo.olxcdn.com:443/v1/files/c-PL/image;s={width}x{height}"}],
+                "location": {"city": {"name": "Łódź"}},
+            },
+        ],
+        "metadata": {
+            "total_elements": 3,
+            "visible_total_count": 3,
+            "source": {"organic": [1, 2]},   # index 0 = promoted
+        },
+    }
+    items = _olx_parse_api_response(resp, "https://www.olx.pl/oferty/q-iphone/")
     assert items is not None
-    assert len(items) == 2, f"expected 2 organic, got {len(items)}"
     ids = [i.external_id for i in items]
-    assert "111" not in ids  # promoted filtered
+    assert "111" not in ids, "promoted item should be filtered"
     assert "222" in ids and "333" in ids
-
-    i1 = next(i for i in items if i.external_id == "222")
-    assert i1.source == "olx"
-    assert i1.title == "Organic One"
-    assert i1.price_value == 2009
-    assert "2 009" in i1.price and "zł" in i1.price
-    assert i1.url == "https://www.olx.pl/d/oferta/organic1-CID99-IDaaa.html"
-    assert i1.image_url and i1.image_url.startswith("https://ireland.apollo.olxcdn.com")
-    assert ";s=512x512" in i1.image_url  # upscaled
-    assert i1.location == "Poznań, Jeżyce"
-    assert i1.published_timestamp is not None   # "Dzisiaj o 11:02"
-
-    i2 = next(i for i in items if i.external_id == "333")
-    # placeholder SVG -> no image
-    assert i2.image_url is None
-    # "do negocjacji" price: value is leading digits
-    assert i2.price_value == 3500
-    assert "do negocjacji" in i2.price
-    assert i2.location == "Katowice, Dąb"
-    # Polish absolute date "03 kwietnia 2026" → valid timestamp
-    assert i2.published_timestamp is not None
-    print("OK: olx _extract_items filters promoted and parses organic")
+    # Every organic item has photo + date + location
+    for i in items:
+        assert i.image_url is not None
+        assert i.published_timestamp is not None
+        assert i.location is not None
+    print("OK: olx _parse_api_response filters promoted by top_ad + organic_idx")
 
 
 if __name__ == "__main__":
@@ -605,11 +598,13 @@ if __name__ == "__main__":
     test_kufar_seller()
     test_kufar_time_parsing()
     test_olx_source_matches()
-    test_olx_is_promoted()
-    test_olx_strip_search_reason()
-    test_olx_absolutize()
-    test_olx_tz_mapping()
-    test_olx_parse_relative_date()
-    test_olx_image_lazy_load_fallback()
-    test_olx_extract_items_organic_vs_promoted()
+    test_olx_parse_iso()
+    test_olx_parse_price()
+    test_olx_usd_estimate()
+    test_olx_parse_location()
+    test_olx_extract_photo()
+    test_olx_clean_description()
+    test_olx_raw_query_encoding_roundtrip()
+    test_olx_parse_api_item_full_shape()
+    test_olx_parse_api_response_filters_promoted()
     print("\nALL UNIT TESTS PASSED")
