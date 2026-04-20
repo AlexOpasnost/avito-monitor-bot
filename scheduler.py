@@ -342,38 +342,72 @@ def _escape(s: str) -> str:
 
 
 # Compact description — read at a glance, no wall of text in the caption.
-# Telegram photo caption limit is 1024; leaving ~300 chars for the
+# Telegram photo caption limit is 1024; leaving ~240 chars for the
 # description keeps titles/prices/seller readable even on longer ads.
-_DESC_SOFT_MAX = 180
-_DESC_HARD_MAX = 260
+_DESC_SOFT_MAX = 160
+_DESC_HARD_MAX = 240
+
+# Marketing / boilerplate line-starts to drop. Strips common "come to
+# our store" intros and "installment plan" banners that add no signal.
+# Matched against line.lower() with .startswith() for cheapness.
+_FLUFF_PREFIXES = (
+    "zapraszamy",      # PL: "we invite you to..."
+    "witam",           # PL: "hi"
+    "dzień dobry",     # PL: "good day"
+    "dzien dobry",     # PL w/o diacritics
+    "raty ",           # PL: "installments"
+    "0%",
+    "promocja",        # PL: "promotion"
+    "promo ",
+    "sklep stacjonarny",  # PL: "physical store"
+    "darmowa dostawa",    # PL: "free delivery"
+    "добрый день", "здравствуйте",
+    "bună ziua",       # RO: hello
+    "olá", "bom dia",  # PT
+)
 
 
 def _prettify_description(raw: str, hard_max: int = _DESC_HARD_MAX) -> str:
     """Clean up a seller's free-form description for a Telegram card.
 
-    - strips zero-width / soft-hyphen / NBSP junk
-    - collapses ALL runs of whitespace (including blank lines) into a
-      single space — bullet-heavy ads become a short paragraph
-    - cuts at sentence boundary near the soft limit, else word boundary
-      near hard_max with ellipsis
+    Strategy:
+      - strip zero-width / NBSP junk + normalize whitespace while
+        PRESERVING line breaks (bullet lists stay readable)
+      - drop leading marketing-boilerplate lines (store invites,
+        installment banners, generic greetings)
+      - cut at the last natural boundary (\\n, period, !, ?) before the
+        hard cap; fall back to word boundary with «…» if none
     """
     import re as _re
     if not raw:
         return ""
     text = raw
-    # Drop invisible / bidi chars that occasionally sneak into
-    # copy-pasted descriptions and make them look dirty.
+    # Drop invisible / bidi chars
     for ch in ("\u200B", "\u200C", "\u200D", "\u2060", "\u00AD",
                "\uFEFF", "\u00A0"):
         text = text.replace(ch, " ")
-    # Collapse EVERY whitespace run (spaces, tabs, newlines) into one
-    # space. Bullet lists with blank lines between items read fine as a
-    # single short paragraph in a Telegram caption.
-    text = _re.sub(r"\s+", " ", text).strip()
-    # "word.," / "word. ," punctuation glitches
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Collapse repeated spaces/tabs, strip lead/trail whitespace on
+    # each line, cap consecutive blank lines.
+    text = _re.sub(r"[ \t]+", " ", text)
+    text = _re.sub(r" *\n *", "\n", text)
+    text = _re.sub(r"\n{3,}", "\n\n", text)
     text = _re.sub(r"\.\s*,", ".", text)
     text = _re.sub(r",\s*\.", ".", text)
+    text = text.strip()
+    if not text:
+        return ""
 
+    # Drop marketing-fluff lines from the top. Only from the top so we
+    # don't mangle legit product details mid-description.
+    lines = text.split("\n")
+    while lines:
+        low = lines[0].strip().lower()
+        if not low or any(low.startswith(p) for p in _FLUFF_PREFIXES):
+            lines.pop(0)
+            continue
+        break
+    text = "\n".join(lines).strip()
     if not text:
         return ""
 
@@ -381,14 +415,23 @@ def _prettify_description(raw: str, hard_max: int = _DESC_HARD_MAX) -> str:
     if len(text) <= soft_limit:
         return text
 
-    # Try a sentence boundary near the soft limit
-    window = text[: soft_limit]
-    sentence_end = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
-    if sentence_end >= soft_limit // 2:
-        return text[: sentence_end + 1].rstrip() + "…"
+    # Pick the latest natural break before the hard cap. Preferring
+    # line breaks keeps bullet lists intact; period/!/? also work.
+    window = text[:hard_max]
+    breaks = [window.rfind(m) for m in ("\n\n", "\n", ". ", "! ", "? ",
+                                         ".\n", "!\n", "?\n")]
+    viable = [b for b in breaks if b >= soft_limit // 2]
+    if viable:
+        cut_at = max(viable)
+        out = text[:cut_at].rstrip()
+        # Sentence-terminator cut reads as complete; line-break cut
+        # gets an «…» so the reader sees there's more below.
+        if not out.endswith((".", "!", "?", "…")):
+            out += "…"
+        return out
 
-    # Else: word boundary near hard_max
-    cut = text[: hard_max - 1]
+    # No natural boundary — word trim with «…»
+    cut = window
     sp = cut.rfind(" ")
     if sp > hard_max // 2:
         cut = cut[:sp]
