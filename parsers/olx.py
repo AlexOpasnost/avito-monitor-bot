@@ -72,10 +72,6 @@ _USD_RATES: dict[str, float] = {
     "RUB": 0.011,       # rare but possible
 }
 
-# Regex for extracting the first <div data-cy="l-card" id="<N>"> on the
-# listing page. Used to pick an item whose /api/v1/offers/<id> response
-# carries the real category.id for this listing.
-_LCARD_ID_RE = re.compile(r'data-cy="l-card"[^>]*\bid="(\d+)"')
 # Marker for paid top-slot cards — skip these when sampling for category.
 _PROMOTED_MARKERS = (
     "search_reason=search%7Cpromoted",
@@ -212,15 +208,15 @@ async def _build_api_url(url: str, proxy: str | None) -> str | None:
         pairs = [("category_id", str(cid))] + original_pairs
         return base + "?" + _encode_pairs(pairs)
 
-    # Strategy 3: last-resort — pass through only the search[…] filters.
-    # Without a category the result will be the whole catalog filtered
-    # by generic params; prefer returning SOMETHING over nothing.
-    if original_pairs:
-        logger.warning("[olx] no query term / category_id extracted, using bare search params")
-        return base + "?" + _encode_pairs(original_pairs)
-
-    logger.warning("[olx] URL has neither query nor category markers: %s", url[:100])
-    return base
+    # No safe strategy — abort. Returning the API base with just the
+    # filters would give a cross-category garbage listing (observed:
+    # laptop-OS filter + state=new returned audiobooks, clothing, shoes,
+    # furniture). Better to fail loud and let the scheduler retry.
+    logger.error(
+        "[olx] could not resolve category_id for %s; giving up this cycle",
+        url[:100],
+    )
+    return None
 
 
 def _parse_raw_query(q: str) -> list[tuple[str, str]]:
@@ -291,18 +287,38 @@ async def _extract_category_id(url: str, proxy: str | None) -> int | None:
 
 def _first_organic_card_id(html: str) -> int | None:
     """Return the id attr of the first `<div data-cy="l-card">` on the
-    page whose href does NOT carry a paid-promotion marker. That gives
-    us an item guaranteed to be in the URL's actual category."""
-    for m in _LCARD_ID_RE.finditer(html):
-        # Look in the ~4KB after this match for the item's href
-        window = html[m.end(): m.end() + 4096]
-        if any(marker in window for marker in _PROMOTED_MARKERS):
+    page whose inner anchor does NOT carry a paid-promotion marker.
+
+    We use BeautifulSoup instead of a regex so we don't get tripped up
+    by (a) attribute order / inline <style> blocks between data-cy and
+    id, or (b) the card boundaries that make a windowed promoted-check
+    unreliable (OLX cards emit ~60 KB of inlined CSS each).
+    """
+    if not html:
+        return None
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    for card in soup.select('[data-cy="l-card"]'):
+        card_id = (card.get("id") or "").strip()
+        if not card_id.isdigit():
+            continue
+        # Look at every <a> anchor inside the card. A card is promoted
+        # if ANY of its anchors carries `search_reason=search|promoted`.
+        anchors = card.select('a[href]')
+        if any(_is_promoted_href(a.get("href") or "") for a in anchors):
             continue
         try:
-            return int(m.group(1))
+            return int(card_id)
         except ValueError:
             continue
     return None
+
+
+def _is_promoted_href(href: str) -> bool:
+    return any(marker in href for marker in _PROMOTED_MARKERS)
 
 
 async def _lookup_category_via_item(
@@ -350,25 +366,24 @@ def _fetch_simple_sync(url: str, proxy: str | None) -> str | None:
 
 
 def _fetch_html_head_sync(url: str, proxy: str | None) -> str | None:
+    """Fetch the full HTML listing (no streaming truncation).
+
+    Earlier versions read only the first 200 KB — but OLX inlines ~60 KB
+    of CSS per l-card, so 200 KB often contains just 3 cards, ALL of
+    which are paid promotions. That made category_id extraction fail,
+    which in turn dropped the listing into a dangerous "bare filters"
+    fallback that returned random cross-category items.
+    """
     try:
         origin = _origin_for(url) or "https://www.olx.pl"
         s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
         proxies = proxies_dict(proxy)
         logger.info("[olx] HTML probe for category_id: %s", url[:100])
-        resp = s.get(url, proxies=proxies, timeout=30, allow_redirects=True, stream=True)
-        try:
-            # First 200 KB is plenty to hit a few l-card hrefs
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in resp.iter_content(chunk_size=32 * 1024):
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= 200 * 1024:
-                    break
-            body = b"".join(chunks).decode("utf-8", errors="ignore")
-            return body
-        finally:
-            resp.close()
+        resp = s.get(url, proxies=proxies, timeout=45, allow_redirects=True)
+        if resp.status_code != 200:
+            logger.warning("[olx] html probe HTTP %d", resp.status_code)
+            return None
+        return resp.text
     except Exception as e:
         logger.debug("[olx] html-head fetch error: %s", e)
         return None
