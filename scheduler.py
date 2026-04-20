@@ -215,6 +215,81 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
         await db.mark_items_sent_batch(sub["id"], ids, source=src)
 
 
+# Sources whose text is NOT already Russian — we'll translate title +
+# description via Google Translate before formatting the notification.
+# Avito is native RU, Kufar (Belarus) is mostly RU. Everyone else gets
+# translated so Russian audience can actually read the card.
+_TRANSLATED_SOURCES: frozenset[str] = frozenset({"olx", "vinted", "mercari"})
+
+
+async def _translate_to_russian(text: str) -> str | None:
+    """Translate a short string to Russian via deep_translator's Google
+    backend. Returns None on empty input, timeout, or any library error —
+    callers should fall back to the original text."""
+    if not text or not text.strip():
+        return None
+    try:
+        from deep_translator import GoogleTranslator
+    except ImportError:
+        logger.debug("[translate] deep_translator not installed")
+        return None
+
+    def _sync_translate() -> str | None:
+        try:
+            # 2500-char cap is well under Google's 5000 hard limit and
+            # keeps latency predictable.
+            return GoogleTranslator(source="auto", target="ru").translate(
+                text[:2500],
+            )
+        except Exception as e:
+            logger.debug("[translate] google err: %s", str(e)[:120])
+            return None
+
+    loop = asyncio.get_running_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_translate), timeout=6.0,
+        )
+    except asyncio.TimeoutError:
+        logger.debug("[translate] timeout after 6s")
+        return None
+    except Exception as e:
+        logger.debug("[translate] executor err: %s", e)
+        return None
+    if not isinstance(result, str) or not result.strip():
+        return None
+    return result
+
+
+async def _russify_item(item: SearchItem) -> None:
+    """Translate title + description on foreign-source items. Mutates
+    `item` in place; on any failure the original text is preserved so
+    the notification still goes out."""
+    if item.source not in _TRANSLATED_SOURCES:
+        return
+    # Parallelize title + description; both calls are usually sub-second
+    title_task = _translate_to_russian(item.title) if item.title else None
+    desc_task = _translate_to_russian(item.description) if item.description else None
+    if title_task is None and desc_task is None:
+        return
+    tasks = [t for t in (title_task, desc_task) if t is not None]
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logger.debug("[translate] gather err: %s", e)
+        return
+    idx = 0
+    if title_task is not None:
+        r = results[idx]
+        idx += 1
+        if isinstance(r, str) and r.strip():
+            item.title = r
+    if desc_task is not None:
+        r = results[idx]
+        if isinstance(r, str) and r.strip():
+            item.description = r
+
+
 _SOURCE_BUTTON_TEXT = {
     "avito":   "🔗 Открыть на Авито",
     "kufar":   "🔗 Открыть на Kufar",
@@ -237,6 +312,9 @@ _SOURCE_IMAGE_REFERER = {
 
 
 async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
+    # Translate foreign-source text (PL/UA/RO/PT/EN → RU) before
+    # formatting so the notification is readable to the Russian user.
+    await _russify_item(item)
     text = _format_notification(item)
     button_text = _SOURCE_BUTTON_TEXT.get(item.source, "🔗 Открыть объявление")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -351,19 +429,20 @@ _DESC_HARD_MAX = 240
 # our store" intros and "installment plan" banners that add no signal.
 # Matched against line.lower() with .startswith() for cheapness.
 _FLUFF_PREFIXES = (
-    "zapraszamy",      # PL: "we invite you to..."
-    "witam",           # PL: "hi"
-    "dzień dobry",     # PL: "good day"
-    "dzien dobry",     # PL w/o diacritics
-    "raty ",           # PL: "installments"
-    "0%",
-    "promocja",        # PL: "promotion"
-    "promo ",
-    "sklep stacjonarny",  # PL: "physical store"
-    "darmowa dostawa",    # PL: "free delivery"
-    "добрый день", "здравствуйте",
-    "bună ziua",       # RO: hello
-    "olá", "bom dia",  # PT
+    # Polish originals (pre-translation safety net)
+    "zapraszamy", "witam", "dzień dobry", "dzien dobry",
+    "raty ", "0%", "promocja", "promo ",
+    "sklep stacjonarny", "darmowa dostawa",
+    # Russian — after Google-translate these are what the PL/UA/RO
+    # boilerplate usually renders as, so the fluff filter still has
+    # something to catch post-translation.
+    "приглашаем", "добро пожаловать", "здравствуйте", "добрый день",
+    "рассрочка", "бесплатная доставка",
+    "стационарный магазин", "наш магазин", "наш салон",
+    # Ukrainian / Romanian / Portuguese originals (pre-translation)
+    "вітаємо", "ласкаво просимо",
+    "bună ziua", "bine ați venit",
+    "olá", "bom dia", "seja bem-vindo",
 )
 
 

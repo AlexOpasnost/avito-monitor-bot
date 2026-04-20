@@ -7,3 +7,4 @@ cloudscraper>=1.2.71
 curl_cffi>=0.14.0
 beautifulsoup4>=4.12.0
 tzdata>=2024.1
+deep-translator>=1.11.4
