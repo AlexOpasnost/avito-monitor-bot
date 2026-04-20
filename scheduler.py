@@ -284,29 +284,18 @@ async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
 def _format_notification(item: AvitoItem) -> str:
     """Unified pretty notification format.
 
-    Layout (always same order, missing fields collapse their line):
+    Layout (missing fields collapse their line):
         <title>
         💰 <price>
         📍 <location>
-        📅 <HH:MM DD.MM.YYYY MSK>
-        ──────────────
-        <description>
+        📅 <сегодня/вчера/DD.MM> в HH:MM (МСК)
+        <description>                ← short, max ~180 chars
         👤 <seller>
     """
     title = _escape(item.title) or "Без названия"
     price = _escape(item.price) or "Цена не указана"
     location = _escape(item.location) or "—"
-
-    if item.published_timestamp:
-        dt = datetime.fromtimestamp(item.published_timestamp, MSK)
-        when = dt.strftime("%H:%M %d.%m.%Y")
-    else:
-        when = "—"
-
-    # Telegram photo caption limit is 1024 chars — leave room for the
-    # header so description has predictable budget.
-    HEADER_BUDGET = 260  # title + price + location + date + separator + small margin
-    DESC_MAX = 1024 - HEADER_BUDGET  # ≈ 764 chars
+    when = _format_when_msk(item.published_timestamp)
 
     lines = [
         f"<b>{title}</b>",
@@ -316,9 +305,12 @@ def _format_notification(item: AvitoItem) -> str:
     ]
 
     if item.description:
-        desc = _prettify_description(item.description, DESC_MAX)
+        desc = _prettify_description(item.description, _DESC_HARD_MAX)
         if desc:
-            lines.append("──────────────")
+            # Blank line between header and description — cleaner than a
+            # U-bar separator, and leaves room within the 1024-char
+            # Telegram photo-caption budget.
+            lines.append("")
             lines.append(f"<i>{_escape(desc)}</i>")
 
     if item.seller_name:
@@ -327,25 +319,43 @@ def _format_notification(item: AvitoItem) -> str:
     return "\n".join(lines)
 
 
+def _format_when_msk(ts: int | None) -> str:
+    """Pretty-print a unix timestamp in Moscow local time with a clear
+    МСК suffix. Same-day ads show «Сегодня в HH:MM», one-day-old show
+    «Вчера в HH:MM», older ones show «DD.MM в HH:MM»."""
+    if not ts:
+        return "—"
+    dt = datetime.fromtimestamp(ts, MSK)
+    now = datetime.now(MSK)
+    hhmm = dt.strftime("%H:%M")
+    if dt.date() == now.date():
+        return f"Сегодня в {hhmm} (МСК)"
+    if dt.date() == (now.date() - timedelta(days=1)):
+        return f"Вчера в {hhmm} (МСК)"
+    return f"{dt.strftime('%d.%m')} в {hhmm} (МСК)"
+
+
 def _escape(s: str) -> str:
     if not s:
         return ""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-# Soft max per card — keep descriptions compact so the notification
-# reads at a glance. Hard cap passed in if the card is tighter.
-_DESC_SOFT_MAX = 400
+# Compact description — read at a glance, no wall of text in the caption.
+# Telegram photo caption limit is 1024; leaving ~300 chars for the
+# description keeps titles/prices/seller readable even on longer ads.
+_DESC_SOFT_MAX = 180
+_DESC_HARD_MAX = 260
 
 
-def _prettify_description(raw: str, hard_max: int) -> str:
+def _prettify_description(raw: str, hard_max: int = _DESC_HARD_MAX) -> str:
     """Clean up a seller's free-form description for a Telegram card.
 
-    - normalizes whitespace (no tripled newlines, no double spaces)
     - strips zero-width / soft-hyphen / NBSP junk
-    - collapses "word.,word" typos
-    - truncates at sentence boundary near the soft limit, fallback to
-      hard_max with ellipsis
+    - collapses ALL runs of whitespace (including blank lines) into a
+      single space — bullet-heavy ads become a short paragraph
+    - cuts at sentence boundary near the soft limit, else word boundary
+      near hard_max with ellipsis
     """
     import re as _re
     if not raw:
@@ -356,17 +366,13 @@ def _prettify_description(raw: str, hard_max: int) -> str:
     for ch in ("\u200B", "\u200C", "\u200D", "\u2060", "\u00AD",
                "\uFEFF", "\u00A0"):
         text = text.replace(ch, " ")
-    # Windows line endings -> \n
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Collapse 3+ newlines to 2 (paragraph), 2 spaces to 1
-    text = _re.sub(r"\n{3,}", "\n\n", text)
-    text = _re.sub(r"[ \t]{2,}", " ", text)
+    # Collapse EVERY whitespace run (spaces, tabs, newlines) into one
+    # space. Bullet lists with blank lines between items read fine as a
+    # single short paragraph in a Telegram caption.
+    text = _re.sub(r"\s+", " ", text).strip()
     # "word.," / "word. ," punctuation glitches
     text = _re.sub(r"\.\s*,", ".", text)
     text = _re.sub(r",\s*\.", ".", text)
-    # Strip trailing whitespace on each line
-    text = "\n".join(line.rstrip() for line in text.split("\n"))
-    text = text.strip()
 
     if not text:
         return ""
@@ -375,29 +381,17 @@ def _prettify_description(raw: str, hard_max: int) -> str:
     if len(text) <= soft_limit:
         return text
 
-    # Try to cut at sentence boundary near the soft limit
+    # Try a sentence boundary near the soft limit
     window = text[: soft_limit]
-    sentence_end = max(
-        window.rfind(". "), window.rfind("! "),
-        window.rfind("? "), window.rfind(".\n"),
-        window.rfind("!\n"), window.rfind("?\n"),
-    )
+    sentence_end = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
     if sentence_end >= soft_limit // 2:
-        return text[: sentence_end + 1].rstrip() + " …"
+        return text[: sentence_end + 1].rstrip() + "…"
 
-    # Fall back to word boundary near hard_max
-    if len(text) > hard_max:
-        text = text[: hard_max - 2]
-        sp = text.rfind(" ")
-        if sp > hard_max // 2:
-            text = text[:sp]
-        return text.rstrip() + "…"
-
-    # Between soft and hard: end at last space
-    cut = text[:soft_limit]
+    # Else: word boundary near hard_max
+    cut = text[: hard_max - 1]
     sp = cut.rfind(" ")
-    if sp > soft_limit // 2:
+    if sp > hard_max // 2:
         cut = cut[:sp]
-    return cut.rstrip() + " …"
+    return cut.rstrip() + "…"
 
 
