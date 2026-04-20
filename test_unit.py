@@ -32,6 +32,7 @@ from parsers.olx import (
     _clean_description as _olx_clean_desc,
     _encode_pairs as _olx_encode_pairs,
     _extract_photo as _olx_extract_photo,
+    _first_organic_card_id as _olx_first_organic_card_id,
     _parse_api_item as _olx_parse_api_item,
     _parse_api_response as _olx_parse_api_response,
     _parse_iso as _olx_parse_iso,
@@ -520,6 +521,37 @@ def test_olx_parse_api_item_full_shape():
     print("OK: olx _parse_api_item full shape")
 
 
+def test_olx_first_organic_card_id():
+    # Mix: first card is promoted, second is organic — expect second id.
+    html = """
+<div data-cy="l-card" id="111">
+  <a href="/d/oferta/promo-CID99-IDa.html?search_reason=search%7Cpromoted">promo</a>
+</div>
+<div data-cy="l-card" id="222">
+  <a href="/d/oferta/org-CID3102-IDb.html?search_reason=search%7Corganic">real</a>
+</div>
+<div data-cy="l-card" id="333">
+  <a href="/d/oferta/org-CID3102-IDc.html?search_reason=search%7Corganic">real</a>
+</div>
+"""
+    assert _olx_first_organic_card_id(html) == 222
+
+    # All promoted → None
+    html_all_promo = """
+<div data-cy="l-card" id="111">
+  <a href="/d/oferta/a.html?search_reason=search%7Cpromoted">x</a>
+</div>
+<div data-cy="l-card" id="112">
+  <a href="/d/oferta/b.html?search_reason=search|promoted">x</a>
+</div>
+"""
+    assert _olx_first_organic_card_id(html_all_promo) is None
+
+    # No l-cards at all → None
+    assert _olx_first_organic_card_id("<html>nothing here</html>") is None
+    print("OK: _olx_first_organic_card_id skips promoted")
+
+
 def test_olx_parse_api_response_filters_promoted():
     resp = {
         "data": [
@@ -606,5 +638,6 @@ if __name__ == "__main__":
     test_olx_clean_description()
     test_olx_raw_query_encoding_roundtrip()
     test_olx_parse_api_item_full_shape()
+    test_olx_first_organic_card_id()
     test_olx_parse_api_response_filters_promoted()
     print("\nALL UNIT TESTS PASSED")

@@ -25,6 +25,7 @@ import asyncio
 import html as html_lib
 import logging
 import re
+import time
 from datetime import datetime
 from urllib.parse import quote, urlparse
 
@@ -71,10 +72,21 @@ _USD_RATES: dict[str, float] = {
     "RUB": 0.011,       # rare but possible
 }
 
-# In case the API returns a category-only URL path (no /oferty/q-...),
-# we extract the numeric category id from any item href on the HTML
-# listing page: /d/oferta/<slug>-CID<N>-ID<hash>.html
-_CID_IN_HREF_RE = re.compile(r"CID(\d+)-ID")
+# Regex for extracting the first <div data-cy="l-card" id="<N>"> on the
+# listing page. Used to pick an item whose /api/v1/offers/<id> response
+# carries the real category.id for this listing.
+_LCARD_ID_RE = re.compile(r'data-cy="l-card"[^>]*\bid="(\d+)"')
+# Marker for paid top-slot cards — skip these when sampling for category.
+_PROMOTED_MARKERS = (
+    "search_reason=search%7Cpromoted",
+    "search_reason=search|promoted",
+)
+
+# Category_id lookup is expensive (one HTML fetch + one API call). Cache
+# by user-URL with a 1-hour TTL; category mappings practically never
+# change.
+_CATEGORY_CACHE: dict[str, tuple[int, float]] = {}
+_CATEGORY_TTL = 3600.0
 
 
 class OlxSource:
@@ -240,21 +252,100 @@ def _encode_pairs(pairs) -> str:
 
 
 async def _extract_category_id(url: str, proxy: str | None) -> int | None:
-    """Fetch the HTML listing once and pick a category_id out of any
-    item href. Cheap: only the first ~20 KB is inspected."""
+    """Return the numeric OLX category_id for this listing URL.
+
+    The `CID<N>-` in item hrefs is NOT reliable — on almost every OLX
+    listing that value is the parent domain (e.g. 99 = electronics),
+    not the specific sub-category the URL is actually filtered by.
+    We work around it by picking the first organic card id off the
+    HTML, calling /api/v1/offers/<id> and reading `data.category.id`.
+    """
+    cached = _CATEGORY_CACHE.get(url)
+    now = time.time()
+    if cached and (now - cached[1]) < _CATEGORY_TTL:
+        return cached[0]
+
     loop = asyncio.get_running_loop()
     html_text = await loop.run_in_executor(
         None, lambda: _fetch_html_head_sync(url, proxy),
     )
     if not html_text:
         return None
-    m = _CID_IN_HREF_RE.search(html_text)
-    if m is None:
-        logger.warning("[olx] no CID<N>- marker found in HTML of %s", url[:100])
+
+    item_id = _first_organic_card_id(html_text)
+    if item_id is None:
+        logger.warning("[olx] no organic l-card found in HTML of %s", url[:100])
+        return None
+
+    cid = await _lookup_category_via_item(url, item_id, proxy)
+    if cid is None:
+        logger.warning(
+            "[olx] item %d lookup returned no category.id for %s",
+            item_id, url[:100],
+        )
+        return None
+    _CATEGORY_CACHE[url] = (cid, now)
+    logger.info("[olx] resolved category_id=%d via item %d (cached 1h)", cid, item_id)
+    return cid
+
+
+def _first_organic_card_id(html: str) -> int | None:
+    """Return the id attr of the first `<div data-cy="l-card">` on the
+    page whose href does NOT carry a paid-promotion marker. That gives
+    us an item guaranteed to be in the URL's actual category."""
+    for m in _LCARD_ID_RE.finditer(html):
+        # Look in the ~4KB after this match for the item's href
+        window = html[m.end(): m.end() + 4096]
+        if any(marker in window for marker in _PROMOTED_MARKERS):
+            continue
+        try:
+            return int(m.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+async def _lookup_category_via_item(
+    base_url: str, item_id: int, proxy: str | None,
+) -> int | None:
+    origin = _origin_for(base_url) or "https://www.olx.pl"
+    api_url = f"{origin}/api/v1/offers/{item_id}"
+    loop = asyncio.get_running_loop()
+    body = await loop.run_in_executor(
+        None, lambda: _fetch_simple_sync(api_url, proxy),
+    )
+    if not body:
         return None
     try:
-        return int(m.group(1))
-    except ValueError:
+        data = orjson.loads(body)
+    except Exception as e:
+        logger.debug("[olx] item %d JSON decode err: %s", item_id, str(e)[:80])
+        return None
+    cat = (data.get("data") or {}).get("category")
+    if not isinstance(cat, dict):
+        return None
+    cid = cat.get("id")
+    if isinstance(cid, int) and cid > 0:
+        return cid
+    if isinstance(cid, str) and cid.isdigit():
+        return int(cid)
+    return None
+
+
+def _fetch_simple_sync(url: str, proxy: str | None) -> str | None:
+    try:
+        origin = _origin_for(url) or "https://www.olx.pl"
+        s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
+        proxies = proxies_dict(proxy)
+        logger.info("[olx] category probe: %s", url[:100])
+        resp = s.get(url, proxies=proxies, timeout=20,
+                     headers={"Accept": "application/json"})
+        if resp.status_code != 200:
+            logger.debug("[olx] category probe HTTP %d", resp.status_code)
+            return None
+        return resp.text
+    except Exception as e:
+        logger.debug("[olx] category probe error: %s", e)
         return None
 
 
