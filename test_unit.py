@@ -428,13 +428,87 @@ def test_olx_parse_relative_date():
     yesterday = (datetime.now(tz) - timedelta(days=1)).date()
     assert dt.date() == yesterday
 
-    # Absolute date (Polish month name) — not parsed, returns None
-    ts = _olx_parse_date("03 kwietnia 2026", tz)
+    # Polish absolute date "19 kwietnia 2026" (genitive form)
+    ts = _olx_parse_date("19 kwietnia 2026", tz)
+    assert ts is not None
+    dt = datetime.fromtimestamp(ts, tz)
+    assert dt.year == 2026 and dt.month == 4 and dt.day == 19
+
+    # Polish month in nominative (rare but possible)
+    ts = _olx_parse_date("3 kwiecień 2026", tz)
+    assert ts is not None
+    dt = datetime.fromtimestamp(ts, tz)
+    assert dt.month == 4 and dt.day == 3
+
+    # Ukrainian "19 квітня 2026"
+    ts = _olx_parse_date("19 квітня 2026", tz)
+    assert ts is not None
+    dt = datetime.fromtimestamp(ts, tz)
+    assert dt.month == 4 and dt.day == 19
+
+    # Numeric "19.04.2026"
+    ts = _olx_parse_date("19.04.2026", tz)
+    assert ts is not None
+    dt = datetime.fromtimestamp(ts, tz)
+    assert dt.year == 2026 and dt.month == 4 and dt.day == 19
+
+    # With HH:MM prefix: "15:32 19.04.2026"
+    ts = _olx_parse_date("15:32 19.04.2026", tz)
+    assert ts is not None
+    dt = datetime.fromtimestamp(ts, tz)
+    assert dt.hour == 15 and dt.minute == 32 and dt.day == 19
+
+    # Unknown month word → None
+    ts = _olx_parse_date("19 blornstag 2026", tz)
     assert ts is None
 
     # Empty
     assert _olx_parse_date("", tz) is None
     print("OK: _olx_parse_relative_date")
+
+
+def test_olx_image_lazy_load_fallback():
+    from bs4 import BeautifulSoup
+    from parsers.olx import _extract_image_url
+
+    # Case 1: src has real URL → use it
+    html = '<div><img src="https://ireland.apollo.olxcdn.com:443/v1/files/abc-PL/image;s=216x152;q=50"/></div>'
+    img_card = BeautifulSoup(html, "html.parser").select_one("div")
+    url = _extract_image_url(img_card)
+    assert url and url.startswith("https://ireland.apollo.olxcdn.com")
+    assert ";s=512x512" in url
+
+    # Case 2: src is placeholder SVG, data-src has real URL
+    html = (
+        '<div><img src="/app/static/media/no_thumbnail.15f456ec5.svg" '
+        'data-src="https://ireland.apollo.olxcdn.com:443/v1/files/xyz-PL/image;s=216x152;q=50"/></div>'
+    )
+    img_card = BeautifulSoup(html, "html.parser").select_one("div")
+    url = _extract_image_url(img_card)
+    assert url and "xyz-PL" in url
+    assert ";s=512x512" in url
+
+    # Case 3: src is placeholder, srcset has real URL (most common for OLX)
+    html = (
+        '<div><img src="/app/static/media/no_thumbnail.15f456ec5.svg" '
+        'srcset="https://ireland.apollo.olxcdn.com:443/v1/files/qqq-PL/image;s=150x188;q=50 150w, '
+        'https://ireland.apollo.olxcdn.com:443/v1/files/qqq-PL/image;s=270x338;q=50 300w"/></div>'
+    )
+    img_card = BeautifulSoup(html, "html.parser").select_one("div")
+    url = _extract_image_url(img_card)
+    assert url and "qqq-PL" in url
+    assert ";s=512x512" in url
+
+    # Case 4: nothing usable → None
+    html = '<div><img src="/app/static/media/no_thumbnail.15f456ec5.svg"/></div>'
+    img_card = BeautifulSoup(html, "html.parser").select_one("div")
+    assert _extract_image_url(img_card) is None
+
+    # Case 5: no img at all
+    html = '<div></div>'
+    img_card = BeautifulSoup(html, "html.parser").select_one("div")
+    assert _extract_image_url(img_card) is None
+    print("OK: _olx image lazy-load fallbacks (src -> data-src -> srcset)")
 
 
 def _olx_card_html(card_inner: str, card_id: str) -> str:
@@ -504,8 +578,8 @@ def test_olx_extract_items_organic_vs_promoted():
     assert i2.price_value == 3500
     assert "do negocjacji" in i2.price
     assert i2.location == "Katowice, Dąb"
-    # absolute date not parsed → None
-    assert i2.published_timestamp is None
+    # Polish absolute date "03 kwietnia 2026" → valid timestamp
+    assert i2.published_timestamp is not None
     print("OK: olx _extract_items filters promoted and parses organic")
 
 
@@ -536,5 +610,6 @@ if __name__ == "__main__":
     test_olx_absolutize()
     test_olx_tz_mapping()
     test_olx_parse_relative_date()
+    test_olx_image_lazy_load_fallback()
     test_olx_extract_items_organic_vs_promoted()
     print("\nALL UNIT TESTS PASSED")

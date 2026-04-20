@@ -64,6 +64,72 @@ _YESTERDAY_WORDS = (
 # HH:MM extractor
 _TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
 
+# Numeric absolute date: "19.04.2026"
+_ABS_DATE_NUMERIC_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
+
+# Absolute date with month name: "19 kwietnia 2026", "19 kwietnia",
+# "3 жовтня 2026", etc. Year is optional — defaults to current.
+_ABS_DATE_WORD_RE = re.compile(r"(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?", re.UNICODE)
+
+# Month word → month number. Covers every OLX UI language we care about.
+# Both nominative and genitive forms since some regions use "kwiecień"
+# and others "kwietnia" ("19 of April" vs "April 19").
+_MONTH_NAMES: dict[str, int] = {
+    # Polish
+    "styczeń": 1, "stycznia": 1, "sty": 1,
+    "luty": 2, "lutego": 2, "lut": 2,
+    "marzec": 3, "marca": 3, "mar": 3,
+    "kwiecień": 4, "kwietnia": 4, "kwi": 4,
+    "maj": 5, "maja": 5,
+    "czerwiec": 6, "czerwca": 6, "cze": 6,
+    "lipiec": 7, "lipca": 7, "lip": 7,
+    "sierpień": 8, "sierpnia": 8, "sie": 8,
+    "wrzesień": 9, "września": 9, "wrz": 9,
+    "październik": 10, "października": 10, "paź": 10,
+    "listopad": 11, "listopada": 11, "lis": 11,
+    "grudzień": 12, "grudnia": 12, "gru": 12,
+    # Ukrainian
+    "січень": 1, "січня": 1,
+    "лютий": 2, "лютого": 2,
+    "березень": 3, "березня": 3,
+    "квітень": 4, "квітня": 4,
+    "травень": 5, "травня": 5,
+    "червень": 6, "червня": 6,
+    "липень": 7, "липня": 7,
+    "серпень": 8, "серпня": 8,
+    "вересень": 9, "вересня": 9,
+    "жовтень": 10, "жовтня": 10,
+    "листопад_ua": 11,  # same spelling as PL; handled by PL entry above
+    "грудень": 12, "грудня": 12,
+    # Russian (for olx.kz / olx.uz)
+    "январь": 1, "января": 1, "янв": 1,
+    "февраль": 2, "февраля": 2, "фев": 2,
+    "март": 3, "марта": 3,
+    "апрель": 4, "апреля": 4, "апр": 4,
+    # "май" already above
+    "июнь": 6, "июня": 6, "июн": 6,
+    "июль": 7, "июля": 7, "июл": 7,
+    "август": 8, "августа": 8, "авг": 8,
+    "сентябрь": 9, "сентября": 9, "сен": 9,
+    "октябрь": 10, "октября": 10, "окт": 10,
+    "ноябрь": 11, "ноября": 11, "ноя": 11,
+    "декабрь": 12, "декабря": 12, "дек": 12,
+    # Romanian
+    "ianuarie": 1, "februarie": 2, "martie": 3, "aprilie": 4,
+    "iunie": 6, "iulie": 7,
+    "septembrie": 9, "octombrie": 10, "noiembrie": 11, "decembrie": 12,
+    # Portuguese (olx.pt, olx.com.br)
+    "janeiro": 1, "fevereiro": 2, "março": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
+    "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+    # English (fallback)
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "june": 6, "july": 7,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
 # Digits for price extraction
 _DIGITS_RE = re.compile(r"[\d\s]+")
 
@@ -358,15 +424,32 @@ def _extract_image_url(card) -> str | None:
     img = card.select_one("img")
     if img is None:
         return None
-    src = img.get("src") or ""
-    # Placeholder SVG = no actual photo
-    if not src or src.startswith("/") or src.endswith(".svg"):
+    # OLX server-renders listing cards with lazy-loaded images — initial
+    # `src` is usually a placeholder SVG; the real URL lives in `srcset`
+    # or `data-src`. Try each spot before giving up.
+    for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+        url = _clean_olx_image_url(img.get(attr) or "")
+        if url:
+            return url
+    srcset = img.get("srcset") or ""
+    if srcset:
+        first = srcset.strip().split(",")[0].strip().split(" ")[0]
+        url = _clean_olx_image_url(first)
+        if url:
+            return url
+    return None
+
+
+def _clean_olx_image_url(raw: str) -> str | None:
+    if not raw:
         return None
-    # Upscale thumbnail: "216x152" → "512x512"
-    src = _IMG_SIZE_RE.sub(";s=512x512", src, count=1)
-    if not src.startswith("http"):
+    # Reject placeholder SVG / relative paths
+    if raw.startswith("/") or raw.endswith(".svg"):
         return None
-    return src
+    if not raw.startswith("http"):
+        return None
+    # Upscale CDN thumbnail spec: ";s=216x152" → ";s=512x512"
+    return _IMG_SIZE_RE.sub(";s=512x512", raw, count=1)
 
 
 def _extract_location_and_date(card, tz) -> tuple[str | None, int | None]:
@@ -413,9 +496,35 @@ def _parse_relative_date(phrase: str, tz) -> int | None:
         )
         return int(target.timestamp())
 
-    # Absolute dates like "03 kwietnia 2026" are per-locale and not worth
-    # parsing for monitoring purposes — the scheduler treats None-timestamps
-    # as fresh, which is the right behavior for older refreshed ads.
+    # "19.04.2026" form
+    m = _ABS_DATE_NUMERIC_RE.search(low)
+    if m:
+        try:
+            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            target = datetime(year, month, day, hh, mm, tzinfo=tz)
+            return int(target.timestamp())
+        except ValueError:
+            pass
+
+    # "19 kwietnia 2026" form (year optional)
+    m = _ABS_DATE_WORD_RE.search(low)
+    if m:
+        day_s, month_word, year_s = m.group(1), m.group(2), m.group(3)
+        month = _MONTH_NAMES.get(month_word)
+        if month:
+            try:
+                day = int(day_s)
+                year = int(year_s) if year_s else now.year
+                target = datetime(year, month, day, hh, mm, tzinfo=tz)
+                # If the resulting date is wildly in the future (seeing
+                # "15 grudnia" in January → it's last year's ad, not next
+                # year's), wrap back a year.
+                if (target - now).days > 30:
+                    target = target.replace(year=year - 1)
+                return int(target.timestamp())
+            except ValueError:
+                pass
+
     return None
 
 
