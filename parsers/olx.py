@@ -191,21 +191,30 @@ async def _build_api_url(url: str, proxy: str | None) -> str | None:
 
     # Parse the user's query string into (key, value) pairs, preserving
     # encoded brackets so search[filter_enum_state][0]=new passes through
-    # the API unchanged.
-    original_pairs = _parse_raw_query(p.query or "")
+    # the API unchanged. Drop any ordering from the user URL — we always
+    # force newest-first below so the monitor catches fresh items, not
+    # whatever OLX's default "relevance" ranking dredges up.
+    original_pairs = [
+        (k, v) for k, v in _parse_raw_query(p.query or "")
+        if k.lower() not in ("search[order]", "sort_by")
+    ]
+    # Always newest-first. Without this the API returns items in an
+    # opaque mix (relevance + recency + boost) and the bot picks up
+    # refreshed-4-hours-ago ads as if they were brand new.
+    sort_pair = ("sort_by", "created_at:desc")
 
     # Strategy 1: free-text query like /oferty/q-iphone/
     m = _QUERY_IN_PATH_RE.search(p.path or "")
     if m:
         term = m.group(1).replace("-", " ")
-        pairs = [("query", term)] + original_pairs
+        pairs = [("query", term), sort_pair] + original_pairs
         return base + "?" + _encode_pairs(pairs)
 
     # Strategy 2: category-based path — fetch the HTML listing once,
     # extract the category id from any item href's "CID<N>-" marker.
     cid = await _extract_category_id(url, proxy)
     if cid is not None:
-        pairs = [("category_id", str(cid))] + original_pairs
+        pairs = [("category_id", str(cid)), sort_pair] + original_pairs
         return base + "?" + _encode_pairs(pairs)
 
     # No safe strategy — abort. Returning the API base with just the

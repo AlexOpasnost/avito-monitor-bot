@@ -195,6 +195,20 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
         sub["id"], len(new_items), len(fresh), len(to_send),
     )
 
+    # Translate all to-send items in parallel before the send loop —
+    # Google Translate latency is ~500-1500 ms/call, so doing it
+    # sequentially per item stretched a 10-item batch to 15+ seconds.
+    # Shared _TRANSLATE_SEM (4) keeps us under Google's rate limit.
+    foreign_items = [i for i in to_send if i.source in _TRANSLATED_SOURCES]
+    if foreign_items:
+        try:
+            await asyncio.gather(
+                *(_russify_item(i) for i in foreign_items),
+                return_exceptions=True,
+            )
+        except Exception as e:
+            logger.debug("[translate] bulk gather err: %s", e)
+
     sent_keys: set[tuple[str, str]] = set()
     for item in to_send:
         try:
@@ -221,6 +235,10 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
 # translated so Russian audience can actually read the card.
 _TRANSLATED_SOURCES: frozenset[str] = frozenset({"olx", "vinted", "mercari"})
 
+# Cap concurrent Google Translate calls so a batch of 10 new items
+# doesn't fire 20 parallel requests and get rate-limited into 429s.
+_TRANSLATE_SEM = asyncio.Semaphore(4)
+
 
 async def _translate_to_russian(text: str) -> str | None:
     """Translate a short string to Russian via deep_translator's Google
@@ -246,16 +264,17 @@ async def _translate_to_russian(text: str) -> str | None:
             return None
 
     loop = asyncio.get_running_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _sync_translate), timeout=6.0,
-        )
-    except asyncio.TimeoutError:
-        logger.debug("[translate] timeout after 6s")
-        return None
-    except Exception as e:
-        logger.debug("[translate] executor err: %s", e)
-        return None
+    async with _TRANSLATE_SEM:
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _sync_translate), timeout=6.0,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("[translate] timeout after 6s")
+            return None
+        except Exception as e:
+            logger.debug("[translate] executor err: %s", e)
+            return None
     if not isinstance(result, str) or not result.strip():
         return None
     return result
@@ -312,9 +331,9 @@ _SOURCE_IMAGE_REFERER = {
 
 
 async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
-    # Translate foreign-source text (PL/UA/RO/PT/EN → RU) before
-    # formatting so the notification is readable to the Russian user.
-    await _russify_item(item)
+    # Translation is done in bulk by _process_items BEFORE this loop
+    # starts — here the item is already Russian (or the translator
+    # failed and we're showing the original, which is still safe).
     text = _format_notification(item)
     button_text = _SOURCE_BUTTON_TEXT.get(item.source, "🔗 Открыть объявление")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
