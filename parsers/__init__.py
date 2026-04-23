@@ -10,12 +10,14 @@ from __future__ import annotations
 from .avito import AvitoSource
 from .base import SearchItem, Source
 from .kufar import KufarSource
+from .mercari import MercariSource
 from .olx import OlxSource
 
 SOURCES: list[Source] = [
     AvitoSource(),
     KufarSource(),
     OlxSource(),
+    MercariSource(),
 ]
 
 

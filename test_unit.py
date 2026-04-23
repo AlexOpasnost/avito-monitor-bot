@@ -27,6 +27,12 @@ from parsers.kufar import (
     _parse_item as _kufar_parse_item,
     _parse_list_time as _kufar_parse_time,
 )
+from parsers.mercari import (
+    MercariSource,
+    _extract_keyword as _mer_extract_keyword,
+    _format_jpy_price as _mer_format_price,
+    _parse_item as _mer_parse_item,
+)
 from parsers.olx import (
     OlxSource,
     _clean_description as _olx_clean_desc,
@@ -88,6 +94,14 @@ def test_dispatcher_matches_kufar():
     print("OK: dispatcher matches kufar")
 
 
+def test_dispatcher_matches_mercari():
+    s = detect_source("https://jp.mercari.com/search?keyword=iphone")
+    assert s is not None and s.name == "mercari"
+    s = detect_source("https://www.mercari.com/search?q=camera")
+    assert s is not None and s.name == "mercari"
+    print("OK: dispatcher matches mercari")
+
+
 def test_dispatcher_matches_olx():
     s = detect_source("https://www.olx.pl/oferty/q-iphone/?search%5Border%5D=created_at%3Adesc")
     assert s is not None and s.name == "olx"
@@ -110,6 +124,7 @@ def test_supported_sources():
     assert "avito" in sources
     assert "kufar" in sources
     assert "olx" in sources
+    assert "mercari" in sources
     print(f"OK: supported sources = {sources}")
 
 
@@ -340,6 +355,77 @@ def test_olx_source_matches():
     assert not src.matches("https://www.kufar.by/x")
     assert not src.matches("")
     print("OK: OlxSource.matches")
+
+
+def test_mercari_source_matches():
+    src = MercariSource()
+    assert src.matches("https://jp.mercari.com/search?keyword=iphone")
+    assert src.matches("https://www.mercari.com/")
+    assert not src.matches("https://www.avito.ru/x")
+    assert not src.matches("")
+    print("OK: MercariSource.matches")
+
+
+def test_mercari_extract_keyword():
+    # Primary param
+    assert _mer_extract_keyword(
+        "https://jp.mercari.com/search?keyword=iphone+15"
+    ) == "iphone 15"
+    # URL-encoded Japanese
+    assert _mer_extract_keyword(
+        "https://jp.mercari.com/search?keyword=%E3%82%B9%E3%83%9E%E3%83%9B"
+    ) == "スマホ"
+    # Fallback `q=` / `query=`
+    assert _mer_extract_keyword(
+        "https://jp.mercari.com/search?q=camera"
+    ) == "camera"
+    # Empty / missing
+    assert _mer_extract_keyword("https://jp.mercari.com/search") is None
+    assert _mer_extract_keyword("") is None
+    print("OK: _mer_extract_keyword")
+
+
+def test_mercari_format_jpy_price():
+    assert _mer_format_price(3999) == "3 999 ¥ (~26 $)"
+    # Small amount where USD rounds to 0 → drop USD hint
+    assert _mer_format_price(50) == "50 ¥"
+    assert _mer_format_price(None) == "Цена не указана"
+    assert _mer_format_price(0) == "Цена не указана"
+    assert _mer_format_price(-100) == "Цена не указана"
+    print("OK: _mer_format_jpy_price")
+
+
+def test_mercari_parse_item():
+    # Fake item mimicking mercapi's SearchResultItem shape
+    from datetime import datetime
+    class FakeItem:
+        id_ = "m71928728136"
+        name = "Apple iPhone 15 ブラック 128GB"
+        price = 69000
+        is_no_price = False
+        thumbnails = [
+            "https://static.mercdn.net/thumb/item/webp/m71928728136_1.jpg?123",
+        ]
+        item_type = "ITEM_TYPE_MERCARI"
+        status = "ITEM_STATUS_ON_SALE"
+        created = datetime(2026, 4, 23, 14, 22, 20)  # naive — any system-local
+        updated = datetime(2026, 4, 23, 15, 10, 0)
+
+    it = _mer_parse_item(FakeItem())
+    assert it.source == "mercari"
+    assert it.external_id == "m71928728136"
+    assert it.title == "Apple iPhone 15 ブラック 128GB"
+    assert it.price_value == 69000
+    assert "69 000 ¥" in it.price and "$" in it.price
+    assert it.url == "https://jp.mercari.com/item/m71928728136"
+    assert it.image_url and it.image_url.startswith(
+        "https://static.mercdn.net/thumb/"
+    )
+    # published_timestamp prefers `updated` — the bigger of the two
+    assert it.published_timestamp is not None
+    assert it.published_timestamp == int(FakeItem.updated.timestamp())
+    assert it.location is None  # search results carry no region
+    print("OK: mercari _parse_item full shape")
 
 
 def test_olx_parse_iso():
@@ -629,6 +715,11 @@ if __name__ == "__main__":
     test_kufar_description_fallback()
     test_kufar_seller()
     test_kufar_time_parsing()
+    test_dispatcher_matches_mercari()
+    test_mercari_source_matches()
+    test_mercari_extract_keyword()
+    test_mercari_format_jpy_price()
+    test_mercari_parse_item()
     test_olx_source_matches()
     test_olx_parse_iso()
     test_olx_parse_price()
