@@ -72,23 +72,32 @@ async def _fetch_inner(url: str) -> list[SearchItem] | None:
         logger.warning("[mercari] mercapi not installed")
         return None
 
-    keyword = _extract_keyword(url)
-    if not keyword:
-        logger.warning("[mercari] no ?keyword= / ?q= / ?query= in URL: %s",
-                       url[:120])
+    filters = _extract_filters(url)
+    if filters is None:
+        logger.warning(
+            "[mercari] URL has no keyword / category_id / brand_id: %s",
+            url[:120],
+        )
         return None
 
     m = Mercapi()
     try:
         results = await m.search(
-            keyword,
+            filters["keyword"],
+            categories=filters["categories"],
+            brands=filters["brands"],
+            item_conditions=filters["item_conditions"],
+            price_min=filters["price_min"],
+            price_max=filters["price_max"],
             sort_by=SearchRequestData.SortBy.SORT_CREATED_TIME,
             sort_order=SearchRequestData.SortOrder.ORDER_DESC,
             status=[SearchRequestData.Status.STATUS_ON_SALE],
         )
     except Exception as e:
-        logger.warning("[mercari] search error (keyword=%r): %s",
-                       keyword, str(e)[:180])
+        logger.warning(
+            "[mercari] search error (filters=%s): %s",
+            _log_filter_summary(filters), str(e)[:180],
+        )
         return None
 
     raw_items = list(results.items or [])
@@ -108,8 +117,9 @@ async def _fetch_inner(url: str) -> list[SearchItem] | None:
     regular = regular[:_KEEP_TOP]
 
     logger.info(
-        "[mercari] keyword=%r → %d raw, %d regular-kept (skipped %d shops)",
-        keyword, len(raw_items), len(regular), len(raw_items) - len(regular),
+        "[mercari] filters=%s → %d raw, %d regular-kept (skipped %d shops)",
+        _log_filter_summary(filters),
+        len(raw_items), len(regular), len(raw_items) - len(regular),
     )
 
     items: list[SearchItem] = []
@@ -131,9 +141,12 @@ async def _fetch_inner(url: str) -> list[SearchItem] | None:
 
 
 _KEYWORD_KEYS = ("keyword", "query", "q")
+_INT_CSV_RE = re.compile(r"\d+")
 
 
 def _extract_keyword(url: str) -> str | None:
+    """Back-compat helper — legacy callers expect this. See _extract_filters
+    for the real thing."""
     try:
         p = urlparse(url)
     except Exception:
@@ -144,6 +157,90 @@ def _extract_keyword(url: str) -> str | None:
         if v:
             return v
     return None
+
+
+def _extract_filters(url: str) -> dict | None:
+    """Pull every Mercari search filter we care about out of the user URL.
+
+    Mercari JP's web search supports lots of query params; the common ones
+    we map through to mercapi are keyword / category / brand / price /
+    item condition. At least one of {keyword, category_id, brand_id}
+    must be present — otherwise the search is meaningless (returns the
+    whole catalogue).
+
+    Returns None if nothing was parseable; otherwise a dict safe to
+    splat into Mercapi.search().
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    qs = parse_qs(p.query or "")
+
+    keyword = ""
+    for k in _KEYWORD_KEYS:
+        v = (qs.get(k) or [""])[0].strip()
+        if v:
+            keyword = v
+            break
+
+    def _csv_ints(*keys: str) -> list[int]:
+        out: list[int] = []
+        for k in keys:
+            for raw in qs.get(k, []):
+                out.extend(int(m.group()) for m in _INT_CSV_RE.finditer(raw))
+        # Dedupe preserving first-seen order
+        seen: set[int] = set()
+        uniq: list[int] = []
+        for x in out:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+
+    categories = _csv_ints("category_id", "category_ids", "categories")
+    brands = _csv_ints("brand_id", "brand_ids", "brands")
+    item_conditions = _csv_ints("item_condition_id", "item_conditions")
+
+    def _int_param(*keys: str) -> int | None:
+        for k in keys:
+            v = (qs.get(k) or [""])[0].strip()
+            if v.isdigit():
+                return int(v)
+        return None
+
+    price_min = _int_param("price_min", "priceMin")
+    price_max = _int_param("price_max", "priceMax")
+
+    if not keyword and not categories and not brands:
+        return None
+
+    return {
+        "keyword": keyword,
+        "categories": categories,
+        "brands": brands,
+        "item_conditions": item_conditions,
+        "price_min": price_min,
+        "price_max": price_max,
+    }
+
+
+def _log_filter_summary(filters: dict) -> str:
+    """One-line filter summary for log lines — keeps log grep-able."""
+    parts = []
+    if filters.get("keyword"):
+        parts.append(f"kw={filters['keyword']!r}")
+    if filters.get("categories"):
+        parts.append(f"cat={filters['categories']}")
+    if filters.get("brands"):
+        parts.append(f"brand={filters['brands']}")
+    if filters.get("item_conditions"):
+        parts.append(f"cond={filters['item_conditions']}")
+    if filters.get("price_min") is not None:
+        parts.append(f"min={filters['price_min']}")
+    if filters.get("price_max") is not None:
+        parts.append(f"max={filters['price_max']}")
+    return "{" + ", ".join(parts) + "}" if parts else "{}"
 
 
 def _parse_item(it) -> SearchItem:

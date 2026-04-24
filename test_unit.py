@@ -29,6 +29,7 @@ from parsers.kufar import (
 )
 from parsers.mercari import (
     MercariSource,
+    _extract_filters as _mer_extract_filters,
     _extract_keyword as _mer_extract_keyword,
     _format_jpy_price as _mer_format_price,
     _parse_item as _mer_parse_item,
@@ -385,6 +386,44 @@ def test_mercari_extract_keyword():
     print("OK: _mer_extract_keyword")
 
 
+def test_mercari_extract_filters():
+    # Plain keyword URL → keyword filter only
+    f = _mer_extract_filters("https://jp.mercari.com/search?keyword=iphone")
+    assert f is not None
+    assert f["keyword"] == "iphone"
+    assert f["categories"] == [] and f["brands"] == []
+
+    # User's real URL: category_id + brand_id CSV
+    f = _mer_extract_filters(
+        "https://jp.mercari.com/search?category_id=2&brand_id=1242%2C24%2C17736"
+    )
+    assert f is not None
+    assert f["keyword"] == ""
+    assert f["categories"] == [2]
+    assert f["brands"] == [1242, 24, 17736]
+
+    # keyword + category + price range + condition
+    f = _mer_extract_filters(
+        "https://jp.mercari.com/search?keyword=macbook"
+        "&category_id=719&price_min=30000&price_max=150000"
+        "&item_condition_id=1,2"
+    )
+    assert f is not None
+    assert f["keyword"] == "macbook"
+    assert f["categories"] == [719]
+    assert f["price_min"] == 30000 and f["price_max"] == 150000
+    assert f["item_conditions"] == [1, 2]
+
+    # Nothing to search for → None
+    assert _mer_extract_filters("https://jp.mercari.com/search") is None
+    assert _mer_extract_filters("https://jp.mercari.com/search?sort=created_time") is None
+
+    # Dedup (user URL rarely has this but our parser should be safe)
+    f = _mer_extract_filters("https://jp.mercari.com/search?brand_id=24,24,17736")
+    assert f["brands"] == [24, 17736]
+    print("OK: _mer_extract_filters")
+
+
 def test_mercari_format_jpy_price():
     assert _mer_format_price(3999) == "3 999 ¥ (~26 $)"
     # Small amount where USD rounds to 0 → drop USD hint
@@ -718,6 +757,7 @@ if __name__ == "__main__":
     test_dispatcher_matches_mercari()
     test_mercari_source_matches()
     test_mercari_extract_keyword()
+    test_mercari_extract_filters()
     test_mercari_format_jpy_price()
     test_mercari_parse_item()
     test_olx_source_matches()
