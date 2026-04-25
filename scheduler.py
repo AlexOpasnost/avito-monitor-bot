@@ -19,6 +19,7 @@ from parser import (
 )
 from parsers import source_display_name
 from parsers.common import proxy_for_source
+from parsers.currency import format_with_estimate
 
 # Back-compat alias used in this module
 AvitoItem = SearchItem
@@ -196,24 +197,15 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
         sub["id"], len(new_items), len(fresh), len(to_send),
     )
 
-    # Translate all to-send items in parallel before the send loop —
-    # Google Translate latency is ~500-1500 ms/call, so doing it
-    # sequentially per item stretched a 10-item batch to 15+ seconds.
-    # Shared _TRANSLATE_SEM (4) keeps us under Google's rate limit.
-    foreign_items = [i for i in to_send if i.source in _TRANSLATED_SOURCES]
-    if foreign_items:
-        try:
-            await asyncio.gather(
-                *(_russify_item(i) for i in foreign_items),
-                return_exceptions=True,
-            )
-        except Exception as e:
-            logger.debug("[translate] bulk gather err: %s", e)
-
+    # Per-user translation: each subscription belongs to one user, who
+    # picked a target language at /start. Translation happens inside
+    # _send_notification with a shared cache keyed by (text_hash, lang),
+    # so multiple subscriptions in the same language reuse work.
+    prefs = await db.get_user_prefs_by_telegram(sub["telegram_id"])
     sent_keys: set[tuple[str, str]] = set()
     for item in to_send:
         try:
-            await _send_notification(bot, sub, item)
+            await _send_notification(bot, sub, item, prefs)
             sent_keys.add((item.source, item.external_id))
             await db.mark_item_sent(sub["id"], item.external_id, source=item.source)
         except Exception as e:
@@ -230,34 +222,59 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
         await db.mark_items_sent_batch(sub["id"], ids, source=src)
 
 
-# Sources whose text is NOT already Russian — we'll translate title +
-# description via Google Translate before formatting the notification.
-# Avito is native RU, Kufar (Belarus) is mostly RU. Everyone else gets
-# translated so Russian audience can actually read the card.
-_TRANSLATED_SOURCES: frozenset[str] = frozenset({"olx", "vinted", "mercari"})
+# Sources whose text is NOT already in the user's language by default.
+# Avito is RU-native; Kufar (Belarus) ships mixed RU/BE; everything else
+# uses the seller's native language. We feed source="auto" to Google so
+# it detects each item separately rather than guessing per source.
+_TRANSLATED_SOURCES: frozenset[str] = frozenset(
+    {"olx", "vinted", "mercari", "avito", "kufar", "goofish"}
+)
+
+# When the user picked a language that already matches the item's
+# native language we skip the Google round-trip. Mapping is best-effort;
+# missing entries fall through to "translate anyway" (Google no-ops same-
+# language calls cheaply).
+_SOURCE_NATIVE_LANG: dict[str, str] = {
+    "avito":   "ru",
+    "kufar":   "ru",
+    "mercari": "ja",
+    "goofish": "zh",
+}
 
 # Cap concurrent Google Translate calls so a batch of 10 new items
 # doesn't fire 20 parallel requests and get rate-limited into 429s.
 _TRANSLATE_SEM = asyncio.Semaphore(4)
 
+# Process-local LRU-ish cache: (text_hash, target_lang) → translated.
+# Cleared crudely when it grows past the cap. Different users on the
+# same language share entries, which is the whole point of the cache.
+_TRANSLATE_CACHE: dict[tuple[int, str], str] = {}
+_TRANSLATE_CACHE_MAX = 4000
 
-async def _translate_to_russian(text: str) -> str | None:
-    """Translate a short string to Russian via deep_translator's Google
-    backend. Returns None on empty input, timeout, or any library error —
-    callers should fall back to the original text."""
-    if not text or not text.strip():
-        return None
+
+async def _translate(text: str, target_lang: str) -> str:
+    """Translate `text` into `target_lang` (ISO-639-1). Returns the
+    original text unchanged on empty input or any library error.
+
+    Result is memoised by (hash(text), target_lang) so different items
+    quoting the same condition string ("Nuevo con etiquetas") only call
+    Google once per language.
+    """
+    if not text or not text.strip() or not target_lang:
+        return text or ""
+    key = (hash(text), target_lang)
+    cached = _TRANSLATE_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         from deep_translator import GoogleTranslator
     except ImportError:
         logger.debug("[translate] deep_translator not installed")
-        return None
+        return text
 
     def _sync_translate() -> str | None:
         try:
-            # 2500-char cap is well under Google's 5000 hard limit and
-            # keeps latency predictable.
-            return GoogleTranslator(source="auto", target="ru").translate(
+            return GoogleTranslator(source="auto", target=target_lang).translate(
                 text[:2500],
             )
         except Exception as e:
@@ -272,42 +289,65 @@ async def _translate_to_russian(text: str) -> str | None:
             )
         except asyncio.TimeoutError:
             logger.debug("[translate] timeout after 6s")
-            return None
+            return text
         except Exception as e:
             logger.debug("[translate] executor err: %s", e)
-            return None
+            return text
     if not isinstance(result, str) or not result.strip():
-        return None
+        return text
+    if len(_TRANSLATE_CACHE) > _TRANSLATE_CACHE_MAX:
+        # Crude eviction: drop the oldest half. Order is insertion order
+        # in CPython 3.7+, which is good enough for an LRU approximation.
+        keys = list(_TRANSLATE_CACHE.keys())[: _TRANSLATE_CACHE_MAX // 2]
+        for k in keys:
+            _TRANSLATE_CACHE.pop(k, None)
+    _TRANSLATE_CACHE[key] = result
     return result
 
 
-async def _russify_item(item: SearchItem) -> None:
-    """Translate title + description on foreign-source items. Mutates
-    `item` in place; on any failure the original text is preserved so
-    the notification still goes out."""
+async def _localise_item(
+    item: SearchItem, target_lang: str,
+) -> tuple[str, str | None, str | None]:
+    """Return (title, description, condition) translated into target_lang.
+
+    The original `item` is left unchanged so the same item can be sent
+    to multiple users in different languages from the same scheduler
+    cycle without cross-talk."""
     if item.source not in _TRANSLATED_SOURCES:
-        return
-    # Parallelize title + description; both calls are usually sub-second
-    title_task = _translate_to_russian(item.title) if item.title else None
-    desc_task = _translate_to_russian(item.description) if item.description else None
-    if title_task is None and desc_task is None:
-        return
-    tasks = [t for t in (title_task, desc_task) if t is not None]
+        return item.title, item.description, item.condition
+    native = _SOURCE_NATIVE_LANG.get(item.source)
+    # Skip the round-trip when the source language already matches the
+    # user's pick (RU user reading Avito etc.). Catches the common case;
+    # auto-detect handles the rest.
+    if native and native == target_lang:
+        return item.title, item.description, item.condition
+
+    tasks = []
+    fields: list[str] = []
+    if item.title:
+        tasks.append(_translate(item.title, target_lang)); fields.append("title")
+    if item.description:
+        tasks.append(_translate(item.description, target_lang)); fields.append("desc")
+    if item.condition:
+        tasks.append(_translate(item.condition, target_lang)); fields.append("cond")
+    if not tasks:
+        return item.title, item.description, item.condition
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
         logger.debug("[translate] gather err: %s", e)
-        return
-    idx = 0
-    if title_task is not None:
-        r = results[idx]
-        idx += 1
-        if isinstance(r, str) and r.strip():
-            item.title = r
-    if desc_task is not None:
-        r = results[idx]
-        if isinstance(r, str) and r.strip():
-            item.description = r
+        return item.title, item.description, item.condition
+    out_title, out_desc, out_cond = item.title, item.description, item.condition
+    for name, r in zip(fields, results):
+        if not isinstance(r, str) or not r.strip():
+            continue
+        if name == "title":
+            out_title = r
+        elif name == "desc":
+            out_desc = r
+        elif name == "cond":
+            out_cond = r
+    return out_title, out_desc, out_cond
 
 
 def _source_button_text(source: str | None) -> str:
@@ -327,11 +367,18 @@ _SOURCE_IMAGE_REFERER = {
 }
 
 
-async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
-    # Translation is done in bulk by _process_items BEFORE this loop
-    # starts — here the item is already Russian (or the translator
-    # failed and we're showing the original, which is still safe).
-    text = _format_notification(item)
+async def _send_notification(
+    bot: Bot, sub: dict, item: SearchItem, prefs: dict,
+):
+    # Translate per the receiving user's language preference. This lets
+    # one scheduler push the same listing in RU to one user and EN to
+    # another without re-fetching it. Translation is cached by
+    # (text, lang) so a 10-item batch runs ~10 Google calls, not 30.
+    title, description, condition = await _localise_item(item, prefs.get("lang") or "ru")
+    text = _format_notification(
+        item, title=title, description=description, condition=condition,
+        user_currency=(prefs.get("currency") or "rub").upper(),
+    )
     button_text = _source_button_text(item.source)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=button_text, url=item.url)],
@@ -375,31 +422,68 @@ async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
     )
 
 
-def _format_notification(item: AvitoItem) -> str:
+def _format_notification(
+    item: AvitoItem, *,
+    title: str | None = None,
+    description: str | None = None,
+    condition: str | None = None,
+    user_currency: str = "RUB",
+) -> str:
     """Unified pretty notification format.
 
     Layout (missing fields collapse their line):
-        <title>
-        💰 <price>
+        <title (size, condition)>
+        💰 <native price> (~user-currency estimate)
         📍 <location>
         📅 <сегодня/вчера/DD.MM> в HH:MM (МСК)
         <description>                ← short, max ~180 chars
         👤 <seller>
+
+    `title`, `description`, `condition` come from the per-user
+    translation step. When omitted (e.g. unit-test path), the item's
+    raw fields are used.
     """
-    title = _escape(item.title) or "Без названия"
-    price = _escape(item.price) or "Цена не указана"
+    import html as _html
+
+    raw_title = title if title is not None else item.title
+    raw_desc = description if description is not None else item.description
+    raw_cond = condition if condition is not None else item.condition
+
+    # Decode HTML entities the seller (or scrape path) left in their
+    # text — "Jack &amp; Jones" should render as "Jack & Jones".
+    raw_title = _html.unescape(raw_title or "")
+    if raw_desc:
+        raw_desc = _html.unescape(raw_desc)
+    if raw_cond:
+        raw_cond = _html.unescape(raw_cond)
+
+    # Append (size, condition) in parens after the (translated) title.
+    extras: list[str] = []
+    if item.size:
+        extras.append(item.size)
+    if raw_cond:
+        extras.append(raw_cond)
+    if extras:
+        # Avoid duplicate noise if seller already wrote one of these
+        title_lc = raw_title.lower()
+        unique = [x for x in extras if x.lower() not in title_lc]
+        if unique:
+            raw_title = f"{raw_title} ({', '.join(unique)})"
+
+    title_html = _escape(raw_title) or "Без названия"
+    price_native = _escape(_format_price(item, user_currency)) or "Цена не указана"
     location = _escape(item.location) or "—"
     when = _format_when_msk(item.published_timestamp)
 
     lines = [
-        f"<b>{title}</b>",
-        f"💰 <b>{price}</b>",
+        f"<b>{title_html}</b>",
+        f"💰 <b>{price_native}</b>",
         f"📍 {location}",
         f"📅 {when}",
     ]
 
-    if item.description:
-        desc = _prettify_description(item.description, _DESC_HARD_MAX)
+    if raw_desc:
+        desc = _prettify_description(raw_desc, _DESC_HARD_MAX)
         if desc:
             # Blank line between header and description — cleaner than a
             # U-bar separator, and leaves room within the 1024-char
@@ -411,6 +495,18 @@ def _format_notification(item: AvitoItem) -> str:
         lines.append(f"\n👤 {_escape(item.seller_name)}")
 
     return "\n".join(lines)
+
+
+def _format_price(item: AvitoItem, user_currency: str) -> str:
+    """Render the price with a user-currency estimate when conversion is
+    possible. Falls back to the parser's raw `item.price` string when
+    we don't have the numeric value to convert."""
+    if item.price_value and item.currency:
+        return format_with_estimate(
+            item.price_value, item.currency, user_currency,
+            fallback=item.price,
+        )
+    return item.price or "Цена не указана"
 
 
 def _format_when_msk(ts: int | None) -> str:
@@ -441,42 +537,55 @@ def _escape(s: str) -> str:
 _DESC_SOFT_MAX = 160
 _DESC_HARD_MAX = 240
 
-# Marketing / boilerplate line-starts to drop. Strips common "come to
-# our store" intros and "installment plan" banners that add no signal.
-# Matched against line.lower() with .startswith() for cheapness.
+# Marketing / boilerplate line-starts to drop. Matched against
+# line.lower() with .startswith(). Ordered roughly by frequency.
 _FLUFF_PREFIXES = (
     # Polish originals (pre-translation safety net)
     "zapraszamy", "witam", "dzień dobry", "dzien dobry",
-    "raty ", "0%", "promocja", "promo ",
+    "raty ", "0%", "promocja", "promo ", "negocjuj",
     "sklep stacjonarny", "darmowa dostawa",
+    "cena ", "pierwotnie",
     # Russian — after Google-translate these are what the PL/UA/RO
     # boilerplate usually renders as, so the fluff filter still has
     # something to catch post-translation.
     "приглашаем", "добро пожаловать", "здравствуйте", "добрый день",
     "рассрочка", "бесплатная доставка",
     "стационарный магазин", "наш магазин", "наш салон",
-    # Ukrainian / Romanian / Portuguese originals (pre-translation)
-    "вітаємо", "ласкаво просимо",
-    "bună ziua", "bine ați venit",
-    "olá", "bom dia", "seja bem-vindo",
+    "первоначально", "изначально", "ранее ", "цена снижена",
+    "торг ", "торг.", "торг,", "торг!", "договорная",
+    # Ukrainian / Romanian / Portuguese / Spanish originals
+    "вітаємо", "ласкаво просимо", "знижка",
+    "bună ziua", "bine ați venit", "preț ",
+    "olá", "bom dia", "seja bem-vindo", "preço",
+    "originalmente", "precio original", "antes ",
+    "originally", "originally:", "was ", "rrp ",
 )
+
+
+def _is_fluff_line(line: str) -> bool:
+    low = line.strip().lower()
+    if not low:
+        return True
+    return any(low.startswith(p) for p in _FLUFF_PREFIXES)
 
 
 def _prettify_description(raw: str, hard_max: int = _DESC_HARD_MAX) -> str:
     """Clean up a seller's free-form description for a Telegram card.
 
     Strategy:
+      - HTML-decode entities (`&amp;` etc.)
       - strip zero-width / NBSP junk + normalize whitespace while
         PRESERVING line breaks (bullet lists stay readable)
-      - drop leading marketing-boilerplate lines (store invites,
-        installment banners, generic greetings)
-      - cut at the last natural boundary (\\n, period, !, ?) before the
-        hard cap; fall back to word boundary with «…» if none
+      - drop fluff lines from BOTH top and bottom (sellers stick
+        "Originally 80€" / "Negotiable" at the end)
+      - cut at the last sentence-end period before hard cap; fall back
+        to line break, then word boundary
     """
+    import html as _html
     import re as _re
     if not raw:
         return ""
-    text = raw
+    text = _html.unescape(raw)
     # Drop invisible / bidi chars
     for ch in ("\u200B", "\u200C", "\u200D", "\u2060", "\u00AD",
                "\uFEFF", "\u00A0"):
@@ -493,15 +602,14 @@ def _prettify_description(raw: str, hard_max: int = _DESC_HARD_MAX) -> str:
     if not text:
         return ""
 
-    # Drop marketing-fluff lines from the top. Only from the top so we
-    # don't mangle legit product details mid-description.
+    # Drop fluff lines from BOTH ends. Sellers tend to bracket their
+    # actual description with "Hi, welcome" at the top and
+    # "originally 80€, negotiable" at the bottom.
     lines = text.split("\n")
-    while lines:
-        low = lines[0].strip().lower()
-        if not low or any(low.startswith(p) for p in _FLUFF_PREFIXES):
-            lines.pop(0)
-            continue
-        break
+    while lines and _is_fluff_line(lines[0]):
+        lines.pop(0)
+    while lines and _is_fluff_line(lines[-1]):
+        lines.pop()
     text = "\n".join(lines).strip()
     if not text:
         return ""
@@ -510,17 +618,24 @@ def _prettify_description(raw: str, hard_max: int = _DESC_HARD_MAX) -> str:
     if len(text) <= soft_limit:
         return text
 
-    # Pick the latest natural break before the hard cap. Preferring
-    # line breaks keeps bullet lists intact; period/!/? also work.
+    # Prefer the latest *sentence-end* boundary before the hard cap —
+    # `\n\n` before a fluff trailer used to win over a clean period
+    # earlier in the text, leaving an awkward "Originally:..." dangling.
     window = text[:hard_max]
-    breaks = [window.rfind(m) for m in ("\n\n", "\n", ". ", "! ", "? ",
-                                         ".\n", "!\n", "?\n")]
-    viable = [b for b in breaks if b >= soft_limit // 2]
-    if viable:
-        cut_at = max(viable)
-        out = text[:cut_at].rstrip()
-        # Sentence-terminator cut reads as complete; line-break cut
-        # gets an «…» so the reader sees there's more below.
+    sentence_ends = [
+        window.rfind(m) for m in (". ", "! ", "? ", ".\n", "!\n", "?\n")
+    ]
+    sentence_ends.append(window.rfind("."))  # text ending with a period
+    viable_sent = [b for b in sentence_ends if b >= soft_limit // 2]
+    if viable_sent:
+        cut_at = max(viable_sent) + 1  # include the terminator itself
+        return text[:cut_at].rstrip()
+
+    # No sentence end in range — fall back to a line break.
+    line_breaks = [window.rfind(m) for m in ("\n\n", "\n")]
+    viable_line = [b for b in line_breaks if b >= soft_limit // 2]
+    if viable_line:
+        out = text[: max(viable_line)].rstrip()
         if not out.endswith((".", "!", "?", "…")):
             out += "…"
         return out

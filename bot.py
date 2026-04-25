@@ -68,13 +68,41 @@ async def main():
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, shutdown_handler)
 
+    # Slash-command menu (the blue "Menu" button in Telegram).
     await bot.set_my_commands([
-        BotCommand(command="start", description="Запустить бота"),
-        BotCommand(command="profile", description="Мой профиль"),
-        BotCommand(command="list", description="Активные отслеживания"),
-        BotCommand(command="delete", description="Удалить отслеживание"),
-        BotCommand(command="stop", description="Пауза"),
+        BotCommand(command="start",    description="Главное меню"),
+        BotCommand(command="list",     description="Мои поиски"),
+        BotCommand(command="profile",  description="Профиль и статистика"),
+        BotCommand(command="settings", description="Язык и валюта"),
+        BotCommand(command="stop",     description="Поставить на паузу"),
+        BotCommand(command="help",     description="Как это работает"),
     ])
+
+    # Bot description: shown on the "Open bot" landing page above the
+    # Start button. Telegram caps this at 512 chars; what's set in
+    # BotFather is overwritten the next time we boot.
+    bot_description = (
+        "🔍 AutoSearch — лучший инструмент для пользователей торговых "
+        "площадок. Моментально присылает все новые объявления.\n\n"
+        "🎁 Бесплатный пробный период\n"
+        "📋 До 5 одновременных поисков\n"
+        "🛒 Огромный выбор площадок\n"
+        "(Avito, Kufar, Olx, Vinted, Mercari и другие)\n"
+        "💵 Лучшая цена на рынке. Одна находка позволяет полностью "
+        "окупить подписку в несколько раз.\n\n"
+        "👇 Нажми «Старт» чтобы начать 👇"
+    )
+    short_description = (
+        "Мониторит Avito, OLX, Vinted, Kufar, Mercari — присылает новые "
+        "объявления в реальном времени."
+    )
+    try:
+        await bot.set_my_description(bot_description)
+        await bot.set_my_short_description(short_description)
+    except Exception as e:
+        # Don't block startup if Telegram rejects the description (e.g.
+        # rate-limited on rapid restarts). The previous value stays.
+        logger.warning("set_my_description failed: %s", e)
 
     try:
         logger.info("Bot starting...")

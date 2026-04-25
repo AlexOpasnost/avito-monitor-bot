@@ -89,8 +89,12 @@ _LD_JSON_RE = re.compile(
 # like `\"text\":\"Vila Nova de Gaia, Portugal\",\"key\":\"location\"`
 # (backslash + quote pairs around the keys/values). The raw-string
 # regex below matches exactly those literal bytes.
+# Two key orders observed in the wild — JSON.stringify in different
+# Vinted code paths emits them in either order. Both groups capture
+# the city,country string; whichever group matched, we consume.
 _LOCATION_RE = re.compile(
     r'\\"text\\":\\"([^"]+?)\\",\\"key\\":\\"location\\"'
+    r'|\\"key\\":\\"location\\",\\"text\\":\\"([^"]+?)\\"'
 )
 _ENRICH_CACHE: dict[int, tuple[dict, float]] = {}
 _ENRICH_TTL = 24 * 3600.0
@@ -381,10 +385,19 @@ def _fetch_item_metadata_sync(
             return None
         ancestors = frozenset(ancestor_ids)
 
+        loc = _extract_location_from_html(html)
+        if not loc:
+            # Help diagnose location-regex regressions when the React
+            # stream layout changes — log once with the HTML size so we
+            # can tell apart "page truncated" from "user_info absent".
+            logger.info(
+                "[vinted] item %d: location not found (html=%d KB)",
+                item_id, len(html) // 1024,
+            )
         meta = {
             "ancestors": ancestors,
             "description": _extract_description_from_html(html),
-            "location": _extract_location_from_html(html),
+            "location": loc,
         }
         _ENRICH_CACHE[item_id] = (meta, now)
         return meta
@@ -397,7 +410,12 @@ def _fetch_item_metadata_sync(
 def _extract_description_from_html(html: str) -> str | None:
     """Pull the seller's description out of the JSON-LD <script> block
     Vinted server-renders for SEO. Falls back to the og:description
-    meta tag for items where JSON-LD is missing or malformed."""
+    meta tag for items where JSON-LD is missing or malformed.
+
+    HTML entities (`&amp;`, `&quot;`, `&#39;`) are decoded so the bot
+    doesn't ship raw entities in the notification card."""
+    import html as _html
+
     # JSON-LD lives in the first ~80 KB; scan only that window.
     head = html[:120_000]
     for m in _LD_JSON_RE.finditer(head):
@@ -411,7 +429,7 @@ def _extract_description_from_html(html: str) -> str | None:
         if isinstance(data, dict) and data.get("@type") == "Product":
             desc = data.get("description")
             if isinstance(desc, str) and desc.strip():
-                return desc.strip()
+                return _html.unescape(desc.strip())
     # Fallback: <meta property="og:description" content="..."/>
     m = re.search(
         r'<meta\s+property="og:description"\s+content="([^"]{1,2000})"',
@@ -420,7 +438,7 @@ def _extract_description_from_html(html: str) -> str | None:
     if m:
         # The og:description starts with the title; strip the title
         # prefix so we don't show the title twice in the notification.
-        og = m.group(1).strip()
+        og = _html.unescape(m.group(1).strip())
         if " - " in og:
             return og.split(" - ", 1)[1].strip() or None
         return og
@@ -433,7 +451,11 @@ def _extract_location_from_html(html: str) -> str | None:
     m = _LOCATION_RE.search(html)
     if not m:
         return None
-    raw = m.group(1).strip()
+    # Either group 1 (text-then-key order) or group 2 (key-then-text)
+    # matched — pick whichever is present.
+    raw = (m.group(1) or m.group(2) or "").strip()
+    if not raw:
+        return None
     # Captured value may carry JSON `\uXXXX` escapes for non-ASCII
     # cities. Round-trip through json.loads to decode them, but fall
     # back to the raw value if the wrapper makes it un-parseable.
@@ -538,23 +560,18 @@ def _parse_item(entry: dict) -> SearchItem:
     ext_id = str(entry.get("id") or "")
     base_title = (entry.get("title") or "").strip()
     brand = (entry.get("brand_title") or "").strip() or None
-    size = (entry.get("size_title") or "").strip()
-    status = (entry.get("status") or "").strip()
+    size = (entry.get("size_title") or "").strip() or None
+    status = (entry.get("status") or "").strip() or None
 
-    # Build a richer title with size + condition. Brand is intentionally
-    # NOT folded in — Google Translate happily mangles brand names
-    # ("Under Armour" → "Под броню", "Zara" → "Зара") so we ship it on
-    # its own line in the notification, untranslated.
-    extras = [x for x in (size, status) if x]
-    title = base_title
-    if extras:
-        # Avoid duplicating something the seller already wrote in the title
-        unique_extras = [
-            x for x in extras
-            if x.lower() not in base_title.lower()
-        ]
-        if unique_extras:
-            title = f"{base_title} ({', '.join(unique_extras)})"
+    # Size and condition are kept on dedicated fields so the renderer
+    # can append them in the user's language ("(M, Хорошее)") AFTER
+    # translation. Earlier we folded them into `title` and Google
+    # Translate left mixed-language strings half-translated
+    # ("(Nuevo sin etiquetas)" inside an otherwise-Russian title).
+    if size and size.lower() in base_title.lower():
+        size = None
+    if status and status.lower() in base_title.lower():
+        status = None
 
     item_url = (entry.get("url") or "").strip()
     if not item_url:
@@ -562,7 +579,7 @@ def _parse_item(entry: dict) -> SearchItem:
         if path:
             item_url = "https://www.vinted.com" + path
 
-    price_str, price_value = _parse_price(entry.get("price"))
+    price_str, price_value, price_currency = _parse_price(entry.get("price"))
 
     image_url = _extract_image(entry)
 
@@ -578,7 +595,7 @@ def _parse_item(entry: dict) -> SearchItem:
     return SearchItem(
         source="vinted",
         external_id=ext_id,
-        title=title,
+        title=base_title,
         price=price_str,
         price_value=price_value,
         url=item_url,
@@ -588,33 +605,36 @@ def _parse_item(entry: dict) -> SearchItem:
         seller_name=seller,
         published_timestamp=ts,
         brand=brand,
+        condition=status,
+        size=size,
+        currency=price_currency,
     )
 
 
-def _parse_price(price) -> tuple[str, int | None]:
+def _parse_price(price) -> tuple[str, int | None, str | None]:
+    """Parse Vinted price block.
+
+    Returns (label, value_int, currency_code). The label is the native
+    rendering ("14 €"); the user-currency estimate is appended later by
+    the renderer using `parsers.currency.format_with_estimate`.
+    """
     if not isinstance(price, dict):
-        return "Цена не указана", None
+        return "Цена не указана", None, None
     raw_amt = price.get("amount")
-    currency = (price.get("currency_code") or "").upper()
+    currency = (price.get("currency_code") or "").upper() or None
     if raw_amt is None:
-        return "Цена не указана", None
+        return "Цена не указана", None, None
     try:
         # Vinted ships amounts as strings like "115.0"
         amt_f = float(raw_amt)
     except (TypeError, ValueError):
-        return "Цена не указана", None
+        return "Цена не указана", None, None
     value = int(round(amt_f))
     if value <= 0:
-        return "Цена не указана", None
-    sym = _CURRENCY_SYMBOL.get(currency, currency)
+        return "Цена не указана", None, None
+    sym = _CURRENCY_SYMBOL.get(currency, currency or "")
     label = f"{value} {sym}".strip()
-    if currency != "USD":
-        rate = _USD_RATES.get(currency)
-        if rate:
-            usd = int(round(value * rate))
-            if usd > 0:
-                label = f"{label} (~{usd} $)"
-    return label, value
+    return label, value, currency
 
 
 def _extract_image(entry: dict) -> str | None:

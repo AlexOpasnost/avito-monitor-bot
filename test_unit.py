@@ -442,25 +442,26 @@ def test_vinted_build_api_url():
 
 
 def test_vinted_parse_price():
-    # Standard Vinted shape
-    label, value = _vinted_parse_price({"amount": "115.0", "currency_code": "USD"})
-    assert value == 115
+    # Standard Vinted shape — returns (label, value, currency)
+    label, value, cur = _vinted_parse_price({"amount": "115.0", "currency_code": "USD"})
+    assert value == 115 and cur == "USD"
     assert "$" in label and "115" in label
 
-    # EUR has USD hint appended
-    label, value = _vinted_parse_price({"amount": "100.0", "currency_code": "EUR"})
-    assert value == 100 and "€" in label and "$" in label
+    # EUR — native render, no hardcoded USD hint anymore (user-currency
+    # estimate is appended at render time by parsers.currency).
+    label, value, cur = _vinted_parse_price({"amount": "100.0", "currency_code": "EUR"})
+    assert value == 100 and cur == "EUR" and "€" in label and "$" not in label
 
-    # Unknown currency: keep code as-is, no USD hint
-    label, value = _vinted_parse_price({"amount": "50", "currency_code": "XXX"})
-    assert value == 50 and "XXX" in label and "$" not in label
+    # Unknown currency: keep code as-is
+    label, value, cur = _vinted_parse_price({"amount": "50", "currency_code": "XXX"})
+    assert value == 50 and cur == "XXX" and "XXX" in label and "$" not in label
 
     # Zero / negative / missing
     assert _vinted_parse_price({"amount": "0", "currency_code": "USD"}) == (
-        "Цена не указана", None,
+        "Цена не указана", None, None,
     )
-    assert _vinted_parse_price({}) == ("Цена не указана", None)
-    assert _vinted_parse_price(None) == ("Цена не указана", None)
+    assert _vinted_parse_price({}) == ("Цена не указана", None, None)
+    assert _vinted_parse_price(None) == ("Цена не указана", None, None)
     print("OK: vinted _parse_price")
 
 
@@ -512,16 +513,15 @@ def test_vinted_parse_item_full_shape():
     item = _vinted_parse_item(entry)
     assert item.source == "vinted"
     assert item.external_id == "8743309093"
-    # Brand is NOT folded into title (translator was mangling it:
-    # "Under Armour" → "Под броню"). Brand is captured on the dataclass
-    # field but the notification doesn't render it — categories beyond
-    # fashion don't have a brand at all so a dedicated line wasn't
-    # universal.
+    # Brand kept on its own field, not in title (Google Translate
+    # was mangling brands: "Under Armour" → "Под броню").
     assert item.brand == "Apple"
-    assert "Iphone 15 plus" in item.title
-    assert "Apple" not in item.title
-    # Condition still in title (size_title was empty here)
-    assert "Very good" in item.title
+    # Title is the seller's verbatim title — no condition/size folded
+    # in. Renderer appends them post-translation in the user's language.
+    assert item.title == "Iphone 15 plus"
+    assert item.condition == "Very good"
+    assert item.size is None  # size_title was empty
+    assert item.currency == "USD"
     assert item.price_value == 115
     assert "$" in item.price
     assert item.url == "https://www.vinted.com/items/8743309093-iphone-15-plus"
@@ -985,9 +985,11 @@ def test_olx_parse_api_item_full_shape():
     assert item.source == "olx"
     assert item.external_id == "1068316812"
     assert item.title == "Apple iPhone 13 Pro Sierra Blue 128 GB"
-    # Price has USD hint appended (PLN 2500 ≈ $625)
-    assert "2 500 zł" in item.price and "$" in item.price
+    # Native price only — user-currency estimate is appended at render
+    # time by parsers.currency.format_with_estimate.
+    assert "2 500 zł" in item.price and "$" not in item.price
     assert item.price_value == 2500
+    assert item.currency == "PLN"
     assert item.url.endswith(".html")
     assert item.location == "Warszawa, Mazowieckie"
     assert item.description == "Sprzedam\nw super stanie"
@@ -1085,6 +1087,134 @@ def test_olx_parse_api_response_filters_promoted():
     print("OK: olx _parse_api_response filters promoted by top_ad + organic_idx")
 
 
+# ---------- currency conversion ----------
+
+def test_currency_convert_and_format():
+    from parsers.currency import convert, format_with_estimate, format_native
+
+    # Same currency — pass-through
+    assert convert(100, "USD", "USD") == 100.0
+    assert convert(100, "rub", "RUB") == 100.0  # case-insensitive
+
+    # USD pivot (rough — rates can drift)
+    eur_to_rub = convert(1, "EUR", "RUB")
+    assert eur_to_rub and 60 < eur_to_rub < 200
+
+    # Unknown currency → None
+    assert convert(100, "EUR", "XXX") is None
+    assert convert(100, "XXX", "EUR") is None
+    assert convert(None, "EUR", "RUB") is None
+
+    # Native render — symbols, no thousands sep for small ints
+    assert format_native(14, "EUR").replace(" ", "") in ("14€", "14EUR")
+    assert format_native(None, "EUR", fallback="—") == "—"
+
+    # With estimate — same currency suppresses parens
+    same = format_with_estimate(14, "EUR", "EUR")
+    assert "(~" not in same and "€" in same
+    # Different currency adds parens
+    diff = format_with_estimate(14, "EUR", "RUB")
+    assert "(~" in diff and "₽" in diff
+
+    print("OK: currency convert + format")
+
+
+# ---------- description prettify ----------
+
+def test_prettify_description_sentence_end():
+    from scheduler import _prettify_description
+
+    # Original screenshot bug: line break after "Originally:" was
+    # winning over the sentence period after "не носил.", leaving an
+    # awkward "Первоначально:..." dangling.
+    raw = (
+        "Размер 48 - Jack &amp; Черные костюмные брюки Jones Premium "
+        "(JPRFRANCO), размер 48. Состояние хорошее, без следов и пятен. "
+        "Никогда не носил.\n"
+        "Первоначально: 80€"
+    )
+    out = _prettify_description(raw)
+    # &amp; should be decoded
+    assert "&amp;" not in out and "Jack & " in out
+    # Cut at the period after "не носил.", drop the "Первоначально" trailer
+    assert "не носил." in out
+    assert "Первоначально" not in out
+    # No naked "..." at the end either
+    assert "..." not in out
+
+    # Long description with no sentence end — should fall back to word
+    # boundary with «…»
+    raw2 = "x " * 200  # all whitespace-separated single chars, no periods
+    out2 = _prettify_description(raw2)
+    assert out2.endswith("…")
+
+    # Empty input
+    assert _prettify_description("") == ""
+    assert _prettify_description(None) == ""
+
+    # Bottom-fluff strip — "договорная" trailer goes
+    raw3 = "Хорошие штаны.\nдоговорная"
+    assert "договорная" not in _prettify_description(raw3)
+
+    print("OK: scheduler _prettify_description")
+
+
+def test_format_notification_includes_condition_and_user_currency():
+    from scheduler import _format_notification
+    from parsers.base import SearchItem
+
+    item = SearchItem(
+        source="vinted", external_id="1",
+        title="Pantalones Jack & Jones",
+        price="14 €", price_value=14, url="https://x", image_url=None,
+        location="Madrid, España",
+        description="Buen estado.",
+        seller_name="polatic", published_timestamp=None,
+        condition="Nuevo sin etiquetas", size="M", currency="EUR",
+    )
+    text = _format_notification(
+        item,
+        title="Брюки Jack & Jones",
+        description="В хорошем состоянии.",
+        condition="Новый с биркой",
+        user_currency="RUB",
+    )
+    # Title carries (size, condition) — both translated where possible
+    assert "Брюки Jack &amp; Jones" in text  # html-escaped
+    assert "M" in text and "Новый с биркой" in text
+    # Native price + RUB estimate
+    assert "14 €" in text and "₽" in text and "(~" in text
+    # Location is rendered
+    assert "Madrid" in text
+    print("OK: scheduler _format_notification (size+condition, native+RUB)")
+
+
+# ---------- bot_i18n integrity ----------
+
+def test_bot_i18n_lists_consistent():
+    from bot_i18n import (
+        LANGUAGES, LANGUAGE_CODES, CURRENCIES, CURRENCY_CODES,
+        language_keyboard, currency_keyboard, main_menu_keyboard,
+    )
+    from parsers.currency import USD_RATES
+
+    # No duplicate codes
+    assert len(LANGUAGES) == len(LANGUAGE_CODES)
+    assert len(CURRENCIES) == len(CURRENCY_CODES)
+
+    # Every selectable currency must have a USD rate so format_with_estimate
+    # can convert into it.
+    for code, _ in CURRENCIES:
+        assert code.upper() in USD_RATES, f"missing rate for {code}"
+
+    # All keyboards build without crashing and have at least one row
+    assert language_keyboard().inline_keyboard
+    assert currency_keyboard().inline_keyboard
+    assert main_menu_keyboard().inline_keyboard
+
+    print("OK: bot_i18n list integrity")
+
+
 if __name__ == "__main__":
     test_proxy_for_source()
     test_dispatcher_matches_avito()
@@ -1135,4 +1265,8 @@ if __name__ == "__main__":
     test_olx_parse_api_item_full_shape()
     test_olx_first_organic_card_id()
     test_olx_parse_api_response_filters_promoted()
+    test_currency_convert_and_format()
+    test_prettify_description_sentence_end()
+    test_format_notification_includes_condition_and_user_currency()
+    test_bot_i18n_lists_consistent()
     print("\nALL UNIT TESTS PASSED")

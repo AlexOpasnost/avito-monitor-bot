@@ -482,12 +482,10 @@ def _parse_api_item(entry: dict) -> SearchItem:
     ts_str = entry.get("last_refresh_time") or entry.get("created_time")
     ts = _parse_iso(ts_str)
 
-    # Price — extract from params list
+    # Price — extract from params list. Native render only; the
+    # user-currency estimate is appended at notification-render time
+    # by parsers.currency.format_with_estimate.
     price_str, price_value, currency = _parse_price(entry.get("params") or [])
-    if price_value and currency:
-        usd = _usd_estimate(price_value, currency)
-        if usd and currency.upper() != "USD":
-            price_str = f"{price_str} (~{usd} $)"
 
     # Location
     loc = _parse_location(entry.get("location") or {})
@@ -511,6 +509,7 @@ def _parse_api_item(entry: dict) -> SearchItem:
         description=description,
         seller_name=seller,
         published_timestamp=ts,
+        currency=(currency.upper() if currency else None),
     )
 
 

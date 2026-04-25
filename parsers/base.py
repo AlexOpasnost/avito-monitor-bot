@@ -21,6 +21,14 @@ class SearchItem:
     seller_name: str | None
     published_timestamp: int | None   # unix seconds
     brand: str | None = None          # rendered untranslated as own line
+    # Optional listing-attribute fields. Rendered in parens after the title
+    # (e.g. "Black jeans (M, Хорошее"). `condition` is translatable;
+    # `size` usually isn't (numbers, "M", "XL", "EU 42") so we leave it raw.
+    condition: str | None = None
+    size: str | None = None
+    # Currency code (ISO-4217 upper, e.g. "EUR", "RUB"). Used at render
+    # time to convert price into the user's preferred currency.
+    currency: str | None = None
 
 
 @runtime_checkable

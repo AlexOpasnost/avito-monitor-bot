@@ -140,6 +140,20 @@ class Database:
             await conn.execute(
                 "ALTER TABLE sent_items ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'avito'"
             )
+            # User notification preferences. `lang` is the deep-translator
+            # target language; `currency` is the ISO-4217 code (lowercase
+            # by convention) used for the price-conversion hint.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang TEXT DEFAULT 'ru'"
+            )
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'rub'"
+            )
+            # Onboarding flag — flips to TRUE after the user picks both
+            # language and currency, so /start re-entries skip the wizard.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded BOOLEAN DEFAULT FALSE"
+            )
             # Backfill any NULLs that may have crept in from older rows.
             await conn.execute(
                 "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
@@ -216,6 +230,62 @@ class Database:
             )
             return row["id"]
         return await self._execute(_op)
+
+    async def get_user_prefs(self, user_id: int) -> dict:
+        """Return {lang, currency, onboarded}. Defaults applied for old
+        rows where columns are NULL after migration."""
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT COALESCE(lang, 'ru') AS lang, "
+                "       COALESCE(currency, 'rub') AS currency, "
+                "       COALESCE(onboarded, FALSE) AS onboarded "
+                "FROM users WHERE id = $1",
+                user_id,
+            )
+            if not row:
+                return {"lang": "ru", "currency": "rub", "onboarded": False}
+            return {
+                "lang": row["lang"],
+                "currency": row["currency"],
+                "onboarded": row["onboarded"],
+            }
+        return await self._execute(_op)
+
+    async def get_user_prefs_by_telegram(self, telegram_id: int) -> dict:
+        """Same as get_user_prefs but keyed by telegram_id — used by the
+        scheduler when sending notifications without a cached user_id."""
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT COALESCE(lang, 'ru') AS lang, "
+                "       COALESCE(currency, 'rub') AS currency "
+                "FROM users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if not row:
+                return {"lang": "ru", "currency": "rub"}
+            return {"lang": row["lang"], "currency": row["currency"]}
+        return await self._execute(_op)
+
+    async def set_user_lang(self, user_id: int, lang: str):
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET lang = $2 WHERE id = $1", user_id, lang,
+            )
+        await self._execute(_op)
+
+    async def set_user_currency(self, user_id: int, currency: str):
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET currency = $2 WHERE id = $1", user_id, currency,
+            )
+        await self._execute(_op)
+
+    async def set_user_onboarded(self, user_id: int, value: bool = True):
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET onboarded = $2 WHERE id = $1", user_id, value,
+            )
+        await self._execute(_op)
 
     # --- Subscriptions ---
 
