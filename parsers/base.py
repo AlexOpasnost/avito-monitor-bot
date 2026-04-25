@@ -20,6 +20,7 @@ class SearchItem:
     description: str | None
     seller_name: str | None
     published_timestamp: int | None   # unix seconds
+    brand: str | None = None          # rendered untranslated as own line
 
 
 @runtime_checkable

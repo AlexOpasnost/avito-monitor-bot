@@ -507,9 +507,14 @@ def test_vinted_parse_item_full_shape():
     item = _vinted_parse_item(entry)
     assert item.source == "vinted"
     assert item.external_id == "8743309093"
-    # title gets enriched with brand + condition (size empty so skipped)
+    # Brand is NOT folded into title — translator was mangling it
+    # ("Under Armour" → "Под броню"). It now travels on a separate
+    # untranslated `brand` field.
+    assert item.brand == "Apple"
     assert "Iphone 15 plus" in item.title
-    assert "Apple" in item.title and "Very good" in item.title
+    assert "Apple" not in item.title
+    # Condition still in title (size_title was empty here)
+    assert "Very good" in item.title
     assert item.price_value == 115
     assert "$" in item.price
     assert item.url == "https://www.vinted.com/items/8743309093-iphone-15-plus"
@@ -517,7 +522,7 @@ def test_vinted_parse_item_full_shape():
     assert item.seller_name == "dashal15"
     assert item.published_timestamp == 1777116722
     assert item.location is None and item.description is None
-    print("OK: vinted _parse_item full shape")
+    print("OK: vinted _parse_item full shape (brand on its own field)")
 
 
 def test_vinted_parse_response_filters_promoted():

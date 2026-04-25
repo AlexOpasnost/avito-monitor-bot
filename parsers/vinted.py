@@ -257,17 +257,18 @@ def _parse_response(data: dict) -> list[SearchItem] | None:
 def _parse_item(entry: dict) -> SearchItem:
     ext_id = str(entry.get("id") or "")
     base_title = (entry.get("title") or "").strip()
-    brand = (entry.get("brand_title") or "").strip()
+    brand = (entry.get("brand_title") or "").strip() or None
     size = (entry.get("size_title") or "").strip()
     status = (entry.get("status") or "").strip()
 
-    # Build a rich title — Vinted's bare title is often something like
-    # "Iphone case", which is way too generic on its own. Brand + size +
-    # condition give the reader real signal at a glance.
-    extras = [x for x in (brand, size, status) if x]
+    # Build a richer title with size + condition. Brand is intentionally
+    # NOT folded in — Google Translate happily mangles brand names
+    # ("Under Armour" → "Под броню", "Zara" → "Зара") so we ship it on
+    # its own line in the notification, untranslated.
+    extras = [x for x in (size, status) if x]
     title = base_title
     if extras:
-        # Avoid duplicating brand if it's already in the title (common)
+        # Avoid duplicating something the seller already wrote in the title
         unique_extras = [
             x for x in extras
             if x.lower() not in base_title.lower()
@@ -306,6 +307,7 @@ def _parse_item(entry: dict) -> SearchItem:
         description=None,         # not in catalog response
         seller_name=seller,
         published_timestamp=ts,
+        brand=brand,
     )
 
 
