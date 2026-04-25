@@ -22,10 +22,6 @@ LANGUAGES: list[tuple[str, str]] = [
     ("be", "🇧🇾 Беларуская"),
     ("uk", "🇺🇦 Українська"),
     ("kk", "🇰🇿 Қазақша"),
-    # Caucasus
-    ("hy", "🇦🇲 Հայերեն"),
-    ("ka", "🇬🇪 ქართული"),
-    ("az", "🇦🇿 Azərbaycan"),
     # Major European
     ("en", "🇬🇧 English"),
     ("es", "🇪🇸 Español"),
