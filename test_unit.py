@@ -34,6 +34,15 @@ from parsers.mercari import (
     _format_jpy_price as _mer_format_price,
     _parse_item as _mer_parse_item,
 )
+from parsers.vinted import (
+    VintedSource,
+    _build_api_url as _vinted_build_api_url,
+    _extract_image as _vinted_extract_image,
+    _extract_timestamp as _vinted_extract_ts,
+    _parse_item as _vinted_parse_item,
+    _parse_price as _vinted_parse_price,
+    _parse_response as _vinted_parse_response,
+)
 from parsers.olx import (
     OlxSource,
     _clean_description as _olx_clean_desc,
@@ -95,6 +104,16 @@ def test_dispatcher_matches_kufar():
     print("OK: dispatcher matches kufar")
 
 
+def test_dispatcher_matches_vinted():
+    s = detect_source("https://www.vinted.com/catalog?search_text=iphone")
+    assert s is not None and s.name == "vinted"
+    s = detect_source("https://www.vinted.fr/catalog?brand_ids[]=53")
+    assert s is not None and s.name == "vinted"
+    s = detect_source("https://www.vinted.co.uk/catalog?search_text=nike")
+    assert s is not None and s.name == "vinted"
+    print("OK: dispatcher matches vinted")
+
+
 def test_dispatcher_matches_mercari():
     s = detect_source("https://jp.mercari.com/search?keyword=iphone")
     assert s is not None and s.name == "mercari"
@@ -126,6 +145,7 @@ def test_supported_sources():
     assert "kufar" in sources
     assert "olx" in sources
     assert "mercari" in sources
+    assert "vinted" in sources
     print(f"OK: supported sources = {sources}")
 
 
@@ -356,6 +376,183 @@ def test_olx_source_matches():
     assert not src.matches("https://www.kufar.by/x")
     assert not src.matches("")
     print("OK: OlxSource.matches")
+
+
+def test_vinted_source_matches():
+    src = VintedSource()
+    assert src.matches("https://www.vinted.com/catalog?search_text=iphone")
+    assert src.matches("https://www.vinted.fr/catalog?brand_ids[]=53")
+    assert src.matches("https://m.vinted.de/")
+    assert src.matches("https://www.vinted.co.uk/catalog?search_text=nike")
+    assert not src.matches("https://www.avito.ru/x")
+    assert not src.matches("https://example.com/")
+    assert not src.matches("")
+    print("OK: VintedSource.matches")
+
+
+def test_vinted_build_api_url():
+    # Plain search text → API URL with order=newest_first injected
+    api = _vinted_build_api_url(
+        "https://www.vinted.com/catalog?search_text=iphone"
+    )
+    assert api is not None
+    assert "/api/v2/catalog/items?" in api
+    assert "search_text=iphone" in api
+    assert "order=newest_first" in api
+    assert "page=1" in api and "per_page=50" in api
+
+    # User's URL with order/page/per_page already → all overwritten
+    api = _vinted_build_api_url(
+        "https://www.vinted.com/catalog?search_text=nike"
+        "&order=price_high_to_low&page=5&per_page=200"
+    )
+    assert api is not None
+    assert "order=newest_first" in api  # forced newest
+    assert "page=1" in api and "per_page=50" in api
+    assert "order=price_high_to_low" not in api
+    # No double per_page= ever
+    assert api.count("per_page=") == 1
+
+    # Brand-only filter (no keyword) is still a valid search
+    api = _vinted_build_api_url(
+        "https://www.vinted.fr/catalog?brand_ids%5B%5D=53"
+    )
+    assert api is not None
+    # parse_qs decodes %5B%5D back to [], so the API param is brand_ids[]
+    assert "brand_ids" in api
+
+    # Price-range filter alone counts
+    api = _vinted_build_api_url(
+        "https://www.vinted.com/catalog?price_from=10&price_to=50&currency=EUR"
+    )
+    assert api is not None and "price_from=10" in api
+
+    # Empty / no filter — reject (would flood with whole catalogue)
+    assert _vinted_build_api_url("https://www.vinted.com/catalog") is None
+    assert _vinted_build_api_url("https://www.vinted.com/") is None
+    assert _vinted_build_api_url(
+        "https://www.vinted.com/catalog?order=newest_first"
+    ) is None
+    print("OK: vinted _build_api_url")
+
+
+def test_vinted_parse_price():
+    # Standard Vinted shape
+    label, value = _vinted_parse_price({"amount": "115.0", "currency_code": "USD"})
+    assert value == 115
+    assert "$" in label and "115" in label
+
+    # EUR has USD hint appended
+    label, value = _vinted_parse_price({"amount": "100.0", "currency_code": "EUR"})
+    assert value == 100 and "€" in label and "$" in label
+
+    # Unknown currency: keep code as-is, no USD hint
+    label, value = _vinted_parse_price({"amount": "50", "currency_code": "XXX"})
+    assert value == 50 and "XXX" in label and "$" not in label
+
+    # Zero / negative / missing
+    assert _vinted_parse_price({"amount": "0", "currency_code": "USD"}) == (
+        "Цена не указана", None,
+    )
+    assert _vinted_parse_price({}) == ("Цена не указана", None)
+    assert _vinted_parse_price(None) == ("Цена не указана", None)
+    print("OK: vinted _parse_price")
+
+
+def test_vinted_extract_image_and_ts():
+    entry = {
+        "photos": [
+            {
+                "url": "https://images1.vinted.net/t/abc/f800/1777116722.jpeg",
+                "high_resolution": {"timestamp": 1777116722},
+            },
+            {"url": "https://images1.vinted.net/t/def/f800/x.jpeg"},
+        ],
+        "photo": {
+            "url": "https://images1.vinted.net/t/abc/f800/1777116722.jpeg",
+            "high_resolution": {"timestamp": 1777116722},
+        },
+    }
+    assert _vinted_extract_image(entry) == (
+        "https://images1.vinted.net/t/abc/f800/1777116722.jpeg"
+    )
+    assert _vinted_extract_ts(entry) == 1777116722
+
+    # Empty / missing
+    assert _vinted_extract_image({}) is None
+    assert _vinted_extract_ts({}) is None
+    # Non-http URL rejected
+    assert _vinted_extract_image({"photos": [{"url": "//cdn/x.jpg"}]}) is None
+    print("OK: vinted _extract_image / _extract_timestamp")
+
+
+def test_vinted_parse_item_full_shape():
+    entry = {
+        "id": 8743309093,
+        "title": "Iphone 15 plus",
+        "price": {"amount": "115.0", "currency_code": "USD"},
+        "is_visible": True,
+        "brand_title": "Apple",
+        "size_title": "",
+        "status": "Very good",
+        "path": "/items/8743309093-iphone-15-plus",
+        "url": "https://www.vinted.com/items/8743309093-iphone-15-plus",
+        "promoted": False,
+        "user": {"id": 1, "login": "dashal15"},
+        "photos": [{
+            "url": "https://images1.vinted.net/t/abc/f800/1777116722.jpeg",
+            "high_resolution": {"timestamp": 1777116722},
+        }],
+    }
+    item = _vinted_parse_item(entry)
+    assert item.source == "vinted"
+    assert item.external_id == "8743309093"
+    # title gets enriched with brand + condition (size empty so skipped)
+    assert "Iphone 15 plus" in item.title
+    assert "Apple" in item.title and "Very good" in item.title
+    assert item.price_value == 115
+    assert "$" in item.price
+    assert item.url == "https://www.vinted.com/items/8743309093-iphone-15-plus"
+    assert item.image_url and item.image_url.startswith("https://images1.vinted.net/")
+    assert item.seller_name == "dashal15"
+    assert item.published_timestamp == 1777116722
+    assert item.location is None and item.description is None
+    print("OK: vinted _parse_item full shape")
+
+
+def test_vinted_parse_response_filters_promoted():
+    data = {
+        "items": [
+            {  # promoted → skip
+                "id": 1, "title": "Promoted", "promoted": True,
+                "price": {"amount": "10", "currency_code": "USD"},
+            },
+            {  # is_visible False → skip
+                "id": 2, "title": "Hidden",
+                "is_visible": False,
+                "price": {"amount": "20", "currency_code": "USD"},
+            },
+            {  # organic
+                "id": 3, "title": "Organic Phone",
+                "is_visible": True, "promoted": False,
+                "brand_title": "Apple",
+                "price": {"amount": "100.0", "currency_code": "EUR"},
+                "url": "https://www.vinted.com/items/3-organic",
+                "photos": [{
+                    "url": "https://images1.vinted.net/t/x/f800/123.jpeg",
+                    "high_resolution": {"timestamp": 1777116722},
+                }],
+                "user": {"login": "alice"},
+            },
+        ],
+        "pagination": {"total_entries": 3},
+    }
+    out = _vinted_parse_response(data)
+    assert out is not None
+    ids = [i.external_id for i in out]
+    assert ids == ["3"]
+    assert out[0].seller_name == "alice"
+    print("OK: vinted _parse_response filters promoted + hidden")
 
 
 def test_mercari_source_matches():
@@ -754,6 +951,13 @@ if __name__ == "__main__":
     test_kufar_description_fallback()
     test_kufar_seller()
     test_kufar_time_parsing()
+    test_dispatcher_matches_vinted()
+    test_vinted_source_matches()
+    test_vinted_build_api_url()
+    test_vinted_parse_price()
+    test_vinted_extract_image_and_ts()
+    test_vinted_parse_item_full_shape()
+    test_vinted_parse_response_filters_promoted()
     test_dispatcher_matches_mercari()
     test_mercari_source_matches()
     test_mercari_extract_keyword()
