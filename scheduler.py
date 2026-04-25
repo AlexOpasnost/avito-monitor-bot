@@ -397,14 +397,9 @@ def _format_notification(item: AvitoItem) -> str:
     lines = [
         f"<b>{title}</b>",
         f"💰 <b>{price}</b>",
+        f"📍 {location}",
+        f"📅 {when}",
     ]
-    # Brand is rendered untranslated. Google Translate mangles brand
-    # names ("Under Armour" → "Под броню") so the parser keeps the
-    # original brand_title here instead of folding it into the title.
-    if item.brand:
-        lines.append(f"🏷️ {_escape(item.brand)}")
-    lines.append(f"📍 {location}")
-    lines.append(f"📅 {when}")
 
     if item.description:
         desc = _prettify_description(item.description, _DESC_HARD_MAX)

@@ -507,9 +507,11 @@ def test_vinted_parse_item_full_shape():
     item = _vinted_parse_item(entry)
     assert item.source == "vinted"
     assert item.external_id == "8743309093"
-    # Brand is NOT folded into title — translator was mangling it
-    # ("Under Armour" → "Под броню"). It now travels on a separate
-    # untranslated `brand` field.
+    # Brand is NOT folded into title (translator was mangling it:
+    # "Under Armour" → "Под броню"). Brand is captured on the dataclass
+    # field but the notification doesn't render it — categories beyond
+    # fashion don't have a brand at all so a dedicated line wasn't
+    # universal.
     assert item.brand == "Apple"
     assert "Iphone 15 plus" in item.title
     assert "Apple" not in item.title
