@@ -36,8 +36,10 @@ from parsers.mercari import (
 )
 from parsers.vinted import (
     VintedSource,
+    _BREADCRUMB_RE as _vinted_breadcrumb_re,
     _build_api_url as _vinted_build_api_url,
     _extract_image as _vinted_extract_image,
+    _extract_target_catalogs as _vinted_extract_target_catalogs,
     _extract_timestamp as _vinted_extract_ts,
     _parse_item as _vinted_parse_item,
     _parse_price as _vinted_parse_price,
@@ -527,6 +529,58 @@ def test_vinted_parse_item_full_shape():
     print("OK: vinted _parse_item full shape (brand on its own field)")
 
 
+def test_vinted_extract_target_catalogs():
+    # Single catalog id
+    cats = _vinted_extract_target_catalogs(
+        "https://www.vinted.es/catalog?catalog[]=2050"
+    )
+    assert cats == frozenset({2050})
+
+    # Multiple catalog[] occurrences
+    cats = _vinted_extract_target_catalogs(
+        "https://www.vinted.es/catalog?catalog[]=2050&catalog[]=77"
+    )
+    assert cats == frozenset({2050, 77})
+
+    # CSV form
+    cats = _vinted_extract_target_catalogs(
+        "https://www.vinted.es/catalog?catalog_ids=5,77,2050"
+    )
+    assert cats == frozenset({5, 77, 2050})
+
+    # No catalog filter -> empty (skip strict filter)
+    cats = _vinted_extract_target_catalogs(
+        "https://www.vinted.es/catalog?search_text=iphone&brand_ids[]=14"
+    )
+    assert cats == frozenset()
+    print("OK: vinted _extract_target_catalogs")
+
+
+def test_vinted_breadcrumb_regex():
+    """Real breadcrumb HTML structure from a vinted.es item page."""
+    html = (
+        '<ul class="breadcrumbs"><li><a href="/catalog/5-men?referrer=item-crumbs">'
+        'Hombre</a></li><li><a href="/catalog/2050-clothing?referrer=item-crumbs">'
+        'Ropa</a></li><li><a href="/catalog/30-activewear?referrer=item-crumbs">'
+        'Ropa deportiva</a></li><li><a href="/catalog/582-tracksuits?referrer=item-crumbs">'
+        'Tracksuits</a></li></ul>'
+    )
+    ids = [int(m) for m in _vinted_breadcrumb_re.findall(html)]
+    assert ids == [5, 2050, 30, 582]
+
+    # Multi-digit, hyphen-with-numbers slug
+    html2 = (
+        '<a href="/catalog/4690593-some-niche-brand?referrer=item-crumbs">x</a>'
+    )
+    ids = [int(m) for m in _vinted_breadcrumb_re.findall(html2)]
+    assert ids == [4690593]
+
+    # Wrong referrer (catalog page itself, not item) -> no match
+    html3 = '<a href="/catalog/5-men?referrer=catalog">x</a>'
+    assert _vinted_breadcrumb_re.findall(html3) == []
+    print("OK: vinted _BREADCRUMB_RE")
+
+
 def test_vinted_parse_response_filters_promoted():
     data = {
         "items": [
@@ -964,6 +1018,8 @@ if __name__ == "__main__":
     test_vinted_parse_price()
     test_vinted_extract_image_and_ts()
     test_vinted_parse_item_full_shape()
+    test_vinted_extract_target_catalogs()
+    test_vinted_breadcrumb_regex()
     test_vinted_parse_response_filters_promoted()
     test_dispatcher_matches_mercari()
     test_mercari_source_matches()

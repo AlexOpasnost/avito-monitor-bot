@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import orjson
@@ -68,6 +69,17 @@ _CURRENCY_SYMBOL: dict[str, str] = {
     "PLN": "zł", "CZK": "Kč", "SEK": "kr", "DKK": "kr",
     "HUF": "Ft", "RON": "lei",
 }
+
+# Catalog ancestors are scraped out of the item page's breadcrumb,
+# which Vinted server-renders with /catalog/<id>-<slug>?referrer=item-crumbs
+# anchors. Cache the result per-item so the steady-state monitor only
+# pays the per-page fetch on truly new IDs.
+_BREADCRUMB_RE = re.compile(r"/catalog/(\d+)-[a-z0-9-]+\?referrer=item-crumbs")
+_ANCESTOR_CACHE: dict[int, tuple[frozenset[int], float]] = {}
+_ANCESTOR_TTL = 24 * 3600.0
+# Hard cap on per-cycle item-page fetches so a fresh seed doesn't
+# stampede DataDome (or blow the request budget).
+_MAX_ENRICH_PER_CYCLE = 50
 
 # Search-meaningful query keys. We require at least one to be present
 # in the user URL so we don't flood with the whole catalogue.
@@ -146,7 +158,28 @@ async def _fetch_api(api_url: str, user_url: str, proxy: str | None):
     except Exception as e:
         logger.warning("[vinted] JSON decode err: %s", str(e)[:80])
         return None, False
-    return _parse_response(data), False
+
+    items = _parse_response(data)
+    if items is None:
+        return None, False
+
+    # Strict catalog filter: Vinted's `catalog[]=...` filter is loose
+    # — sellers categorize themselves and items leak across genders.
+    # If the user URL named a specific catalog (e.g. 2050 = men's
+    # clothing), enrich each item with its own breadcrumb chain and
+    # drop the ones outside that subtree.
+    target = _extract_target_catalogs(user_url)
+    if target:
+        before = len(items)
+        origin = _origin_for(user_url) or "https://www.vinted.com"
+        items, dropped_outside, failures = await _filter_by_catalog(
+            items, target, origin, proxy,
+        )
+        logger.info(
+            "[vinted] strict catalog %s: %d → %d (dropped %d outside, %d enrich failures)",
+            sorted(target), before, len(items), dropped_outside, failures,
+        )
+    return items, False
 
 
 def _fetch_api_sync(api_url: str, user_url: str, proxy: str | None):
@@ -252,6 +285,121 @@ def _parse_response(data: dict) -> list[SearchItem] | None:
             with_ts, total_cnt, skipped,
         )
     return items
+
+
+# ---------------------------------------------------------------------------
+# Strict catalog filter — Vinted's server-side `catalog[]` filter is
+# loose (sellers mis-categorize, items leak across genders). To get a
+# clean men's-only / women's-only stream we fetch each item page's
+# breadcrumb, extract its ancestor chain, and drop items whose chain
+# doesn't intersect the user's target catalogs.
+# ---------------------------------------------------------------------------
+
+def _extract_target_catalogs(user_url: str) -> frozenset[int]:
+    """Return the set of catalog IDs the user explicitly asked for in
+    `catalog[]=...` (or `catalog_ids[]=...`). Empty frozenset means no
+    strict filter — the parser then accepts whatever the search API
+    returns."""
+    try:
+        p = urlparse(user_url)
+    except Exception:
+        return frozenset()
+    qs = parse_qs(p.query or "")
+    out: set[int] = set()
+    for key in ("catalog[]", "catalog_ids[]", "catalog_ids", "catalog"):
+        for raw in qs.get(key, []):
+            for token in raw.split(","):
+                token = token.strip()
+                if token.isdigit():
+                    out.add(int(token))
+    return frozenset(out)
+
+
+def _fetch_item_breadcrumb_sync(
+    item_id: int, origin: str, proxy: str | None,
+) -> frozenset[int] | None:
+    """GET /items/{id} (first ~200 KB) and parse the breadcrumb URLs to
+    learn the item's catalog ancestor chain. Cached per item-id."""
+    cached = _ANCESTOR_CACHE.get(item_id)
+    now = time.time()
+    if cached and (now - cached[1]) < _ANCESTOR_TTL:
+        return cached[0]
+    try:
+        s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
+        proxies = proxies_dict(proxy)
+        url = f"{origin}/items/{item_id}"
+        # Breadcrumb sits ~73 KB into Vinted's item HTML; 200 KB is a
+        # safety margin. Server often ignores Range and sends the full
+        # 2 MB page (gzipped), so cap how much we read either way.
+        headers = {
+            "Accept": "text/html",
+            "Range": "bytes=0-204799",
+            "Referer": origin + "/",
+        }
+        resp = s.get(url, proxies=proxies, timeout=20, headers=headers)
+        if resp.status_code not in (200, 206):
+            logger.debug("[vinted] item %d page HTTP %d", item_id, resp.status_code)
+            return None
+        # Slice locally — even when server ignored Range we don't need
+        # the full body for breadcrumbs.
+        html_head = (resp.text or "")[:200_000]
+        ids = {int(m) for m in _BREADCRUMB_RE.findall(html_head)}
+        if not ids:
+            return None
+        ancestors = frozenset(ids)
+        _ANCESTOR_CACHE[item_id] = (ancestors, now)
+        return ancestors
+    except Exception as e:
+        logger.debug("[vinted] item %d breadcrumb fetch err: %s",
+                     item_id, str(e)[:100])
+        return None
+
+
+async def _filter_by_catalog(
+    items: list[SearchItem], target_catalogs: frozenset[int],
+    origin: str, proxy: str | None,
+) -> tuple[list[SearchItem], int, int]:
+    """Drop items whose breadcrumb ancestor chain doesn't include any
+    target catalog id. Returns (kept, dropped_outside, fetch_failures).
+
+    Fail-open: items whose ancestors couldn't be determined (network
+    error, DataDome page redirect, parse miss) are KEPT — better to
+    notify than to silently swallow."""
+    if not target_catalogs:
+        return items, 0, 0
+    loop = asyncio.get_running_loop()
+    kept: list[SearchItem] = []
+    dropped_outside = 0
+    failures = 0
+    enriched = 0
+    for item in items:
+        # Hard cap so first-scan seed doesn't fire 50 sequential page
+        # loads and trip DataDome.
+        if enriched >= _MAX_ENRICH_PER_CYCLE:
+            kept.append(item)
+            continue
+        try:
+            item_id = int(item.external_id)
+        except (TypeError, ValueError):
+            kept.append(item)
+            continue
+        ancestors = await loop.run_in_executor(
+            None,
+            lambda i=item_id: _fetch_item_breadcrumb_sync(i, origin, proxy),
+        )
+        enriched += 1
+        if ancestors is None:
+            failures += 1
+            kept.append(item)  # fail-open
+            continue
+        if ancestors & target_catalogs:
+            kept.append(item)
+        else:
+            dropped_outside += 1
+        # Mild courtesy delay so 50 sequential GETs don't read as a
+        # bot to DataDome's behavioural model.
+        await asyncio.sleep(0.15)
+    return kept, dropped_outside, failures
 
 
 def _parse_item(entry: dict) -> SearchItem:
