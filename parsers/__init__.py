@@ -37,4 +37,26 @@ def supported_sources() -> list[str]:
     return [s.name for s in SOURCES]
 
 
-__all__ = ["SearchItem", "Source", "SOURCES", "detect_source", "supported_sources"]
+# Single source of truth for human-facing source names.
+# Used in user-facing bot messages and inline buttons.
+SOURCE_DISPLAY_NAMES: dict[str, str] = {
+    "avito":   "Авито",
+    "kufar":   "Kufar",
+    "olx":     "OLX",
+    "vinted":  "Vinted",
+    "mercari": "Mercari",
+    "goofish": "Goofish",
+}
+
+
+def source_display_name(name: str | None) -> str:
+    if not name:
+        return "маркетплейс"
+    return SOURCE_DISPLAY_NAMES.get(name.lower(), name.title())
+
+
+__all__ = [
+    "SearchItem", "Source", "SOURCES",
+    "detect_source", "supported_sources",
+    "SOURCE_DISPLAY_NAMES", "source_display_name",
+]

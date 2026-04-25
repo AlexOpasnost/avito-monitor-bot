@@ -17,6 +17,7 @@ from parser import (
     download_image_bytes,
     fetch_search_items,
 )
+from parsers import source_display_name
 from parsers.common import proxy_for_source
 
 # Back-compat alias used in this module
@@ -309,14 +310,10 @@ async def _russify_item(item: SearchItem) -> None:
             item.description = r
 
 
-_SOURCE_BUTTON_TEXT = {
-    "avito":   "🔗 Открыть на Авито",
-    "kufar":   "🔗 Открыть на Kufar",
-    "olx":     "🔗 Открыть на OLX",
-    "vinted":  "🔗 Открыть на Vinted",
-    "mercari": "🔗 Открыть на Mercari",
-    "goofish": "🔗 Открыть на Goofish",
-}
+def _source_button_text(source: str | None) -> str:
+    if not source:
+        return "🔗 Открыть объявление"
+    return f"🔗 Открыть на {source_display_name(source)}"
 
 # Per-source Referer for image downloads — Avito's CDN refuses requests
 # without the Avito Referer; other sites have similar checks.
@@ -335,7 +332,7 @@ async def _send_notification(bot: Bot, sub: dict, item: SearchItem):
     # starts — here the item is already Russian (or the translator
     # failed and we're showing the original, which is still safe).
     text = _format_notification(item)
-    button_text = _SOURCE_BUTTON_TEXT.get(item.source, "🔗 Открыть объявление")
+    button_text = _source_button_text(item.source)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=button_text, url=item.url)],
     ])

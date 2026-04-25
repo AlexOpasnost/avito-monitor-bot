@@ -14,6 +14,7 @@ from aiogram.types import (
 from config import config
 from database import db
 from parser import detect_source, fetch_search_items, supported_sources
+from parsers import source_display_name
 from parsers.common import proxy_for_source
 
 logger = logging.getLogger(__name__)
@@ -216,7 +217,8 @@ async def cmd_list(message: Message):
 
     if not active:
         await message.answer(
-            "У тебя нет активных отслеживаний. Отправь ссылку с Авито, чтобы начать."
+            "У тебя нет активных отслеживаний. Отправь ссылку на поиск с любого "
+            "поддерживаемого маркетплейса, чтобы начать."
         )
         return
 
@@ -332,9 +334,10 @@ async def handle_url(message: Message):
     else:
         seeded = 0
 
+    pretty = source_display_name(source_name)
     await message.answer(
         f"✅ <b>Мониторинг запущен</b>\n\n"
-        f"🔗 <a href=\"{url}\">Твоя ссылка на Авито</a>\n\n"
+        f"🔗 <a href=\"{url}\">Твоя ссылка на {pretty}</a>\n\n"
         f"Записал {seeded} текущих объявлений как уже виденные. "
         f"Как появится новое — пришлю с фото, ценой и описанием.\n\n"
         f"/list — все отслеживания  ·  /delete — удалить",
