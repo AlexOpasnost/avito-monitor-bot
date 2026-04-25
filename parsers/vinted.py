@@ -78,8 +78,11 @@ _BREADCRUMB_RE = re.compile(r"/catalog/(\d+)-[a-z0-9-]+\?referrer=item-crumbs")
 _ANCESTOR_CACHE: dict[int, tuple[frozenset[int], float]] = {}
 _ANCESTOR_TTL = 24 * 3600.0
 # Hard cap on per-cycle item-page fetches so a fresh seed doesn't
-# stampede DataDome (or blow the request budget).
-_MAX_ENRICH_PER_CYCLE = 50
+# stampede DataDome (or blow the request budget). At 1.5s spacing
+# this caps the verify pass at ~45s per cycle — under the 60s tick.
+# Cache-hit items don't count towards this cap, so steady state on a
+# stable URL is essentially unbounded.
+_MAX_ENRICH_PER_CYCLE = 30
 
 # Search-meaningful query keys. We require at least one to be present
 # in the user URL so we don't flood with the whole catalogue.
@@ -172,12 +175,14 @@ async def _fetch_api(api_url: str, user_url: str, proxy: str | None):
     if target:
         before = len(items)
         origin = _origin_for(user_url) or "https://www.vinted.com"
-        items, dropped_outside, failures = await _filter_by_catalog(
+        items, dropped_outside, failures, unverified = await _filter_by_catalog(
             items, target, origin, proxy,
         )
         logger.info(
-            "[vinted] strict catalog %s: %d → %d (dropped %d outside, %d enrich failures)",
-            sorted(target), before, len(items), dropped_outside, failures,
+            "[vinted] strict catalog %s: %d → %d kept "
+            "(dropped %d outside | %d enrich-fail | %d unverified)",
+            sorted(target), before, len(items),
+            dropped_outside, failures, unverified,
         )
     return items, False
 
@@ -355,34 +360,62 @@ def _fetch_item_breadcrumb_sync(
         return None
 
 
+def _ancestors_from_cache(item_id: int) -> frozenset[int] | None:
+    cached = _ANCESTOR_CACHE.get(item_id)
+    if cached and (time.time() - cached[1]) < _ANCESTOR_TTL:
+        return cached[0]
+    return None
+
+
 async def _filter_by_catalog(
     items: list[SearchItem], target_catalogs: frozenset[int],
     origin: str, proxy: str | None,
-) -> tuple[list[SearchItem], int, int]:
+) -> tuple[list[SearchItem], int, int, int]:
     """Drop items whose breadcrumb ancestor chain doesn't include any
-    target catalog id. Returns (kept, dropped_outside, fetch_failures).
+    target catalog id. Returns
+    (kept, dropped_outside, fetch_failures, dropped_unverified).
 
-    Fail-open: items whose ancestors couldn't be determined (network
-    error, DataDome page redirect, parse miss) are KEPT — better to
-    notify than to silently swallow."""
+    Fail-CLOSED: items whose ancestors couldn't be determined (network
+    error, DataDome 429, redirect, empty crumbs) are DROPPED. Empirical
+    research (research/VINTED_LIVE_ANALYSIS.md) showed that
+    `/api/v2/catalog/items?catalog[]=N` is a decorative filter that
+    leaks ~80% women's/kids' items into a men's-clothing search, so any
+    item we can't positively verify must be assumed leaky.
+
+    Cache-hit items are evaluated synchronously (no sleep) so steady
+    state stays cheap; only cache-miss items pay the 1.5s rate-limit
+    spacing required by Vinted's per-IP throttle on /items/{id}."""
     if not target_catalogs:
-        return items, 0, 0
+        return items, 0, 0, 0
     loop = asyncio.get_running_loop()
     kept: list[SearchItem] = []
     dropped_outside = 0
     failures = 0
+    dropped_unverified = 0
     enriched = 0
     for item in items:
-        # Hard cap so first-scan seed doesn't fire 50 sequential page
-        # loads and trip DataDome.
-        if enriched >= _MAX_ENRICH_PER_CYCLE:
-            kept.append(item)
-            continue
         try:
             item_id = int(item.external_id)
         except (TypeError, ValueError):
-            kept.append(item)
+            dropped_unverified += 1
             continue
+
+        cached = _ancestors_from_cache(item_id)
+        if cached is not None:
+            # Cache hit — instant, no sleep, no enrichment budget burn.
+            if cached & target_catalogs:
+                kept.append(item)
+            else:
+                dropped_outside += 1
+            continue
+
+        # Cache miss — pay HTTP. Hard cap so first-scan seed doesn't
+        # fire 50 sequential page loads and trip DataDome's per-IP
+        # throttle.
+        if enriched >= _MAX_ENRICH_PER_CYCLE:
+            dropped_unverified += 1
+            continue
+
         ancestors = await loop.run_in_executor(
             None,
             lambda i=item_id: _fetch_item_breadcrumb_sync(i, origin, proxy),
@@ -390,16 +423,16 @@ async def _filter_by_catalog(
         enriched += 1
         if ancestors is None:
             failures += 1
-            kept.append(item)  # fail-open
+            # Fail-CLOSED: drop unverified rather than risk a leak.
             continue
         if ancestors & target_catalogs:
             kept.append(item)
         else:
             dropped_outside += 1
-        # Mild courtesy delay so 50 sequential GETs don't read as a
-        # bot to DataDome's behavioural model.
-        await asyncio.sleep(0.15)
-    return kept, dropped_outside, failures
+        # 1.5s spacing held under sustained 30-item enrichment in
+        # research; faster spacing tripped 429 within ~4 requests.
+        await asyncio.sleep(1.5)
+    return kept, dropped_outside, failures, dropped_unverified
 
 
 def _parse_item(entry: dict) -> SearchItem:
