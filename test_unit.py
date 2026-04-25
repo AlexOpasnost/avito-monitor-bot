@@ -37,8 +37,11 @@ from parsers.mercari import (
 from parsers.vinted import (
     VintedSource,
     _BREADCRUMB_RE as _vinted_breadcrumb_re,
+    _apply_enrichment as _vinted_apply_enrichment,
     _build_api_url as _vinted_build_api_url,
+    _extract_description_from_html as _vinted_extract_description,
     _extract_image as _vinted_extract_image,
+    _extract_location_from_html as _vinted_extract_location,
     _extract_target_catalogs as _vinted_extract_target_catalogs,
     _extract_timestamp as _vinted_extract_ts,
     _parse_item as _vinted_parse_item,
@@ -581,6 +584,97 @@ def test_vinted_breadcrumb_regex():
     print("OK: vinted _BREADCRUMB_RE")
 
 
+def test_vinted_extract_description_from_html():
+    # JSON-LD path — Vinted's primary description carrier
+    html = '''
+<!DOCTYPE html><html><head>
+<title>x</title>
+<script type="application/ld+json">{"@type":"Product","name":"Casaco Adidas Italia","description":"Casaco da adidas com detalhe da bandeira d Italia.\\nUsado poucas vezes\\nPreco negociavel","image":"https://...","brand":{"@type":"Brand","name":"adidas"}}</script>
+</head><body></body></html>
+'''
+    desc = _vinted_extract_description(html)
+    assert desc is not None
+    assert "Casaco da adidas" in desc and "Preco negociavel" in desc
+
+    # og:description fallback (no JSON-LD) — title prefix gets stripped
+    html2 = (
+        '<meta property="og:description" '
+        'content="Casaco Adidas Italia - Casaco da adidas usado poucas vezes."'
+        '/>'
+    )
+    desc = _vinted_extract_description(html2)
+    assert desc == "Casaco da adidas usado poucas vezes."
+
+    # Nothing parseable -> None
+    assert _vinted_extract_description("<html><body>nope</body></html>") is None
+    print("OK: vinted _extract_description_from_html")
+
+
+def test_vinted_extract_location_from_html():
+    # The user_info block in Vinted's React stream comes through as
+    # backslash-escaped JSON inside a JS-string. The bytes really are
+    # `\"text\":\"...\",\"key\":\"location\"`.
+    html_chunk = (
+        r'\"icon\":\"LocationPin16\",'
+        r'\"text\":\"Vila Nova de Gaia, Portugal\",\"key\":\"location\"'
+    )
+    loc = _vinted_extract_location(html_chunk)
+    assert loc == "Vila Nova de Gaia, Portugal"
+
+    # Unicode escape inside the value (e.g. Málaga)
+    html_chunk2 = (
+        r'\"text\":\"Málaga, España\",\"key\":\"location\"'
+    )
+    loc = _vinted_extract_location(html_chunk2)
+    # unicode_escape decodes á to á, ñ to ñ
+    assert loc == "Málaga, España"
+
+    # No location -> None
+    assert _vinted_extract_location("<html>no user_info</html>") is None
+    print("OK: vinted _extract_location_from_html")
+
+
+def test_vinted_apply_enrichment():
+    from parsers.base import SearchItem
+    item = SearchItem(
+        source="vinted", external_id="1", title="x", price="10 €",
+        price_value=10, url="x", image_url=None, location=None,
+        description=None, seller_name=None, published_timestamp=None,
+    )
+    _vinted_apply_enrichment(item, {
+        "ancestors": frozenset({5, 2050}),
+        "description": "Bonita prenda",
+        "location": "Madrid, España",
+    })
+    assert item.description == "Bonita prenda"
+    assert item.location == "Madrid, España"
+
+    # Existing fields are preserved (don't overwrite)
+    item2 = SearchItem(
+        source="vinted", external_id="2", title="y", price="20 €",
+        price_value=20, url="y", image_url=None,
+        location="Already Set", description="Already Set",
+        seller_name=None, published_timestamp=None,
+    )
+    _vinted_apply_enrichment(item2, {
+        "description": "From Vinted",
+        "location": "From Vinted",
+    })
+    assert item2.description == "Already Set"
+    assert item2.location == "Already Set"
+
+    # Empty / missing meta keys don't blow up
+    item3 = SearchItem(
+        source="vinted", external_id="3", title="z", price="30 €",
+        price_value=30, url="z", image_url=None, location=None,
+        description=None, seller_name=None, published_timestamp=None,
+    )
+    _vinted_apply_enrichment(item3, {})
+    _vinted_apply_enrichment(item3, {"description": "  "})  # whitespace
+    assert item3.description is None and item3.location is None
+    print("OK: vinted _apply_enrichment")
+
+
 def test_vinted_parse_response_filters_promoted():
     data = {
         "items": [
@@ -1020,6 +1114,9 @@ if __name__ == "__main__":
     test_vinted_parse_item_full_shape()
     test_vinted_extract_target_catalogs()
     test_vinted_breadcrumb_regex()
+    test_vinted_extract_description_from_html()
+    test_vinted_extract_location_from_html()
+    test_vinted_apply_enrichment()
     test_vinted_parse_response_filters_promoted()
     test_dispatcher_matches_mercari()
     test_mercari_source_matches()

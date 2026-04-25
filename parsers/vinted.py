@@ -70,13 +70,30 @@ _CURRENCY_SYMBOL: dict[str, str] = {
     "HUF": "Ft", "RON": "lei",
 }
 
-# Catalog ancestors are scraped out of the item page's breadcrumb,
-# which Vinted server-renders with /catalog/<id>-<slug>?referrer=item-crumbs
-# anchors. Cache the result per-item so the steady-state monitor only
-# pays the per-page fetch on truly new IDs.
+# Per-item enrichment from the full /items/{id} HTML:
+#   - ancestors: the breadcrumb chain (gender + category subtree),
+#     used for the strict-catalog filter. Server-renders as
+#     /catalog/<id>-<slug>?referrer=item-crumbs anchors.
+#   - description: from the JSON-LD <script> block (~80 KB into HTML).
+#   - location: from the React-stream user_info block (~2.1 MB into HTML).
+#
+# We cache the whole bundle per item-id with a 24 h TTL so the
+# steady-state monitor only pays the page fetch on genuinely new IDs.
 _BREADCRUMB_RE = re.compile(r"/catalog/(\d+)-[a-z0-9-]+\?referrer=item-crumbs")
-_ANCESTOR_CACHE: dict[int, tuple[frozenset[int], float]] = {}
-_ANCESTOR_TTL = 24 * 3600.0
+_LD_JSON_RE = re.compile(
+    r'<script\s+type="application/ld\+json"\s*>([\s\S]*?)</script>',
+    re.IGNORECASE,
+)
+# user_info location entry. Vinted's React-stream emits the user_info
+# block JSON-encoded inside a JS string, so the on-the-wire bytes look
+# like `\"text\":\"Vila Nova de Gaia, Portugal\",\"key\":\"location\"`
+# (backslash + quote pairs around the keys/values). The raw-string
+# regex below matches exactly those literal bytes.
+_LOCATION_RE = re.compile(
+    r'\\"text\\":\\"([^"]+?)\\",\\"key\\":\\"location\\"'
+)
+_ENRICH_CACHE: dict[int, tuple[dict, float]] = {}
+_ENRICH_TTL = 24 * 3600.0
 # Hard cap on per-cycle item-page fetches so a fresh seed doesn't
 # stampede DataDome (or blow the request budget). At 1.5s spacing
 # this caps the verify pass at ~45s per cycle — under the 60s tick.
@@ -320,60 +337,147 @@ def _extract_target_catalogs(user_url: str) -> frozenset[int]:
     return frozenset(out)
 
 
-def _fetch_item_breadcrumb_sync(
+def _fetch_item_metadata_sync(
     item_id: int, origin: str, proxy: str | None,
-) -> frozenset[int] | None:
-    """GET /items/{id} (first ~200 KB) and parse the breadcrumb URLs to
-    learn the item's catalog ancestor chain. Cached per item-id."""
-    cached = _ANCESTOR_CACHE.get(item_id)
+) -> dict | None:
+    """GET /items/{id} (full HTML, no Range) and extract everything we
+    can in one pass: breadcrumb ancestors, JSON-LD description, and
+    the seller's city/country from the React-stream user_info block.
+
+    Returns a dict like
+        {"ancestors": frozenset[int], "description": str | None,
+         "location": str | None}
+    or None on any fetch failure. Cached per item-id (24 h TTL)."""
+    cached = _ENRICH_CACHE.get(item_id)
     now = time.time()
-    if cached and (now - cached[1]) < _ANCESTOR_TTL:
+    if cached and (now - cached[1]) < _ENRICH_TTL:
         return cached[0]
     try:
         s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
         proxies = proxies_dict(proxy)
         url = f"{origin}/items/{item_id}"
-        # Breadcrumb sits ~73 KB into Vinted's item HTML; 200 KB is a
-        # safety margin. Server often ignores Range and sends the full
-        # 2 MB page (gzipped), so cap how much we read either way.
+        # No Range header — the seller location lives ~2.1 MB into the
+        # 2.3 MB item HTML, in a React-stream user_info block. Without
+        # the full page we'd lose location entirely.
         headers = {
             "Accept": "text/html",
-            "Range": "bytes=0-204799",
+            "Accept-Encoding": "gzip, deflate, br",
             "Referer": origin + "/",
         }
-        resp = s.get(url, proxies=proxies, timeout=20, headers=headers)
+        resp = s.get(url, proxies=proxies, timeout=30, headers=headers)
         if resp.status_code not in (200, 206):
             logger.debug("[vinted] item %d page HTTP %d", item_id, resp.status_code)
             return None
-        # Slice locally — even when server ignored Range we don't need
-        # the full body for breadcrumbs.
-        html_head = (resp.text or "")[:200_000]
-        ids = {int(m) for m in _BREADCRUMB_RE.findall(html_head)}
-        if not ids:
+        html = resp.text or ""
+
+        # Ancestors live near the top (byte ~73 KB) — slice for the regex
+        # to keep work bounded.
+        ancestors_html = html[:200_000]
+        ancestor_ids = {int(m) for m in _BREADCRUMB_RE.findall(ancestors_html)}
+        if not ancestor_ids:
+            # Page didn't render a breadcrumb (deleted item, A/B variant,
+            # interstitial, …). Treat as failure so the strict-filter
+            # caller fails-closed.
             return None
-        ancestors = frozenset(ids)
-        _ANCESTOR_CACHE[item_id] = (ancestors, now)
-        return ancestors
+        ancestors = frozenset(ancestor_ids)
+
+        meta = {
+            "ancestors": ancestors,
+            "description": _extract_description_from_html(html),
+            "location": _extract_location_from_html(html),
+        }
+        _ENRICH_CACHE[item_id] = (meta, now)
+        return meta
     except Exception as e:
-        logger.debug("[vinted] item %d breadcrumb fetch err: %s",
+        logger.debug("[vinted] item %d enrichment err: %s",
                      item_id, str(e)[:100])
         return None
 
 
-def _ancestors_from_cache(item_id: int) -> frozenset[int] | None:
-    cached = _ANCESTOR_CACHE.get(item_id)
-    if cached and (time.time() - cached[1]) < _ANCESTOR_TTL:
+def _extract_description_from_html(html: str) -> str | None:
+    """Pull the seller's description out of the JSON-LD <script> block
+    Vinted server-renders for SEO. Falls back to the og:description
+    meta tag for items where JSON-LD is missing or malformed."""
+    # JSON-LD lives in the first ~80 KB; scan only that window.
+    head = html[:120_000]
+    for m in _LD_JSON_RE.finditer(head):
+        body = (m.group(1) or "").strip()
+        if not body:
+            continue
+        try:
+            data = orjson.loads(body)
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("@type") == "Product":
+            desc = data.get("description")
+            if isinstance(desc, str) and desc.strip():
+                return desc.strip()
+    # Fallback: <meta property="og:description" content="..."/>
+    m = re.search(
+        r'<meta\s+property="og:description"\s+content="([^"]{1,2000})"',
+        head,
+    )
+    if m:
+        # The og:description starts with the title; strip the title
+        # prefix so we don't show the title twice in the notification.
+        og = m.group(1).strip()
+        if " - " in og:
+            return og.split(" - ", 1)[1].strip() or None
+        return og
+    return None
+
+
+def _extract_location_from_html(html: str) -> str | None:
+    """Pull `<city>, <country>` out of the user_info block in the
+    React-stream JSON near the end of the item HTML."""
+    m = _LOCATION_RE.search(html)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    # Captured value may carry JSON `\uXXXX` escapes for non-ASCII
+    # cities. Round-trip through json.loads to decode them, but fall
+    # back to the raw value if the wrapper makes it un-parseable.
+    import json as _json
+    try:
+        decoded = _json.loads(f'"{raw}"')
+        if isinstance(decoded, str) and decoded.strip():
+            return decoded.strip()
+    except Exception:
+        pass
+    return raw
+
+
+def _metadata_from_cache(item_id: int) -> dict | None:
+    cached = _ENRICH_CACHE.get(item_id)
+    if cached and (time.time() - cached[1]) < _ENRICH_TTL:
         return cached[0]
     return None
+
+
+def _apply_enrichment(item: SearchItem, meta: dict) -> None:
+    """Copy the description / location we scraped off the item HTML
+    onto the SearchItem (which the API response left empty)."""
+    desc = meta.get("description")
+    if isinstance(desc, str) and desc.strip() and not item.description:
+        item.description = desc.strip()
+    loc = meta.get("location")
+    if isinstance(loc, str) and loc.strip() and not item.location:
+        item.location = loc.strip()
 
 
 async def _filter_by_catalog(
     items: list[SearchItem], target_catalogs: frozenset[int],
     origin: str, proxy: str | None,
 ) -> tuple[list[SearchItem], int, int, int]:
-    """Drop items whose breadcrumb ancestor chain doesn't include any
-    target catalog id. Returns
-    (kept, dropped_outside, fetch_failures, dropped_unverified).
+    """Strict catalog filter + per-item description/location enrichment.
+
+    Returns (kept, dropped_outside, fetch_failures, dropped_unverified).
+
+    For each item we fetch /items/{id} HTML once, scrape three things
+    in one pass: breadcrumb ancestor chain (drives the filter),
+    JSON-LD description, and the seller location from the React-stream
+    user_info block. Kept items get description + location patched
+    onto their SearchItem.
 
     Fail-CLOSED: items whose ancestors couldn't be determined (network
     error, DataDome 429, redirect, empty crumbs) are DROPPED. Empirical
@@ -400,38 +504,33 @@ async def _filter_by_catalog(
             dropped_unverified += 1
             continue
 
-        cached = _ancestors_from_cache(item_id)
-        if cached is not None:
-            # Cache hit — instant, no sleep, no enrichment budget burn.
-            if cached & target_catalogs:
-                kept.append(item)
-            else:
-                dropped_outside += 1
-            continue
+        meta = _metadata_from_cache(item_id)
+        if meta is None:
+            # Cache miss — pay HTTP. Hard cap so first-scan seed doesn't
+            # fire 50 sequential page loads and trip DataDome's per-IP
+            # throttle.
+            if enriched >= _MAX_ENRICH_PER_CYCLE:
+                dropped_unverified += 1
+                continue
+            meta = await loop.run_in_executor(
+                None,
+                lambda i=item_id: _fetch_item_metadata_sync(i, origin, proxy),
+            )
+            enriched += 1
+            if meta is None:
+                failures += 1
+                # Fail-CLOSED: drop unverified rather than risk a leak.
+                continue
+            # 1.5s spacing held under sustained 30-item enrichment in
+            # research; faster spacing tripped 429 within ~4 requests.
+            await asyncio.sleep(1.5)
 
-        # Cache miss — pay HTTP. Hard cap so first-scan seed doesn't
-        # fire 50 sequential page loads and trip DataDome's per-IP
-        # throttle.
-        if enriched >= _MAX_ENRICH_PER_CYCLE:
-            dropped_unverified += 1
-            continue
-
-        ancestors = await loop.run_in_executor(
-            None,
-            lambda i=item_id: _fetch_item_breadcrumb_sync(i, origin, proxy),
-        )
-        enriched += 1
-        if ancestors is None:
-            failures += 1
-            # Fail-CLOSED: drop unverified rather than risk a leak.
-            continue
+        ancestors = meta.get("ancestors") or frozenset()
         if ancestors & target_catalogs:
+            _apply_enrichment(item, meta)
             kept.append(item)
         else:
             dropped_outside += 1
-        # 1.5s spacing held under sustained 30-item enrichment in
-        # research; faster spacing tripped 429 within ~4 requests.
-        await asyncio.sleep(1.5)
     return kept, dropped_outside, failures, dropped_unverified
 
 
