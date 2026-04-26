@@ -32,8 +32,11 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
+from datetime import datetime, timezone
 
 from bot_i18n import (
     LANGUAGE_CODES, CURRENCY_CODES, TIMEZONE_CODES,
@@ -382,6 +385,10 @@ async def callback_set_timezone(callback: CallbackQuery):
 # ---------------------------------------------------------------------------
 
 # (id, label, price_pretty, limits, footnote_or_None)
+# Single source of truth for tariff configuration. Each entry is the
+# id used in DB rows + payment payloads, the human label, the price
+# string for the UI, the limits string, an optional footnote, plus
+# the machine-readable price/duration/sub-limit triplet.
 _TARIFFS = [
     ("trial",    "🎁 Пробный",          "Бесплатно",     "1 поиск, 6 часов",   "(только один раз)"),
     ("basic",    "💎 Базовый",          "890 ₽/мес",     "1 поиск, 30 дней",   None),
@@ -389,20 +396,105 @@ _TARIFFS = [
     ("pro",      "👑 Профессиональный", "2 590 ₽/мес",   "5 поисков, 30 дней", None),
 ]
 
+# tariff_id → (max_subs, hours, price_kopeks). `legacy` is the
+# grandfathered tier auto-assigned to users who registered before the
+# paywall existed. Free state (DB row is NULL or expired) maps to 0
+# subs — user has to activate Trial or buy a tier.
+_TARIFF_RULES: dict[str, dict] = {
+    "trial":    {"max_subs": 1, "hours": 6,        "kopeks": 0},
+    "basic":    {"max_subs": 1, "hours": 30 * 24,  "kopeks": 89000},
+    "advanced": {"max_subs": 3, "hours": 30 * 24,  "kopeks": 179000},
+    "pro":      {"max_subs": 5, "hours": 30 * 24,  "kopeks": 259000},
+    # No expiry, max 5 — preserves behaviour for users who joined
+    # before the paywall was introduced.
+    "legacy":   {"max_subs": 5, "hours": 0,        "kopeks": 0},
+}
+
+
+def _tariff_meta(tariff_id: str | None) -> tuple | None:
+    """Return the human row from _TARIFFS for a given id, or None."""
+    if not tariff_id:
+        return None
+    return next((t for t in _TARIFFS if t[0] == tariff_id), None)
+
+
+def _resolve_tariff_state(tariff_row: dict) -> dict:
+    """Distill a raw users.tariff row into a render-ready snapshot.
+
+    Returns:
+        {active: bool, tariff_id: str|None, expires_at: datetime|None,
+         max_subs: int, days_left: int|None, trial_used: bool}
+    """
+    tariff_id = tariff_row.get("tariff")
+    expires_at = tariff_row.get("expires_at")
+    trial_used = bool(tariff_row.get("trial_used"))
+
+    rules = _TARIFF_RULES.get(tariff_id) if tariff_id else None
+    # Legacy has no expiry — always active.
+    if tariff_id == "legacy":
+        return {
+            "active": True, "tariff_id": "legacy", "expires_at": None,
+            "max_subs": rules["max_subs"], "days_left": None,
+            "trial_used": trial_used,
+        }
+    # Active = has a tariff and the expiry is still in the future.
+    if rules and expires_at:
+        now = datetime.now(timezone.utc)
+        if expires_at > now:
+            seconds_left = (expires_at - now).total_seconds()
+            days_left = max(1, int(seconds_left // 86400))
+            return {
+                "active": True, "tariff_id": tariff_id,
+                "expires_at": expires_at, "max_subs": rules["max_subs"],
+                "days_left": days_left, "trial_used": trial_used,
+            }
+    # No active tariff — free state.
+    return {
+        "active": False, "tariff_id": None, "expires_at": None,
+        "max_subs": 0, "days_left": None, "trial_used": trial_used,
+    }
+
+
+async def _user_tariff_state(user_id: int) -> dict:
+    return _resolve_tariff_state(await db.get_user_tariff(user_id))
+
 
 async def _show_tariffs(target):
-    lines = ["💎 <b>Тарифы AutoSearch</b>\n"]
-    for _, name, price, limits, foot in _TARIFFS:
+    tg_id, username = _user_from(target)
+    user_id = await db.get_or_create_user(tg_id, username)
+    state = await _user_tariff_state(user_id)
+
+    header = "💎 <b>Тарифы AutoSearch</b>\n"
+    if state["active"]:
+        cur_meta = _tariff_meta(state["tariff_id"])
+        cur_label = cur_meta[1] if cur_meta else state["tariff_id"]
+        if state["days_left"] is not None:
+            header += (
+                f"\n<i>Сейчас активен: <b>{cur_label}</b> "
+                f"(осталось ~{state['days_left']} дн.)</i>\n"
+            )
+        else:
+            header += f"\n<i>Сейчас активен: <b>{cur_label}</b></i>\n"
+
+    lines = [header]
+    for tid, name, price, limits, foot in _TARIFFS:
         line = f"<b>{name}</b> — {price}\n   {limits}"
         if foot:
             line += f"\n   <i>{foot}</i>"
+        # Mark trial as unavailable if already used.
+        if tid == "trial" and state["trial_used"]:
+            line += "\n   <i>✅ уже использован</i>"
         lines.append(line)
     lines.append("\nВыбери тариф для оформления:")
 
-    buttons = [
-        [InlineKeyboardButton(text=f"{name} — {price}", callback_data=f"buy:{tid}")]
-        for tid, name, price, _, _ in _TARIFFS
-    ]
+    buttons = []
+    for tid, name, price, _, _ in _TARIFFS:
+        # Hide the trial button after it's been used.
+        if tid == "trial" and state["trial_used"]:
+            continue
+        buttons.append([InlineKeyboardButton(
+            text=f"{name} — {price}", callback_data=f"buy:{tid}",
+        )])
     buttons.append([InlineKeyboardButton(
         text="⬅️ Главное меню", callback_data="menu:home",
     )])
@@ -415,32 +507,134 @@ async def _show_tariffs(target):
 @router.callback_query(F.data.startswith("buy:"))
 async def callback_buy_tariff(callback: CallbackQuery):
     tariff_id = callback.data.split(":", 1)[1]
-    meta = next((t for t in _TARIFFS if t[0] == tariff_id), None)
-    if meta is None:
+    meta = _tariff_meta(tariff_id)
+    rules = _TARIFF_RULES.get(tariff_id)
+    if meta is None or rules is None:
         await callback.answer("Неизвестный тариф", show_alert=True)
         return
-    _, name, price, limits, _ = meta
 
-    if config.support_handle:
-        contact = (
-            f"Для оформления напиши {config.support_handle} — оплату "
-            "подключим и активируем тариф."
-        )
-    else:
-        contact = "Оплата временно недоступна. Попробуйте позже."
-
-    text = (
-        f"<b>{name}</b>\n\n"
-        f"💰 Стоимость: <b>{price}</b>\n"
-        f"📦 Что входит: <b>{limits}</b>\n\n"
-        f"{contact}"
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К тарифам",     callback_data="menu:tariffs")],
-        [InlineKeyboardButton(text="🏠 Главное меню",  callback_data="menu:home")],
-    ])
-    await _present(callback, text, keyboard=keyboard)
+
+    # Trial — free, one-shot, no Telegram-Payments invoice.
+    if tariff_id == "trial":
+        state = await _user_tariff_state(user_id)
+        if state["trial_used"]:
+            await callback.answer(
+                "Пробный уже был использован — выбери платный тариф.",
+                show_alert=True,
+            )
+            return
+        await db.activate_tariff(user_id, "trial", rules["hours"], is_trial=True)
+        await callback.answer("Пробный активирован!")
+        await _show_profile(callback)
+        return
+
+    # Paid tariff — fire a native Telegram invoice via the configured
+    # provider (YooKassa). Falls back to a support-handle message if
+    # the bot isn't wired up yet (no PAYMENT_PROVIDER_TOKEN set).
+    if not config.payment_provider_token:
+        contact = (
+            f"Для оформления напиши {config.support_handle}."
+            if config.support_handle
+            else "Оплата временно недоступна. Попробуйте позже."
+        )
+        _, name, price, limits, _ = meta
+        text = (
+            f"<b>{name}</b>\n\n"
+            f"💰 Стоимость: <b>{price}</b>\n"
+            f"📦 Что входит: <b>{limits}</b>\n\n{contact}"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К тарифам",    callback_data="menu:tariffs")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+        ])
+        await _present(callback, text, keyboard=keyboard)
+        await callback.answer()
+        return
+
+    _, name, price, limits, _ = meta
+    bot = callback.bot
+    try:
+        await bot.send_invoice(
+            chat_id=callback.message.chat.id,
+            title=f"AutoSearch — {name}",
+            description=limits,
+            # payload echoes back in successful_payment so we can map
+            # «what was paid for» without trusting client-side state.
+            payload=f"tariff:{tariff_id}",
+            provider_token=config.payment_provider_token,
+            currency="RUB",
+            prices=[LabeledPrice(label=name, amount=rules["kopeks"])],
+            need_name=False, need_email=False, need_phone_number=False,
+            send_phone_number_to_provider=False,
+            send_email_to_provider=False,
+            is_flexible=False,
+        )
+    except Exception:
+        logger.exception("send_invoice failed for tariff=%s", tariff_id)
+        await callback.answer(
+            "Не получилось открыть оплату. Попробуй чуть позже.",
+            show_alert=True,
+        )
+        return
     await callback.answer()
+
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery):
+    """Always approve the pre-checkout — Telegram requires a reply
+    within 10 seconds or the payment fails. Validation of payload
+    happens in successful_payment after the user actually pays."""
+    try:
+        await query.bot.answer_pre_checkout_query(query.id, ok=True)
+    except Exception:
+        logger.exception("answer_pre_checkout_query failed")
+
+
+@router.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    """Activate the purchased tariff once Telegram confirms payment.
+
+    Telegram + YooKassa have already verified the money. We just need
+    to translate the payload back to a tariff_id and persist the
+    activation."""
+    sp = message.successful_payment
+    payload = (sp.invoice_payload or "") if sp else ""
+    if not payload.startswith("tariff:"):
+        logger.warning("[payment] unknown payload: %r", payload)
+        return
+    tariff_id = payload.split(":", 1)[1]
+    rules = _TARIFF_RULES.get(tariff_id)
+    if rules is None or tariff_id == "trial" or tariff_id == "legacy":
+        # `trial` and `legacy` shouldn't go through Telegram Payments —
+        # log and ignore to avoid double-applying.
+        logger.warning("[payment] paid invoice for non-purchasable tariff=%s", tariff_id)
+        return
+
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+    new_exp = await db.activate_tariff(
+        user_id, tariff_id, rules["hours"], is_trial=False,
+    )
+    meta = _tariff_meta(tariff_id)
+    name = meta[1] if meta else tariff_id
+    expires_str = new_exp.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+    logger.info(
+        "[payment] user=%d activated tariff=%s exp=%s amount=%d/%s",
+        user_id, tariff_id, expires_str, sp.total_amount, sp.currency,
+    )
+
+    await message.answer(
+        f"✅ <b>Оплата получена!</b>\n\n"
+        f"Тариф <b>{name}</b> активирован до <b>{expires_str}</b>.\n"
+        f"Можно добавлять поиски — вернись в главное меню.",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def _show_add_hint(target):
@@ -500,11 +694,22 @@ async def _show_profile(target, *, prefs: dict | None = None):
     # value on screen.
     tz = prefs.get("tz") or default_tz_for_lang(prefs.get("lang"))
 
+    state = await _user_tariff_state(user_id)
+    if state["active"]:
+        cur_meta = _tariff_meta(state["tariff_id"])
+        cur_label = cur_meta[1] if cur_meta else state["tariff_id"]
+        if state["days_left"] is not None:
+            tariff_line = f"💎 Тариф: <b>{cur_label}</b> · до окончания ~{state['days_left']} дн."
+        else:
+            tariff_line = f"💎 Тариф: <b>{cur_label}</b>"
+    else:
+        tariff_line = "💎 Тариф: <b>не активирован</b> — открой 💎 Тарифы"
+
     text = (
         f"👤 <b>Профиль: {name}</b>\n\n"
+        f"{tariff_line}\n"
+        f"📊 Поисков: <b>{profile['active_subs']} / {state['max_subs']}</b>\n\n"
         f"📅 Регистрация: <b>{reg_date}</b>\n"
-        f"📊 Всего поисков: <b>{profile['total_subs']}</b>\n"
-        f"🟢 Активных сейчас: <b>{profile['active_subs']}</b>\n"
         f"📨 Объявлений найдено: <b>{profile['total_found']}</b>\n"
         f"🕐 Последнее найденное: <b>{last_found_str}</b>\n\n"
         f"⚙️ <b>Настройки</b>\n"
@@ -793,12 +998,36 @@ async def handle_url(message: Message):
         message.from_user.id, message.from_user.username,
     )
 
-    sub_id = await db.add_subscription(user_id, url, source=source_name)
+    state = await _user_tariff_state(user_id)
+    if not state["active"]:
+        # No active tariff at all — gate behind the paywall.
+        await message.answer(
+            "🔒 <b>Чтобы добавить поиск, нужен тариф.</b>\n\n"
+            "Активируй <b>🎁 Пробный</b> на 6 часов бесплатно или выбери "
+            "платный — открывай 💎 <b>Тарифы</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Тарифы", callback_data="menu:tariffs")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+            ]),
+        )
+        return
+
+    sub_id = await db.add_subscription(
+        user_id, url, source=source_name,
+        max_subscriptions=state["max_subs"],
+    )
     if sub_id is None:
         await message.answer(
-            f"⚠️ Достигнут лимит — максимум {config.max_subscriptions} поисков.\n"
-            "Удали лишние через 📋 «Мои поиски» → ❌ Удалить.",
-            reply_markup=back_to_menu_keyboard(),
+            f"⚠️ Достигнут лимит твоего тарифа — максимум "
+            f"{state['max_subs']} {'поиск' if state['max_subs'] == 1 else 'поисков'}.\n\n"
+            "Удали ненужные через 📋 «Мои поиски» → ❌ Удалить, или "
+            "перейди на тариф повыше в 💎 Тарифы.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Тарифы", callback_data="menu:tariffs")],
+                [InlineKeyboardButton(text="📋 Мои поиски", callback_data="menu:list")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+            ]),
         )
         return
 

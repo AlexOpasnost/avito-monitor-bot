@@ -31,6 +31,10 @@ class Config:
     payment_url_basic: str = ""     # real payment link (YooMoney / Robokassa / …)
     payment_url_pro: str = ""
     support_handle: str = ""        # e.g. "@autosearch_support"
+    # Telegram Payments provider token (YooKassa / Stripe / …). Set via
+    # @BotFather → bot → Payments. Empty string disables paid tariffs —
+    # in that case the buy buttons fall back to the support handle.
+    payment_provider_token: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -53,6 +57,7 @@ class Config:
             payment_url_basic=os.getenv("PAYMENT_URL_BASIC", ""),
             payment_url_pro=os.getenv("PAYMENT_URL_PRO", ""),
             support_handle=os.getenv("SUPPORT_HANDLE", ""),
+            payment_provider_token=os.getenv("PAYMENT_PROVIDER_TOKEN", ""),
         )
 
 

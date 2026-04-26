@@ -1280,6 +1280,83 @@ def test_format_when_local():
     print("OK: scheduler _format_when_local")
 
 
+def test_tariff_state_resolution():
+    """_resolve_tariff_state collapses a raw users-row into the
+    render-ready snapshot used by /profile, /tariffs, and the add-sub
+    paywall. Covers: never-activated, active, expired, legacy."""
+    from datetime import datetime, timezone, timedelta
+    from handlers import _resolve_tariff_state
+
+    now = datetime.now(timezone.utc)
+
+    # Never activated → no access
+    s = _resolve_tariff_state({"tariff": None, "expires_at": None, "trial_used": False})
+    assert s["active"] is False and s["max_subs"] == 0
+    assert s["tariff_id"] is None and s["trial_used"] is False
+
+    # Active Basic, 10 days left
+    s = _resolve_tariff_state({
+        "tariff": "basic",
+        "expires_at": now + timedelta(days=10, minutes=5),
+        "trial_used": True,
+    })
+    assert s["active"] is True
+    assert s["tariff_id"] == "basic"
+    assert s["max_subs"] == 1
+    assert 9 <= s["days_left"] <= 10  # rounding tolerance
+
+    # Active Pro = 5 searches
+    s = _resolve_tariff_state({
+        "tariff": "pro",
+        "expires_at": now + timedelta(days=20),
+        "trial_used": True,
+    })
+    assert s["active"] is True and s["max_subs"] == 5
+
+    # Expired tariff → free (no access), but trial_used carries over
+    # so the user can't claim Trial again.
+    s = _resolve_tariff_state({
+        "tariff": "pro",
+        "expires_at": now - timedelta(hours=1),
+        "trial_used": True,
+    })
+    assert s["active"] is False and s["max_subs"] == 0
+    assert s["trial_used"] is True
+
+    # Legacy = grandfathered, no expiry, max 5
+    s = _resolve_tariff_state({
+        "tariff": "legacy",
+        "expires_at": None,
+        "trial_used": False,
+    })
+    assert s["active"] is True
+    assert s["tariff_id"] == "legacy"
+    assert s["max_subs"] == 5
+    assert s["days_left"] is None  # no countdown for legacy
+
+    print("OK: handlers _resolve_tariff_state")
+
+
+def test_tariff_rules_consistency():
+    """Each tariff that appears in the user-facing _TARIFFS list must
+    have matching rules in _TARIFF_RULES (max_subs/hours/kopeks),
+    otherwise the buy-callback would crash on a known tariff."""
+    from handlers import _TARIFFS, _TARIFF_RULES
+
+    for tid, name, *_ in _TARIFFS:
+        assert tid in _TARIFF_RULES, f"_TARIFFS has {tid!r} but _TARIFF_RULES doesn't"
+
+    # Trial must be free, others must have a positive price
+    assert _TARIFF_RULES["trial"]["kopeks"] == 0
+    for tid in ("basic", "advanced", "pro"):
+        assert _TARIFF_RULES[tid]["kopeks"] > 0
+
+    # Pro must allow more searches than Basic
+    assert _TARIFF_RULES["pro"]["max_subs"] > _TARIFF_RULES["basic"]["max_subs"]
+
+    print("OK: handlers _TARIFFS ↔ _TARIFF_RULES consistency")
+
+
 def test_mercari_enrich_items():
     """Enrichment: pull location / description / seller_name from a
     full-item lookup, cache for 24h, never lose a previously-set field."""
@@ -1470,4 +1547,6 @@ if __name__ == "__main__":
     test_vinted_location_fallback()
     test_sub_display_name()
     test_mercari_enrich_items()
+    test_tariff_state_resolution()
+    test_tariff_rules_consistency()
     print("\nALL UNIT TESTS PASSED")

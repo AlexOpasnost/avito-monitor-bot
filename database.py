@@ -166,6 +166,25 @@ class Database:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS name TEXT"
             )
+            # Paid-tariff state. NULL tariff = user hasn't activated
+            # anything (no trial, no purchase). Resolved at read time
+            # against the in-code tariff table to know max_subs etc.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS tariff TEXT"
+            )
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS tariff_expires_at TIMESTAMPTZ"
+            )
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used "
+                "BOOLEAN DEFAULT FALSE"
+            )
+            # Grandfather everyone who registered before paywall existed —
+            # if they ever had a subscription, give them tariff='legacy'
+            # (no expiry, max 5 searches) so the new limit doesn't lock
+            # them out retroactively.
+            await self._apply_once(conn, "grandfather_legacy_users",
+                                    self._grandfather_legacy_users)
             # Backfill any NULLs that may have crept in from older rows.
             await conn.execute(
                 "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
@@ -209,6 +228,18 @@ class Database:
             name,
         )
         logger.info("One-shot migration %s done", name)
+
+    async def _grandfather_legacy_users(self, conn):
+        """One-shot: anyone with a historic subscription gets
+        tariff='legacy' so the new paywall doesn't suddenly lock them
+        out. New users (registered after this migration) start with
+        tariff=NULL and must activate Trial or buy a tier."""
+        result = await conn.execute(
+            "UPDATE users SET tariff = 'legacy' "
+            "WHERE id IN (SELECT DISTINCT user_id FROM subscriptions) "
+            "AND tariff IS NULL"
+        )
+        logger.info("grandfather_legacy_users: %s", result)
 
     async def _cleanup_subscriptions_2026_04_19(self, conn):
         """Wipe every subscription + sent_items row.
@@ -321,14 +352,23 @@ class Database:
     # --- Subscriptions ---
 
     async def add_subscription(self, user_id: int, url: str,
-                                source: str = "avito") -> int | None:
+                                source: str = "avito",
+                                max_subscriptions: int | None = None) -> int | None:
+        """Insert a new subscription if the user is under their limit.
+
+        `max_subscriptions` is the per-tariff cap resolved by the caller.
+        Falls back to config.max_subscriptions for legacy callers that
+        haven't been updated to look up the tariff yet.
+        """
+        if max_subscriptions is None:
+            max_subscriptions = config.max_subscriptions
         async def _op(conn):
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM subscriptions "
                 "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
                 user_id,
             )
-            if count >= config.max_subscriptions:
+            if count >= max_subscriptions:
                 return None
             row = await conn.fetchrow(
                 "INSERT INTO subscriptions (user_id, url, source) "
@@ -336,6 +376,81 @@ class Database:
                 user_id, url, source,
             )
             return row["id"]
+        return await self._execute(_op)
+
+    async def count_active_subs(self, user_id: int) -> int:
+        async def _op(conn):
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM subscriptions "
+                "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
+                user_id,
+            ) or 0
+        return await self._execute(_op)
+
+    async def get_user_tariff(self, user_id: int) -> dict:
+        """Returns {tariff, expires_at, trial_used}.
+
+        `tariff` is the row value (None if never activated). The caller
+        cross-references it with the in-code tariff table to compute
+        max_subs and figure out whether the tariff is still active by
+        comparing expires_at with now."""
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT tariff, tariff_expires_at, "
+                "       COALESCE(trial_used, FALSE) AS trial_used "
+                "FROM users WHERE id = $1", user_id,
+            )
+            if not row:
+                return {"tariff": None, "expires_at": None, "trial_used": False}
+            return {
+                "tariff": row["tariff"],
+                "expires_at": row["tariff_expires_at"],
+                "trial_used": row["trial_used"],
+            }
+        return await self._execute(_op)
+
+    async def activate_tariff(
+        self, user_id: int, tariff_id: str, hours: int,
+        is_trial: bool = False,
+    ) -> datetime:
+        """Activate or extend a tariff for the user.
+
+        - If the user has the same tariff still active, the new hours
+          stack on top of the current expiry (renewal).
+        - Switching tariff replaces the id and starts fresh from now.
+        - `is_trial=True` flips the trial_used flag so the free 6h tier
+          can't be re-claimed.
+
+        Returns the new expiry timestamp.
+        """
+        async def _op(conn):
+            now = datetime.now(timezone.utc)
+            row = await conn.fetchrow(
+                "SELECT tariff, tariff_expires_at FROM users WHERE id = $1",
+                user_id,
+            )
+            current_id = row["tariff"] if row else None
+            current_exp = row["tariff_expires_at"] if row else None
+
+            if current_id == tariff_id and current_exp and current_exp > now:
+                base = current_exp
+            else:
+                base = now
+            new_exp = base + timedelta(hours=hours)
+
+            if is_trial:
+                await conn.execute(
+                    "UPDATE users SET tariff = $2, tariff_expires_at = $3, "
+                    "       trial_used = TRUE WHERE id = $1",
+                    user_id, tariff_id, new_exp,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET tariff = $2, tariff_expires_at = $3 "
+                    "WHERE id = $1",
+                    user_id, tariff_id, new_exp,
+                )
+            return new_exp
         return await self._execute(_op)
 
     async def get_user_subscriptions(self, user_id: int):
