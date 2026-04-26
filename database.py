@@ -154,6 +154,12 @@ class Database:
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded BOOLEAN DEFAULT FALSE"
             )
+            # IANA timezone name (e.g. "Europe/Moscow"). NULL means
+            # "use the language-derived default" — resolved at read
+            # time so we don't bake in wrong defaults for existing rows.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT"
+            )
             # Backfill any NULLs that may have crept in from older rows.
             await conn.execute(
                 "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
@@ -232,22 +238,29 @@ class Database:
         return await self._execute(_op)
 
     async def get_user_prefs(self, user_id: int) -> dict:
-        """Return {lang, currency, onboarded}. Defaults applied for old
-        rows where columns are NULL after migration."""
+        """Return {lang, currency, onboarded, tz}. `tz` is the user's
+        explicit pick or None — callers resolve None to a language-
+        derived default. Defaults applied for old rows where columns
+        are NULL after migration."""
         async def _op(conn):
             row = await conn.fetchrow(
                 "SELECT COALESCE(lang, 'ru') AS lang, "
                 "       COALESCE(currency, 'rub') AS currency, "
-                "       COALESCE(onboarded, FALSE) AS onboarded "
+                "       COALESCE(onboarded, FALSE) AS onboarded, "
+                "       timezone AS tz "
                 "FROM users WHERE id = $1",
                 user_id,
             )
             if not row:
-                return {"lang": "ru", "currency": "rub", "onboarded": False}
+                return {
+                    "lang": "ru", "currency": "rub",
+                    "onboarded": False, "tz": None,
+                }
             return {
                 "lang": row["lang"],
                 "currency": row["currency"],
                 "onboarded": row["onboarded"],
+                "tz": row["tz"],
             }
         return await self._execute(_op)
 
@@ -257,13 +270,18 @@ class Database:
         async def _op(conn):
             row = await conn.fetchrow(
                 "SELECT COALESCE(lang, 'ru') AS lang, "
-                "       COALESCE(currency, 'rub') AS currency "
+                "       COALESCE(currency, 'rub') AS currency, "
+                "       timezone AS tz "
                 "FROM users WHERE telegram_id = $1",
                 telegram_id,
             )
             if not row:
-                return {"lang": "ru", "currency": "rub"}
-            return {"lang": row["lang"], "currency": row["currency"]}
+                return {"lang": "ru", "currency": "rub", "tz": None}
+            return {
+                "lang": row["lang"],
+                "currency": row["currency"],
+                "tz": row["tz"],
+            }
         return await self._execute(_op)
 
     async def set_user_lang(self, user_id: int, lang: str):
@@ -277,6 +295,13 @@ class Database:
         async def _op(conn):
             await conn.execute(
                 "UPDATE users SET currency = $2 WHERE id = $1", user_id, currency,
+            )
+        await self._execute(_op)
+
+    async def set_user_timezone(self, user_id: int, tz: str):
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET timezone = $2 WHERE id = $1", user_id, tz,
             )
         await self._execute(_op)
 

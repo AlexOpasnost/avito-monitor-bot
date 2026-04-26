@@ -34,10 +34,11 @@ from aiogram.types import (
 )
 
 from bot_i18n import (
-    LANGUAGE_CODES, CURRENCY_CODES,
-    language_label, currency_label,
-    language_keyboard, currency_keyboard,
+    LANGUAGE_CODES, CURRENCY_CODES, TIMEZONE_CODES,
+    language_label, currency_label, timezone_label,
+    language_keyboard, currency_keyboard, timezone_keyboard,
     main_menu_keyboard, back_to_menu_keyboard,
+    default_tz_for_lang,
 )
 from config import config
 from database import db
@@ -171,6 +172,13 @@ _CUR_PROMPT = (
     "конвертация)."
 )
 
+_TZ_PROMPT = (
+    "🕐 <b>Выбери часовой пояс</b>\n"
+    "В этом поясе будут показываться даты публикации объявлений.\n\n"
+    "<i>По умолчанию выставляется из языка — меняй только если живёшь в "
+    "другом часовом поясе.</i>"
+)
+
 
 async def _show_hero(target):
     await _present(
@@ -190,6 +198,10 @@ async def _show_lang_picker(target, *, back: str | None):
 
 async def _show_currency_picker(target, *, back: str | None):
     await _present(target, _CUR_PROMPT, keyboard=currency_keyboard(back))
+
+
+async def _show_tz_picker(target, *, back: str | None):
+    await _present(target, _TZ_PROMPT, keyboard=timezone_keyboard(back))
 
 
 async def _show_main_menu(target, prefs: dict | None = None):
@@ -324,6 +336,26 @@ async def callback_profile_cur(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "profile:tz")
+async def callback_profile_tz(callback: CallbackQuery):
+    await _show_tz_picker(callback, back="menu:profile")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settz:"))
+async def callback_set_timezone(callback: CallbackQuery):
+    tz = callback.data.split(":", 1)[1]
+    if tz not in TIMEZONE_CODES:
+        await callback.answer("Неизвестный часовой пояс", show_alert=True)
+        return
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    await db.set_user_timezone(user_id, tz)
+    await callback.answer(f"Пояс: {timezone_label(tz)}")
+    await _show_profile(callback)
+
+
 # ---------------------------------------------------------------------------
 # Submenus
 # ---------------------------------------------------------------------------
@@ -443,6 +475,11 @@ async def _show_profile(target, *, prefs: dict | None = None):
         last_found_str = profile["last_found"]["sent_at"].strftime("%d.%m.%Y %H:%M")
     name = target.from_user.full_name or (user and user["username"]) or "Пользователь"
 
+    # Resolve timezone: explicit pick first, fall back to a language-
+    # derived default so existing rows (tz=NULL) still get a sensible
+    # value on screen.
+    tz = prefs.get("tz") or default_tz_for_lang(prefs.get("lang"))
+
     text = (
         f"👤 <b>Профиль: {name}</b>\n\n"
         f"📅 Регистрация: <b>{reg_date}</b>\n"
@@ -452,13 +489,15 @@ async def _show_profile(target, *, prefs: dict | None = None):
         f"🕐 Последнее найденное: <b>{last_found_str}</b>\n\n"
         f"⚙️ <b>Настройки</b>\n"
         f"🌐 Язык: <b>{language_label(prefs['lang'])}</b>\n"
-        f"💱 Валюта: <b>{currency_label(prefs['currency'])}</b>"
+        f"💱 Валюта: <b>{currency_label(prefs['currency'])}</b>\n"
+        f"🕐 Часовой пояс: <b>{timezone_label(tz)}</b>"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🌐 Сменить язык",   callback_data="profile:lang"),
             InlineKeyboardButton(text="💱 Сменить валюту", callback_data="profile:cur"),
         ],
+        [InlineKeyboardButton(text="🕐 Сменить часовой пояс", callback_data="profile:tz")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:home")],
     ])
     await _present(target, text, keyboard=keyboard)

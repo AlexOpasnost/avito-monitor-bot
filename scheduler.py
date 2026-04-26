@@ -17,6 +17,7 @@ from parser import (
     download_image_bytes,
     fetch_search_items,
 )
+from bot_i18n import default_tz_for_lang, timezone_short
 from parsers import source_display_name
 from parsers.common import proxy_for_source
 from parsers.currency import format_with_estimate
@@ -374,10 +375,13 @@ async def _send_notification(
     # one scheduler push the same listing in RU to one user and EN to
     # another without re-fetching it. Translation is cached by
     # (text, lang) so a 10-item batch runs ~10 Google calls, not 30.
-    title, description, condition = await _localise_item(item, prefs.get("lang") or "ru")
+    lang = prefs.get("lang") or "ru"
+    tz = prefs.get("tz") or default_tz_for_lang(lang)
+    title, description, condition = await _localise_item(item, lang)
     text = _format_notification(
         item, title=title, description=description, condition=condition,
         user_currency=(prefs.get("currency") or "rub").upper(),
+        user_tz=tz,
     )
     button_text = _source_button_text(item.source)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -428,6 +432,7 @@ def _format_notification(
     description: str | None = None,
     condition: str | None = None,
     user_currency: str = "RUB",
+    user_tz: str = "Europe/Moscow",
 ) -> str:
     """Unified pretty notification format.
 
@@ -473,7 +478,7 @@ def _format_notification(
     title_html = _escape(raw_title) or "Без названия"
     price_native = _escape(_format_price(item, user_currency)) or "Цена не указана"
     location = _escape(item.location) or "—"
-    when = _format_when_msk(item.published_timestamp)
+    when = _format_when_local(item.published_timestamp, user_tz)
 
     lines = [
         f"<b>{title_html}</b>",
@@ -509,20 +514,32 @@ def _format_price(item: AvitoItem, user_currency: str) -> str:
     return item.price or "Цена не указана"
 
 
-def _format_when_msk(ts: int | None) -> str:
-    """Pretty-print a unix timestamp in Moscow local time with a clear
-    МСК suffix. Same-day ads show «Сегодня в HH:MM», one-day-old show
-    «Вчера в HH:MM», older ones show «DD.MM в HH:MM»."""
+def _format_when_local(ts: int | None, tz_name: str = "Europe/Moscow") -> str:
+    """Pretty-print a unix timestamp in the user's timezone with a short
+    suffix (МСК / Мадрид / Токио / …). Same-day ads show «Сегодня в
+    HH:MM», one-day-old show «Вчера в HH:MM», older ones «DD.MM в HH:MM».
+
+    Falls back to UTC if the IANA name isn't on the system tzdb (which
+    shouldn't happen — `tzdata` package is in requirements.txt — but a
+    typo in user input shouldn't crash the renderer).
+    """
     if not ts:
         return "—"
-    dt = datetime.fromtimestamp(ts, MSK)
-    now = datetime.now(MSK)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+        tz_name = "UTC"
+    dt = datetime.fromtimestamp(ts, tz)
+    now = datetime.now(tz)
     hhmm = dt.strftime("%H:%M")
+    suffix = "UTC" if tz is timezone.utc else timezone_short(tz_name)
     if dt.date() == now.date():
-        return f"Сегодня в {hhmm} (МСК)"
+        return f"Сегодня в {hhmm} ({suffix})"
     if dt.date() == (now.date() - timedelta(days=1)):
-        return f"Вчера в {hhmm} (МСК)"
-    return f"{dt.strftime('%d.%m')} в {hhmm} (МСК)"
+        return f"Вчера в {hhmm} ({suffix})"
+    return f"{dt.strftime('%d.%m')} в {hhmm} ({suffix})"
 
 
 def _escape(s: str) -> str:

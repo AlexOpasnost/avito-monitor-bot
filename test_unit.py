@@ -1194,25 +1194,70 @@ def test_format_notification_includes_condition_and_user_currency():
 def test_bot_i18n_lists_consistent():
     from bot_i18n import (
         LANGUAGES, LANGUAGE_CODES, CURRENCIES, CURRENCY_CODES,
-        language_keyboard, currency_keyboard, main_menu_keyboard,
+        TIMEZONES, TIMEZONE_CODES,
+        DEFAULT_TZ_FOR_LANG, default_tz_for_lang,
+        language_keyboard, currency_keyboard, timezone_keyboard,
+        main_menu_keyboard,
     )
     from parsers.currency import USD_RATES
 
     # No duplicate codes
     assert len(LANGUAGES) == len(LANGUAGE_CODES)
     assert len(CURRENCIES) == len(CURRENCY_CODES)
+    assert len(TIMEZONES) == len(TIMEZONE_CODES)
 
     # Every selectable currency must have a USD rate so format_with_estimate
     # can convert into it.
     for code, _ in CURRENCIES:
         assert code.upper() in USD_RATES, f"missing rate for {code}"
 
+    # Every language with an explicit default-tz mapping must point at a
+    # timezone that's in the picker (otherwise the user opens the picker
+    # and sees their default not selected).
+    for lang_code, tz in DEFAULT_TZ_FOR_LANG.items():
+        assert tz in TIMEZONE_CODES, f"default tz {tz} for {lang_code} missing from picker"
+
+    # default_tz_for_lang fallback for unknown / missing lang
+    assert default_tz_for_lang(None) == "Europe/Moscow"
+    assert default_tz_for_lang("xx") == "Europe/Moscow"
+    assert default_tz_for_lang("ru") == "Europe/Moscow"
+    assert default_tz_for_lang("es") == "Europe/Madrid"
+
     # All keyboards build without crashing and have at least one row
     assert language_keyboard().inline_keyboard
     assert currency_keyboard().inline_keyboard
+    assert timezone_keyboard().inline_keyboard
     assert main_menu_keyboard().inline_keyboard
 
+    # back_callback wires through the picker
+    kb = timezone_keyboard("menu:profile")
+    last_row = kb.inline_keyboard[-1]
+    assert last_row[0].callback_data == "menu:profile"
+
     print("OK: bot_i18n list integrity")
+
+
+def test_format_when_local():
+    """Render timestamps in the user's TZ with a localised suffix."""
+    from datetime import datetime, timezone
+    from scheduler import _format_when_local
+
+    # Empty timestamp → dash
+    assert _format_when_local(None) == "—"
+    assert _format_when_local(0) == "—"
+
+    # A fixed timestamp: 2026-04-26 12:00:00 UTC = 15:00 МСК = 14:00 CEST.
+    ts = int(datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+    moscow = _format_when_local(ts, "Europe/Moscow")
+    madrid = _format_when_local(ts, "Europe/Madrid")
+    assert "15:00" in moscow and "МСК" in moscow
+    assert "14:00" in madrid and "Мадрид" in madrid
+
+    # Bad TZ falls back to UTC, doesn't crash
+    bad = _format_when_local(ts, "Mars/Olympus")
+    assert "12:00" in bad and "UTC" in bad
+
+    print("OK: scheduler _format_when_local")
 
 
 if __name__ == "__main__":
@@ -1269,4 +1314,5 @@ if __name__ == "__main__":
     test_prettify_description_sentence_end()
     test_format_notification_includes_condition_and_user_currency()
     test_bot_i18n_lists_consistent()
+    test_format_when_local()
     print("\nALL UNIT TESTS PASSED")
