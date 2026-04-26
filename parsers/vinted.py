@@ -583,6 +583,17 @@ async def _filter_by_catalog(
             kept.append(item)
         else:
             dropped_outside += 1
+
+    # Post-enrichment completeness — surfaces how many kept items
+    # actually received a location / description after the per-item
+    # HTML scrape, so a regex regression is visible in Railway logs.
+    if kept:
+        with_loc = sum(1 for i in kept if i.location)
+        with_desc = sum(1 for i in kept if i.description)
+        logger.info(
+            "[vinted] enriched %d kept: location=%d/%d, description=%d/%d",
+            len(kept), with_loc, len(kept), with_desc, len(kept),
+        )
     return kept, dropped_outside, failures, dropped_unverified
 
 
