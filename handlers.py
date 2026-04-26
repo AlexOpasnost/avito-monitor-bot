@@ -519,14 +519,18 @@ async def callback_buy_tariff(callback: CallbackQuery):
 
     # Trial — free, one-shot, no Telegram-Payments invoice.
     if tariff_id == "trial":
-        state = await _user_tariff_state(user_id)
-        if state["trial_used"]:
+        # The atomic UPDATE inside activate_tariff returns None when
+        # the trial was already claimed (e.g. parallel double-click) —
+        # caller never has to do its own race-prone read+check.
+        new_exp = await db.activate_tariff(
+            user_id, "trial", rules["hours"], is_trial=True,
+        )
+        if new_exp is None:
             await callback.answer(
                 "Пробный уже был использован — выбери платный тариф.",
                 show_alert=True,
             )
             return
-        await db.activate_tariff(user_id, "trial", rules["hours"], is_trial=True)
         await callback.answer("Пробный активирован!")
         await _show_profile(callback)
         return
@@ -597,17 +601,22 @@ async def pre_checkout_handler(query: PreCheckoutQuery):
 async def successful_payment_handler(message: Message):
     """Activate the purchased tariff once Telegram confirms payment.
 
-    Telegram + YooKassa have already verified the money. We just need
-    to translate the payload back to a tariff_id and persist the
-    activation."""
+    Telegram + YooKassa have already verified the money. We need to:
+    1. Validate the payload was something we sent.
+    2. Idempotency: skip if Telegram is retrying delivery of a charge
+       we already processed (telegram_payment_charge_id is unique).
+    3. Activate the tariff. If activation crashes (DB down), tell the
+       user to contact support and log the charge id so we can recover
+       manually — the money is real, the user must not silently lose it.
+    """
     sp = message.successful_payment
     payload = (sp.invoice_payload or "") if sp else ""
-    if not payload.startswith("tariff:"):
+    if not sp or not payload.startswith("tariff:"):
         logger.warning("[payment] unknown payload: %r", payload)
         return
     tariff_id = payload.split(":", 1)[1]
     rules = _TARIFF_RULES.get(tariff_id)
-    if rules is None or tariff_id == "trial" or tariff_id == "legacy":
+    if rules is None or tariff_id in ("trial", "legacy"):
         # `trial` and `legacy` shouldn't go through Telegram Payments —
         # log and ignore to avoid double-applying.
         logger.warning("[payment] paid invoice for non-purchasable tariff=%s", tariff_id)
@@ -616,16 +625,62 @@ async def successful_payment_handler(message: Message):
     user_id = await db.get_or_create_user(
         message.from_user.id, message.from_user.username,
     )
-    new_exp = await db.activate_tariff(
-        user_id, tariff_id, rules["hours"], is_trial=False,
-    )
+
+    # Idempotency: only the first delivery of this charge_id
+    # progresses past this point. A retry hits ON CONFLICT and we
+    # politely re-confirm without re-extending the expiry.
+    try:
+        is_new = await db.record_payment(
+            telegram_charge_id=sp.telegram_payment_charge_id,
+            provider_charge_id=getattr(sp, "provider_payment_charge_id", None),
+            user_id=user_id,
+            tariff_id=tariff_id,
+            amount_minor=sp.total_amount,
+            currency=sp.currency,
+        )
+    except Exception:
+        logger.exception(
+            "[payment] record_payment failed — "
+            "tg_charge=%s provider_charge=%s user=%d tariff=%s amount=%d/%s",
+            sp.telegram_payment_charge_id,
+            getattr(sp, "provider_payment_charge_id", None),
+            user_id, tariff_id, sp.total_amount, sp.currency,
+        )
+        await _payment_recovery_message(message, sp, tariff_id)
+        return
+
+    if not is_new:
+        logger.info(
+            "[payment] duplicate delivery — tg_charge=%s already processed",
+            sp.telegram_payment_charge_id,
+        )
+        await message.answer(
+            "✅ Оплата уже была подтверждена ранее. Тариф активен.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    try:
+        new_exp = await db.activate_tariff(
+            user_id, tariff_id, rules["hours"], is_trial=False,
+        )
+    except Exception:
+        logger.exception(
+            "[payment] activate_tariff failed AFTER recording charge — "
+            "tg_charge=%s user=%d tariff=%s",
+            sp.telegram_payment_charge_id, user_id, tariff_id,
+        )
+        await _payment_recovery_message(message, sp, tariff_id)
+        return
+
     meta = _tariff_meta(tariff_id)
     name = meta[1] if meta else tariff_id
     expires_str = new_exp.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
     logger.info(
-        "[payment] user=%d activated tariff=%s exp=%s amount=%d/%s",
+        "[payment] user=%d activated tariff=%s exp=%s amount=%d/%s tg_charge=%s",
         user_id, tariff_id, expires_str, sp.total_amount, sp.currency,
+        sp.telegram_payment_charge_id,
     )
 
     await message.answer(
@@ -634,6 +689,26 @@ async def successful_payment_handler(message: Message):
         f"Можно добавлять поиски — вернись в главное меню.",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
+    )
+
+
+async def _payment_recovery_message(message, sp, tariff_id: str):
+    """Sent to the user when activation fails after the money has
+    already been taken. Includes the charge id so support can find the
+    payment in YooKassa and activate the tariff manually."""
+    contact = (
+        config.support_handle
+        if config.support_handle
+        else "поддержку"
+    )
+    await message.answer(
+        f"⚠️ <b>Оплата прошла, но активация тарифа не удалась</b>\n\n"
+        f"Деньги уже у нас на стороне, не переживай — это техническая "
+        f"проблема нашего бота, мы её починим вручную.\n\n"
+        f"Напиши <b>{contact}</b> и пришли этот код:\n"
+        f"<code>{sp.telegram_payment_charge_id}</code>\n\n"
+        f"Тариф: <b>{tariff_id}</b>",
+        parse_mode="HTML",
     )
 
 

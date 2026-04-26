@@ -1337,6 +1337,32 @@ def test_tariff_state_resolution():
     print("OK: handlers _resolve_tariff_state")
 
 
+def test_payment_recovery_message_contains_charge_id():
+    """When activation fails post-payment, the user must see the
+    charge_id so support can find the payment in YooKassa."""
+    import asyncio
+    from handlers import _payment_recovery_message
+
+    captured = {}
+
+    class FakeMsg:
+        async def answer(self, text, **kwargs):
+            captured["text"] = text
+            captured["mode"] = kwargs.get("parse_mode")
+
+    class FakeSP:
+        telegram_payment_charge_id = "tg_charge_AbCd1234"
+        provider_payment_charge_id = "yk_456"
+
+    asyncio.run(_payment_recovery_message(FakeMsg(), FakeSP(), "basic"))
+
+    assert "tg_charge_AbCd1234" in captured["text"]
+    assert "basic" in captured["text"]
+    # Must be HTML so the <code>...</code> block renders correctly
+    assert captured["mode"] == "HTML"
+    print("OK: handlers _payment_recovery_message")
+
+
 def test_tariff_rules_consistency():
     """Each tariff that appears in the user-facing _TARIFFS list must
     have matching rules in _TARIFF_RULES (max_subs/hours/kopeks),
@@ -1549,4 +1575,5 @@ if __name__ == "__main__":
     test_mercari_enrich_items()
     test_tariff_state_resolution()
     test_tariff_rules_consistency()
+    test_payment_recovery_message_contains_charge_id()
     print("\nALL UNIT TESTS PASSED")

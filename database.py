@@ -185,6 +185,22 @@ class Database:
             # them out retroactively.
             await self._apply_once(conn, "grandfather_legacy_users",
                                     self._grandfather_legacy_users)
+            # Idempotency log for Telegram Payments. Each successful_payment
+            # carries a unique telegram_payment_charge_id; we INSERT-OR-
+            # IGNORE before activating the tariff so a double-delivery
+            # (Telegram retries on transient bot errors) doesn't double
+            # the user's expiry.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    telegram_charge_id TEXT PRIMARY KEY,
+                    provider_charge_id TEXT,
+                    user_id BIGINT NOT NULL,
+                    tariff_id TEXT NOT NULL,
+                    amount_minor BIGINT NOT NULL,
+                    currency TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
             # Backfill any NULLs that may have crept in from older rows.
             await conn.execute(
                 "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
@@ -412,19 +428,39 @@ class Database:
     async def activate_tariff(
         self, user_id: int, tariff_id: str, hours: int,
         is_trial: bool = False,
-    ) -> datetime:
+    ) -> datetime | None:
         """Activate or extend a tariff for the user.
 
-        - If the user has the same tariff still active, the new hours
-          stack on top of the current expiry (renewal).
-        - Switching tariff replaces the id and starts fresh from now.
-        - `is_trial=True` flips the trial_used flag so the free 6h tier
-          can't be re-claimed.
+        Behaviour:
+        - Same tariff still active → new hours stack on top of expiry
+          (renewal). User doesn't lose any unused days.
+        - Switching tariff while a previous one is still active →
+          base = max(now, current_expiry), so an upgrade preserves the
+          remaining days the user already paid for.
+        - is_trial=True → atomic UPDATE WHERE trial_used=FALSE; if the
+          flag was already TRUE (race with another concurrent click),
+          returns None instead of double-activating.
 
-        Returns the new expiry timestamp.
+        Returns the new expiry timestamp, or None when a Trial activation
+        loses the race (caller should treat as «already used»).
         """
         async def _op(conn):
             now = datetime.now(timezone.utc)
+
+            if is_trial:
+                # Atomic CAS: UPDATE only if trial wasn't claimed yet.
+                # `tariff_expires_at` set to now + hours unconditionally
+                # since this branch only runs when trial_used was FALSE.
+                new_exp = now + timedelta(hours=hours)
+                row = await conn.fetchrow(
+                    "UPDATE users SET tariff = 'trial', "
+                    "       tariff_expires_at = $2, trial_used = TRUE "
+                    "WHERE id = $1 AND COALESCE(trial_used, FALSE) = FALSE "
+                    "RETURNING tariff_expires_at",
+                    user_id, new_exp,
+                )
+                return row["tariff_expires_at"] if row else None
+
             row = await conn.fetchrow(
                 "SELECT tariff, tariff_expires_at FROM users WHERE id = $1",
                 user_id,
@@ -432,25 +468,46 @@ class Database:
             current_id = row["tariff"] if row else None
             current_exp = row["tariff_expires_at"] if row else None
 
-            if current_id == tariff_id and current_exp and current_exp > now:
+            # Both renewal AND upgrade should preserve remaining time.
+            # The only case where we reset to `now` is when there's no
+            # current expiry or it's already in the past.
+            if current_exp and current_exp > now:
                 base = current_exp
             else:
                 base = now
             new_exp = base + timedelta(hours=hours)
 
-            if is_trial:
-                await conn.execute(
-                    "UPDATE users SET tariff = $2, tariff_expires_at = $3, "
-                    "       trial_used = TRUE WHERE id = $1",
-                    user_id, tariff_id, new_exp,
-                )
-            else:
-                await conn.execute(
-                    "UPDATE users SET tariff = $2, tariff_expires_at = $3 "
-                    "WHERE id = $1",
-                    user_id, tariff_id, new_exp,
-                )
+            await conn.execute(
+                "UPDATE users SET tariff = $2, tariff_expires_at = $3 "
+                "WHERE id = $1",
+                user_id, tariff_id, new_exp,
+            )
             return new_exp
+        return await self._execute(_op)
+
+    async def record_payment(
+        self, telegram_charge_id: str, provider_charge_id: str | None,
+        user_id: int, tariff_id: str,
+        amount_minor: int, currency: str,
+    ) -> bool:
+        """Record a Telegram-Payments charge for idempotency.
+
+        Returns True if this is a new charge (caller should activate the
+        tariff), False if the same telegram_charge_id was already
+        recorded (Telegram is retrying the delivery; skip activation).
+        """
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "INSERT INTO payments "
+                "(telegram_charge_id, provider_charge_id, user_id, "
+                " tariff_id, amount_minor, currency) "
+                "VALUES ($1, $2, $3, $4, $5, $6) "
+                "ON CONFLICT (telegram_charge_id) DO NOTHING "
+                "RETURNING telegram_charge_id",
+                telegram_charge_id, provider_charge_id, user_id,
+                tariff_id, amount_minor, currency,
+            )
+            return row is not None
         return await self._execute(_op)
 
     async def get_user_subscriptions(self, user_id: int):
