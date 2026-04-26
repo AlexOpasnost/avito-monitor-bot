@@ -1280,6 +1280,86 @@ def test_format_when_local():
     print("OK: scheduler _format_when_local")
 
 
+def test_mercari_enrich_items():
+    """Enrichment: pull location / description / seller_name from a
+    full-item lookup, cache for 24h, never lose a previously-set field."""
+    import asyncio
+    from parsers.base import SearchItem
+    from parsers.mercari import _enrich_items, _ENRICH_CACHE
+
+    _ENRICH_CACHE.clear()
+
+    class FakeArea:
+        def __init__(self, name): self.name = name
+    class FakeSeller:
+        def __init__(self, name): self.name = name
+    class FakeFullItem:
+        def __init__(self, area, desc, seller):
+            self.shipping_from_area = FakeArea(area) if area else None
+            self.description = desc
+            self.seller = FakeSeller(seller) if seller else None
+
+    full_items = {
+        "m1": FakeFullItem("東京都", "Mint condition", "tanaka"),
+        "m2": FakeFullItem("Osaka",  "",                "yamada"),
+        # m3 has nothing useful
+        "m3": FakeFullItem("",       "",                ""),
+    }
+
+    fetch_count = {"n": 0}
+
+    class FakeMercapi:
+        async def item(self, id_):
+            fetch_count["n"] += 1
+            return full_items[id_]
+
+    items = [
+        SearchItem(source="mercari", external_id="m1", title="t1",
+                   price="1000 ¥", price_value=1000, url="https://x/1",
+                   image_url=None, location=None, description=None,
+                   seller_name=None, published_timestamp=None),
+        SearchItem(source="mercari", external_id="m2", title="t2",
+                   price="2000 ¥", price_value=2000, url="https://x/2",
+                   image_url=None, location=None, description=None,
+                   seller_name=None, published_timestamp=None),
+        SearchItem(source="mercari", external_id="m3", title="t3",
+                   price="3000 ¥", price_value=3000, url="https://x/3",
+                   image_url=None, location=None, description=None,
+                   seller_name=None, published_timestamp=None),
+    ]
+
+    asyncio.run(_enrich_items(items, FakeMercapi()))
+
+    assert items[0].location == "東京都"
+    assert items[0].description == "Mint condition"
+    assert items[0].seller_name == "tanaka"
+
+    assert items[1].location == "Osaka"
+    assert items[1].description is None  # empty desc stays None
+    assert items[1].seller_name == "yamada"
+
+    # Empty everything — fields stay None
+    assert items[2].location is None
+    assert items[2].description is None
+    assert items[2].seller_name is None
+
+    assert fetch_count["n"] == 3, "should fetch each id once on first run"
+
+    # Second run hits the cache — no new fetches
+    fetch_count["n"] = 0
+    items2 = [
+        SearchItem(source="mercari", external_id="m1", title="t1-bis",
+                   price="1000 ¥", price_value=1000, url="https://x/1",
+                   image_url=None, location=None, description=None,
+                   seller_name=None, published_timestamp=None),
+    ]
+    asyncio.run(_enrich_items(items2, FakeMercapi()))
+    assert fetch_count["n"] == 0, "cached id_ shouldn't refetch"
+    assert items2[0].location == "東京都"
+
+    print("OK: mercari _enrich_items (location/description/seller + cache)")
+
+
 def test_sub_display_name():
     """Custom user-set name wins; otherwise we render the marketplace
     pretty name (Авито/Mercari/Vinted/…). Empty/whitespace counts as
@@ -1389,4 +1469,5 @@ if __name__ == "__main__":
     test_format_when_local()
     test_vinted_location_fallback()
     test_sub_display_name()
+    test_mercari_enrich_items()
     print("\nALL UNIT TESTS PASSED")

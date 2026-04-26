@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
@@ -39,6 +40,16 @@ _JPY_TO_USD = 0.0065
 
 # Max items returned from one search call (mercapi defaults to 120).
 _KEEP_TOP = 50
+
+# Per-item enrichment cache: id_ → {ts, location, description, seller_name}.
+# Mercari's search API doesn't return location / description / seller —
+# those require a per-item m.item(id) call. We enrich items inline,
+# cache for 24 h, and stagger fetches by 0.2 s to play nice with
+# Mercari's anti-bot. Steady state (no new items) hits 0 fetches.
+_ENRICH_CACHE: dict[str, dict] = {}
+_ENRICH_TTL = 24 * 3600
+_ENRICH_DELAY = 0.2
+_ENRICH_TIMEOUT = 8.0
 
 
 class MercariSource:
@@ -129,15 +140,80 @@ async def _fetch_inner(url: str) -> list[SearchItem] | None:
         except Exception as e:
             logger.debug("[mercari] parse err: %s", e)
 
+    # Enrich with location / description / seller_name from full item
+    # details. Mercari search results omit those, but the user-facing
+    # card needs them — cached for 24h so steady-state cycles don't
+    # repeat the lookup.
     if items:
+        await _enrich_items(items, m)
+
         total_cnt = len(items)
         with_image = sum(1 for i in items if i.image_url)
         with_ts = sum(1 for i in items if i.published_timestamp)
+        with_loc = sum(1 for i in items if i.location)
+        with_desc = sum(1 for i in items if i.description)
         logger.info(
-            "[mercari] completeness: image=%d/%d, date=%d/%d",
+            "[mercari] completeness: image=%d/%d, date=%d/%d, "
+            "location=%d/%d, description=%d/%d",
             with_image, total_cnt, with_ts, total_cnt,
+            with_loc, total_cnt, with_desc, total_cnt,
         )
     return items
+
+
+async def _enrich_items(items: list[SearchItem], m) -> None:
+    """Populate item.location / .description / .seller_name from
+    per-item m.item(id) lookups. Mutates items in place. Failures are
+    silent — the item just keeps its original (empty) field and the
+    notification falls back to «—»."""
+    now = time.time()
+    for it in items:
+        if not it.external_id:
+            continue
+        cached = _ENRICH_CACHE.get(it.external_id)
+        if cached and (now - cached["ts"]) < _ENRICH_TTL:
+            it.location = cached.get("location") or it.location
+            it.description = cached.get("description") or it.description
+            it.seller_name = cached.get("seller_name") or it.seller_name
+            continue
+
+        try:
+            full = await asyncio.wait_for(
+                m.item(it.external_id), timeout=_ENRICH_TIMEOUT,
+            )
+        except Exception as e:
+            logger.debug(
+                "[mercari] enrich %s err: %s", it.external_id, str(e)[:120],
+            )
+            await asyncio.sleep(_ENRICH_DELAY)
+            continue
+
+        loc_obj = getattr(full, "shipping_from_area", None)
+        loc_name = (getattr(loc_obj, "name", None) or "").strip() if loc_obj else ""
+        seller_obj = getattr(full, "seller", None)
+        seller_name = (
+            (getattr(seller_obj, "name", None) or "").strip() if seller_obj else ""
+        )
+        desc = (getattr(full, "description", None) or "").strip()
+
+        loc = loc_name or None
+        desc_v = desc or None
+        seller_v = seller_name or None
+
+        if loc:
+            it.location = loc
+        if desc_v:
+            it.description = desc_v
+        if seller_v:
+            it.seller_name = seller_v
+
+        _ENRICH_CACHE[it.external_id] = {
+            "ts": now,
+            "location": loc,
+            "description": desc_v,
+            "seller_name": seller_v,
+        }
+        await asyncio.sleep(_ENRICH_DELAY)
 
 
 _KEYWORD_KEYS = ("keyword", "query", "q")
