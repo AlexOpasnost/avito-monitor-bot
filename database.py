@@ -160,6 +160,12 @@ class Database:
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT"
             )
+            # Optional user-given label for a subscription. NULL means
+            # "show the source name as default". Renamed via the ✏️
+            # button on the «Мои поиски» screen.
+            await conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS name TEXT"
+            )
             # Backfill any NULLs that may have crept in from older rows.
             await conn.execute(
                 "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
@@ -335,10 +341,43 @@ class Database:
     async def get_user_subscriptions(self, user_id: int):
         async def _op(conn):
             return await conn.fetch(
-                "SELECT id, url, is_active, created_at, last_checked_at, error_count "
+                "SELECT id, url, is_active, created_at, last_checked_at, "
+                "       error_count, "
+                "       COALESCE(source, 'avito') AS source, name "
                 "FROM subscriptions WHERE user_id = $1 AND deleted = FALSE "
                 "ORDER BY created_at DESC",
                 user_id,
+            )
+        return await self._execute(_op)
+
+    async def set_subscription_name(
+        self, sub_id: int, user_id: int, name: str | None,
+    ) -> bool:
+        """Rename a subscription. Verifies ownership so a forged
+        callback can't relabel another user's row. Returns True on
+        success, False if the subscription doesn't belong to the user
+        or is already deleted."""
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "UPDATE subscriptions SET name = $3 "
+                "WHERE id = $1 AND user_id = $2 AND deleted = FALSE "
+                "RETURNING id",
+                sub_id, user_id, name,
+            )
+            return row is not None
+        return await self._execute(_op)
+
+    async def get_subscription_owned_by(
+        self, sub_id: int, user_id: int,
+    ) -> dict | None:
+        """Fetch a subscription row only if it belongs to `user_id`.
+        Returns None for forged IDs or another user's row."""
+        async def _op(conn):
+            return await conn.fetchrow(
+                "SELECT id, url, COALESCE(source, 'avito') AS source, name "
+                "FROM subscriptions "
+                "WHERE id = $1 AND user_id = $2 AND deleted = FALSE",
+                sub_id, user_id,
             )
         return await self._execute(_op)
 

@@ -1280,6 +1280,25 @@ def test_format_when_local():
     print("OK: scheduler _format_when_local")
 
 
+def test_sub_display_name():
+    """Custom user-set name wins; otherwise we render the marketplace
+    pretty name (Авито/Mercari/Vinted/…). Empty/whitespace counts as
+    «no name set»."""
+    from handlers import _sub_display_name
+
+    # Custom name set
+    assert _sub_display_name({"name": "Брюки 48", "source": "vinted"}) == "Брюки 48"
+    # Whitespace-only treated as unset
+    assert _sub_display_name({"name": "   ", "source": "vinted"}) == "Vinted"
+    # No name → source pretty name
+    assert _sub_display_name({"name": None, "source": "mercari"}) == "Mercari"
+    assert _sub_display_name({"name": None, "source": "avito"}) == "Авито"
+    # Missing source falls back to "маркетплейс"
+    assert _sub_display_name({"name": None}) == "маркетплейс"
+
+    print("OK: handlers _sub_display_name")
+
+
 def test_vinted_location_fallback():
     """When user_info doesn't carry the location entry, fall back to
     stitching `city` + `country_title_local`."""
@@ -1369,4 +1388,5 @@ if __name__ == "__main__":
     test_bot_i18n_lists_consistent()
     test_format_when_local()
     test_vinted_location_fallback()
+    test_sub_display_name()
     print("\nALL UNIT TESTS PASSED")

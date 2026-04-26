@@ -25,7 +25,9 @@ import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -50,6 +52,25 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 _GENERIC_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+# Max length of a user-set subscription label. Telegram caption /
+# inline-button width get unhappy with anything much longer.
+_MAX_NAME_LEN = 30
+
+
+class RenameStates(StatesGroup):
+    """FSM: user clicked ✏️, the next text message they send becomes
+    the subscription's new name."""
+    waiting_for_name = State()
+
+
+def _sub_display_name(sub: dict) -> str:
+    """Custom name if set, otherwise a sensible default built from
+    the marketplace name."""
+    raw = sub.get("name")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return source_display_name(sub.get("source") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +540,7 @@ async def _show_subscription_list(target):
         return
 
     lines = ["📋 <b>Активные поиски:</b>\n"]
+    rename_buttons = []
     for i, sub in enumerate(active, 1):
         checked = sub["last_checked_at"]
         checked_str = (
@@ -527,12 +549,18 @@ async def _show_subscription_list(target):
         errors = (
             f" ⚠️ ошибок: {sub['error_count']}" if sub["error_count"] > 0 else ""
         )
+        name = _sub_display_name(sub)
         lines.append(
-            f"{i}. <a href=\"{sub['url']}\">Поиск #{sub['id']}</a>\n"
+            f"<b>{i}.</b> <a href=\"{sub['url']}\">{name}</a>\n"
             f"   Последняя проверка: {checked_str}{errors}"
         )
+        rename_buttons.append([InlineKeyboardButton(
+            text=f"✏️ Назвать «{name[:18]}»",
+            callback_data=f"rename:{sub['id']}",
+        )])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        *rename_buttons,
         [InlineKeyboardButton(text="❌ Удалить поиск", callback_data="cmd:delete")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:home")],
     ])
@@ -554,10 +582,7 @@ async def _show_delete_picker(target):
 
     buttons = [
         [InlineKeyboardButton(
-            text=(
-                f"❌ #{sub['id']} — "
-                + ((sub["url"][:50] + "...") if len(sub["url"]) > 50 else sub["url"])
-            ),
+            text=f"❌ {_sub_display_name(sub)}"[:60],
             callback_data=f"del:{sub['id']}",
         )]
         for sub in active
@@ -656,16 +681,101 @@ async def callback_delete(callback: CallbackQuery):
         await callback.answer("Неверный ID")
         return
     await db.deactivate_subscription(sub_id)
-    await callback.answer(f"Поиск #{sub_id} удалён")
+    await callback.answer("Удалено")
     # Refresh the list — the deleted item disappears in place.
     await _show_subscription_list(callback)
+
+
+# ---------------------------------------------------------------------------
+# Rename flow (FSM)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("rename:"))
+async def callback_rename(callback: CallbackQuery, state: FSMContext):
+    try:
+        sub_id = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Неверный ID")
+        return
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    sub = await db.get_subscription_owned_by(sub_id, user_id)
+    if sub is None:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
+
+    current = _sub_display_name(dict(sub))
+    await state.set_state(RenameStates.waiting_for_name)
+    await state.update_data(rename_sub_id=sub_id)
+
+    text = (
+        f"✏️ <b>Новое название</b>\n\n"
+        f"Сейчас: <b>{current}</b>\n\n"
+        f"Пришли новое название следующим сообщением (до {_MAX_NAME_LEN} символов).\n"
+        f"<i>/cancel — отмена</i>"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data="rename:cancel")],
+    ])
+    await _present(callback, text, keyboard=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "rename:cancel")
+async def callback_rename_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Отменено")
+    await _show_subscription_list(callback)
+
+
+@router.message(Command("cancel"), StateFilter(RenameStates.waiting_for_name))
+async def cmd_cancel_rename(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("✅ Отменено.", reply_markup=back_to_menu_keyboard())
+
+
+@router.message(StateFilter(RenameStates.waiting_for_name), F.text)
+async def handle_rename_input(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer(
+            "Название не может быть пустым. Пришли текст или /cancel.",
+        )
+        return
+    if len(raw) > _MAX_NAME_LEN:
+        raw = raw[:_MAX_NAME_LEN]
+
+    data = await state.get_data()
+    sub_id = data.get("rename_sub_id")
+    await state.clear()
+    if sub_id is None:
+        await message.answer("Что-то пошло не так. Попробуй ещё раз через 📋 «Мои поиски».")
+        return
+
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+    ok = await db.set_subscription_name(int(sub_id), user_id, raw)
+    if not ok:
+        await message.answer(
+            "Поиск не найден или уже удалён.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    await message.answer(
+        f"✅ Поиск переименован в <b>{raw}</b>.",
+        parse_mode="HTML",
+    )
+    await _show_subscription_list(message)
 
 
 # ---------------------------------------------------------------------------
 # Free-text URL handler — main "add subscription" entry point
 # ---------------------------------------------------------------------------
 
-@router.message(F.text)
+@router.message(F.text, StateFilter(default_state))
 async def handle_url(message: Message):
     extracted = _extract_marketplace_url(message)
     if not extracted:
@@ -695,7 +805,7 @@ async def handle_url(message: Message):
 
     pretty = source_display_name(source_name)
     await message.answer(
-        f"⏳ <b>Поиск #{sub_id} добавлен</b> ({pretty})\n"
+        f"⏳ <b>Добавляю поиск {pretty}</b>\n"
         f"Открываю страницу и записываю текущие объявления...",
         parse_mode="HTML",
     )
@@ -714,12 +824,19 @@ async def handle_url(message: Message):
     else:
         seeded = 0
 
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✏️ Назвать поиск", callback_data=f"rename:{sub_id}",
+        )],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+    ])
     await message.answer(
-        f"✅ <b>Мониторинг запущен</b>\n\n"
-        f"🔗 <a href=\"{url}\">Твоя ссылка на {pretty}</a>\n\n"
+        f"✅ <b>Мониторинг запущен</b> ({pretty})\n\n"
+        f"🔗 <a href=\"{url}\">Твоя ссылка</a>\n\n"
         f"Записал {seeded} текущих объявлений как уже виденные. "
-        f"Как появится новое — пришлю с фото, ценой и описанием.",
+        f"Как появится новое — пришлю с фото, ценой и описанием.\n\n"
+        f"<i>Хочешь дать поиску своё название? Жми ✏️</i>",
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=keyboard,
     )
