@@ -1337,6 +1337,95 @@ def test_tariff_state_resolution():
     print("OK: handlers _resolve_tariff_state")
 
 
+def test_admin_ids_env_parsing():
+    """ADMIN_IDS=csv has priority; ADMIN_ID single is back-compat;
+    both set → union (no dups)."""
+    import os
+    from importlib import reload
+    import config as cfg_mod
+
+    saved = (os.environ.pop("ADMIN_IDS", None), os.environ.pop("ADMIN_ID", None))
+    try:
+        # Plain CSV
+        os.environ["ADMIN_IDS"] = " 100, 200 ,300 "
+        reload(cfg_mod)
+        assert sorted(cfg_mod.config.admin_ids) == [100, 200, 300]
+
+        # Back-compat: only ADMIN_ID
+        os.environ.pop("ADMIN_IDS", None)
+        os.environ["ADMIN_ID"] = "777"
+        reload(cfg_mod)
+        assert cfg_mod.config.admin_ids == [777]
+
+        # Both → union, no duplicates
+        os.environ["ADMIN_IDS"] = "111,222"
+        os.environ["ADMIN_ID"] = "222"  # already in list
+        reload(cfg_mod)
+        assert sorted(cfg_mod.config.admin_ids) == [111, 222]
+
+        # Empty / garbage tolerated
+        os.environ["ADMIN_IDS"] = ", , abc, 555 ,"
+        os.environ.pop("ADMIN_ID", None)
+        reload(cfg_mod)
+        assert cfg_mod.config.admin_ids == [555]
+
+        # Nothing set → empty
+        os.environ.pop("ADMIN_IDS", None)
+        reload(cfg_mod)
+        assert cfg_mod.config.admin_ids == []
+    finally:
+        # Restore
+        for key, val in zip(("ADMIN_IDS", "ADMIN_ID"), saved):
+            os.environ.pop(key, None)
+            if val is not None:
+                os.environ[key] = val
+        reload(cfg_mod)
+        # Also reload handlers since it imports config
+        import handlers as handlers_mod
+        reload(handlers_mod)
+
+    print("OK: config admin_ids parsing")
+
+
+def test_admin_user_tariff_short_circuit():
+    """is_admin telegram_id → synthetic admin tariff (max_subs=999),
+    no DB lookup, no expiry. Removing from list = instant demote."""
+    import asyncio
+    from importlib import reload
+    import os
+    import config as cfg_mod
+
+    saved = os.environ.pop("ADMIN_IDS", None)
+    try:
+        os.environ["ADMIN_IDS"] = "12345"
+        reload(cfg_mod)
+        import handlers as handlers_mod
+        reload(handlers_mod)
+
+        # is_admin happy/sad path
+        assert handlers_mod.is_admin(12345) is True
+        assert handlers_mod.is_admin(99999) is False
+        assert handlers_mod.is_admin(None) is False
+
+        # Synthetic state for admin (no DB hit needed because
+        # short-circuit returns before db.get_user_tariff is called).
+        # We pass user_id=-1 (would fail in DB if it got that far).
+        state = asyncio.run(handlers_mod._user_tariff_state(-1, telegram_id=12345))
+        assert state["active"] is True
+        assert state["tariff_id"] == "admin"
+        assert state["max_subs"] == 999
+        assert state["trial_used"] is True  # trial button hidden
+    finally:
+        os.environ.pop("ADMIN_IDS", None)
+        if saved is not None:
+            os.environ["ADMIN_IDS"] = saved
+        reload(cfg_mod)
+        import handlers as handlers_mod
+        reload(handlers_mod)
+
+    print("OK: handlers admin tariff short-circuit")
+
+
 def test_payment_recovery_message_contains_charge_id():
     """When activation fails post-payment, the user must see the
     charge_id so support can find the payment in YooKassa."""
@@ -1576,4 +1665,6 @@ if __name__ == "__main__":
     test_tariff_state_resolution()
     test_tariff_rules_consistency()
     test_payment_recovery_message_contains_charge_id()
+    test_admin_ids_env_parsing()
+    test_admin_user_tariff_short_circuit()
     print("\nALL UNIT TESTS PASSED")

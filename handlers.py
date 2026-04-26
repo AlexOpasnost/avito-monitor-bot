@@ -401,14 +401,25 @@ _TARIFFS = [
 # paywall existed. Free state (DB row is NULL or expired) maps to 0
 # subs — user has to activate Trial or buy a tier.
 _TARIFF_RULES: dict[str, dict] = {
-    "trial":    {"max_subs": 1, "hours": 6,        "kopeks": 0},
-    "basic":    {"max_subs": 1, "hours": 30 * 24,  "kopeks": 89000},
-    "advanced": {"max_subs": 3, "hours": 30 * 24,  "kopeks": 179000},
-    "pro":      {"max_subs": 5, "hours": 30 * 24,  "kopeks": 259000},
+    "trial":    {"max_subs": 1,   "hours": 6,        "kopeks": 0},
+    "basic":    {"max_subs": 1,   "hours": 30 * 24,  "kopeks": 89000},
+    "advanced": {"max_subs": 3,   "hours": 30 * 24,  "kopeks": 179000},
+    "pro":      {"max_subs": 5,   "hours": 30 * 24,  "kopeks": 259000},
     # No expiry, max 5 — preserves behaviour for users who joined
     # before the paywall was introduced.
-    "legacy":   {"max_subs": 5, "hours": 0,        "kopeks": 0},
+    "legacy":   {"max_subs": 5,   "hours": 0,        "kopeks": 0},
+    # Bot admins (config.admin_ids). Bypasses paywall, virtually
+    # unlimited search count. Resolved at runtime from is_admin(),
+    # never persisted to DB — removing someone from ADMIN_IDS in
+    # Railway env vars instantly demotes them.
+    "admin":    {"max_subs": 999, "hours": 0,        "kopeks": 0},
 }
+
+
+def is_admin(telegram_id: int | None) -> bool:
+    if not telegram_id:
+        return False
+    return telegram_id in (config.admin_ids or [])
 
 
 def _tariff_meta(tariff_id: str | None) -> tuple | None:
@@ -455,14 +466,29 @@ def _resolve_tariff_state(tariff_row: dict) -> dict:
     }
 
 
-async def _user_tariff_state(user_id: int) -> dict:
+async def _user_tariff_state(user_id: int, telegram_id: int | None = None) -> dict:
+    """Resolve the current tariff state for a user.
+
+    Admin telegram_ids (per config.admin_ids) get a synthetic 'admin'
+    state — no DB lookup, no expiry, max_subs=999. This means:
+      - removing someone from ADMIN_IDS instantly drops them back to
+        whatever their persisted tariff is (or free if never bought)
+      - admins never leak into the paid-users dashboard
+    """
+    if telegram_id is not None and is_admin(telegram_id):
+        rules = _TARIFF_RULES["admin"]
+        return {
+            "active": True, "tariff_id": "admin", "expires_at": None,
+            "max_subs": rules["max_subs"], "days_left": None,
+            "trial_used": True,  # hide trial button for admins
+        }
     return _resolve_tariff_state(await db.get_user_tariff(user_id))
 
 
 async def _show_tariffs(target):
     tg_id, username = _user_from(target)
     user_id = await db.get_or_create_user(tg_id, username)
-    state = await _user_tariff_state(user_id)
+    state = await _user_tariff_state(user_id, telegram_id=tg_id)
 
     header = "💎 <b>Тарифы AutoSearch</b>\n"
     if state["active"]:
@@ -511,6 +537,16 @@ async def callback_buy_tariff(callback: CallbackQuery):
     rules = _TARIFF_RULES.get(tariff_id)
     if meta is None or rules is None:
         await callback.answer("Неизвестный тариф", show_alert=True)
+        return
+
+    # Admins bypass the paywall entirely — no need to send them an
+    # invoice or activate Trial. Defensive: someone could replay the
+    # callback URL even after the buttons were hidden in the UI.
+    if is_admin(callback.from_user.id):
+        await callback.answer(
+            "У тебя админ-доступ — оплата не нужна, лимиты сняты.",
+            show_alert=True,
+        )
         return
 
     user_id = await db.get_or_create_user(
@@ -769,7 +805,7 @@ async def _show_profile(target, *, prefs: dict | None = None):
     # value on screen.
     tz = prefs.get("tz") or default_tz_for_lang(prefs.get("lang"))
 
-    state = await _user_tariff_state(user_id)
+    state = await _user_tariff_state(user_id, telegram_id=tg_id)
     if state["active"]:
         cur_meta = _tariff_meta(state["tariff_id"])
         cur_label = cur_meta[1] if cur_meta else state["tariff_id"]
@@ -907,29 +943,158 @@ async def cmd_delete(message: Message):
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
-    if config.admin_id == 0 or message.from_user.id != config.admin_id:
+    """Multi-tab admin panel.
+
+    Usage:
+      /admin              — dashboard (revenue + paid users + traffic)
+      /admin users        — latest 30 users with paid/active tariffs
+      /admin user <tg_id> — drill-down: profile + subs + payments
+    """
+    if not is_admin(message.from_user.id):
         return
 
+    raw = (message.text or "").strip().split()
+    if len(raw) >= 2 and raw[1] == "users":
+        await _admin_users_list(message)
+        return
+    if len(raw) >= 3 and raw[1] == "user":
+        try:
+            target_tg = int(raw[2])
+        except ValueError:
+            await message.answer("Использование: /admin user &lt;telegram_id&gt;")
+            return
+        await _admin_user_detail(message, target_tg)
+        return
+
+    await _admin_dashboard(message)
+
+
+async def _admin_dashboard(message: Message):
     stats = await db.get_admin_stats()
 
     last_checked_str = "—"
-    if stats["last_checked"]:
+    if stats.get("last_checked"):
         from datetime import timedelta, timezone as tz
         msk = tz(timedelta(hours=3))
-        last_checked_str = stats["last_checked"].astimezone(msk).strftime("%H:%M %d.%m.%Y")
+        last_checked_str = stats["last_checked"].astimezone(msk).strftime(
+            "%H:%M %d.%m.%Y"
+        )
+
+    rev_total = stats.get("revenue_total", 0) // 100  # kopeks → rubles
+    rev_30d = stats.get("revenue_30d", 0) // 100
 
     await message.answer(
         f"📊 <b>Админ-панель</b>\n\n"
-        f"👥 Юзеров: <b>{stats['total_users']:,}</b>\n"
-        f"📋 Активных подписок: <b>{stats['active_subs']:,}</b>\n"
-        f"🔗 Уникальных ссылок: <b>{stats['unique_urls']:,}</b>\n"
-        f"📨 Объявлений отправлено: <b>{stats['total_sent']:,}</b>\n"
-        f"⏱ Последняя проверка: <b>{last_checked_str}</b>\n\n"
-        f"📈 <b>За 24ч:</b>\n"
-        f"  Новых юзеров: <b>{stats['new_users_24h']:,}</b>\n"
-        f"  Отправлено: <b>{stats['sent_24h']:,}</b>",
+        f"<b>💰 Выручка</b>\n"
+        f"  За всё время: <b>{rev_total:,} ₽</b>\n"
+        f"  За 30 дней:   <b>{rev_30d:,} ₽</b>\n"
+        f"  Платящих сейчас: <b>{stats.get('active_paid_users', 0):,}</b>\n"
+        f"  Уникальных платежей: <b>{stats.get('paid_users_total', 0):,}</b> "
+        f"(за 30д: {stats.get('paid_users_30d', 0):,})\n\n"
+        f"<b>👥 Юзеры</b>\n"
+        f"  Всего: <b>{stats['total_users']:,}</b>\n"
+        f"  Новых за 24ч: <b>{stats['new_users_24h']:,}</b>\n\n"
+        f"<b>🔍 Поиски</b>\n"
+        f"  Активных: <b>{stats['active_subs']:,}</b>\n"
+        f"  Уникальных URL: <b>{stats['unique_urls']:,}</b>\n"
+        f"  Уведомлений всего: <b>{stats['total_sent']:,}</b>\n"
+        f"  За 24ч: <b>{stats['sent_24h']:,}</b>\n"
+        f"  Последняя проверка: <b>{last_checked_str}</b>\n\n"
+        f"<i>/admin users — список платящих\n"
+        f"/admin user &lt;tg_id&gt; — детали юзера</i>",
         parse_mode="HTML",
     )
+
+
+async def _admin_users_list(message: Message):
+    rows = await db.get_admin_user_list(limit=30)
+    if not rows:
+        await message.answer("Платящих юзеров пока нет.")
+        return
+
+    lines = ["📋 <b>Платящие юзеры (top 30)</b>\n"]
+    for r in rows:
+        tariff_meta = _tariff_meta(r["tariff"])
+        tariff_label = tariff_meta[1] if tariff_meta else (r["tariff"] or "—")
+        # days left
+        exp = r.get("tariff_expires_at")
+        if exp:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            if exp > now:
+                days = max(1, int((exp - now).total_seconds() // 86400))
+                exp_str = f"{days}д"
+            else:
+                exp_str = "истёк"
+        else:
+            exp_str = "∞" if r["tariff"] == "legacy" else "—"
+        username = r.get("username") or "—"
+        lifetime = (r.get("lifetime_paid") or 0) // 100
+        lines.append(
+            f"<code>{r['telegram_id']}</code> @{username} · "
+            f"{tariff_label} · {exp_str} · "
+            f"📋{r['active_subs']} · 💰{lifetime:,}₽"
+        )
+    lines.append("\n<i>/admin user &lt;tg_id&gt; — детали</i>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+async def _admin_user_detail(message: Message, target_tg: int):
+    detail = await db.get_admin_user_detail(target_tg)
+    if detail is None:
+        await message.answer(
+            f"Юзер с tg_id <code>{target_tg}</code> не найден.",
+            parse_mode="HTML",
+        )
+        return
+
+    u = detail["user"]
+    tariff_meta = _tariff_meta(u["tariff"])
+    tariff_label = tariff_meta[1] if tariff_meta else (u["tariff"] or "—")
+    reg_str = u["created_at"].strftime("%d.%m.%Y") if u.get("created_at") else "—"
+    exp_str = (
+        u["tariff_expires_at"].strftime("%d.%m.%Y %H:%M UTC")
+        if u.get("tariff_expires_at") else "—"
+    )
+
+    lines = [
+        f"👤 <b>@{u.get('username') or '—'}</b> "
+        f"(<code>{u['telegram_id']}</code>)",
+        f"📅 Регистрация: <b>{reg_str}</b>",
+        f"💎 Тариф: <b>{tariff_label}</b> до {exp_str}",
+        f"🎁 Trial used: <b>{'да' if u.get('trial_used') else 'нет'}</b>",
+        "",
+    ]
+
+    subs = detail["subs"]
+    if subs:
+        lines.append(f"<b>📋 Поиски ({len(subs)}):</b>")
+        for s in subs[:10]:
+            name = s.get("name") or source_display_name(s.get("source") or "")
+            status = "🟢" if s["is_active"] else "⏸"
+            errs = f" ⚠️{s['error_count']}" if (s.get("error_count") or 0) > 0 else ""
+            lines.append(
+                f"  {status} #{s['id']} {name} ({s.get('source') or '—'}){errs}"
+            )
+        if len(subs) > 10:
+            lines.append(f"  <i>… и ещё {len(subs) - 10}</i>")
+        lines.append("")
+
+    payments = detail["payments"]
+    if payments:
+        total = sum(p.get("amount_minor", 0) for p in payments) // 100
+        lines.append(f"<b>💰 Платежи ({len(payments)}, всего {total:,} ₽):</b>")
+        for p in payments[:10]:
+            amt = (p.get("amount_minor", 0)) // 100
+            when = p["created_at"].strftime("%d.%m.%Y") if p.get("created_at") else "—"
+            lines.append(
+                f"  {when} — {p.get('tariff_id', '?')}: "
+                f"{amt:,} {p.get('currency', '')}"
+            )
+        if len(payments) > 10:
+            lines.append(f"  <i>… и ещё {len(payments) - 10}</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(Command("stop"))
@@ -1073,7 +1238,7 @@ async def handle_url(message: Message):
         message.from_user.id, message.from_user.username,
     )
 
-    state = await _user_tariff_state(user_id)
+    state = await _user_tariff_state(user_id, telegram_id=message.from_user.id)
     if not state["active"]:
         # No active tariff at all — gate behind the paywall.
         await message.answer(

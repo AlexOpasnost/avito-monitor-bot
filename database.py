@@ -722,6 +722,29 @@ class Database:
             sent_24h = await conn.fetchval(
                 "SELECT COUNT(*) FROM sent_items WHERE sent_at > NOW() - INTERVAL '24 hours'"
             )
+            # Revenue snapshot — total + 30-day window. amount_minor is
+            # in kopeks/cents, callers convert to display units.
+            revenue_total = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_minor), 0) FROM payments"
+            )
+            revenue_30d = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_minor), 0) FROM payments "
+                "WHERE created_at > NOW() - INTERVAL '30 days'"
+            )
+            paid_users_total = await conn.fetchval(
+                "SELECT COUNT(DISTINCT user_id) FROM payments"
+            )
+            paid_users_30d = await conn.fetchval(
+                "SELECT COUNT(DISTINCT user_id) FROM payments "
+                "WHERE created_at > NOW() - INTERVAL '30 days'"
+            )
+            # Active paid tariffs right now (not legacy, not free, not expired)
+            active_paid_users = await conn.fetchval(
+                "SELECT COUNT(*) FROM users "
+                "WHERE tariff IN ('basic', 'advanced', 'pro') "
+                "  AND tariff_expires_at IS NOT NULL "
+                "  AND tariff_expires_at > NOW()"
+            )
             return {
                 "total_users": total_users,
                 "active_subs": active_subs,
@@ -730,6 +753,69 @@ class Database:
                 "last_checked": last_checked,
                 "new_users_24h": new_users_24h,
                 "sent_24h": sent_24h,
+                "revenue_total": revenue_total,
+                "revenue_30d": revenue_30d,
+                "paid_users_total": paid_users_total,
+                "paid_users_30d": paid_users_30d,
+                "active_paid_users": active_paid_users,
+            }
+        return await self._execute(_op)
+
+    async def get_admin_user_list(self, limit: int = 30) -> list[dict]:
+        """Latest paid users, newest first. Each row carries enough
+        info to render a one-line summary in the admin panel."""
+        async def _op(conn):
+            rows = await conn.fetch(
+                "SELECT u.id, u.telegram_id, u.username, u.tariff, "
+                "       u.tariff_expires_at, u.created_at, "
+                "       COALESCE((SELECT COUNT(*) FROM subscriptions s "
+                "                 WHERE s.user_id = u.id "
+                "                   AND s.is_active = TRUE "
+                "                   AND s.deleted = FALSE), 0) AS active_subs, "
+                "       COALESCE((SELECT SUM(amount_minor) FROM payments p "
+                "                 WHERE p.user_id = u.id), 0) AS lifetime_paid "
+                "FROM users u "
+                "WHERE u.tariff IS NOT NULL "
+                "ORDER BY "
+                "  CASE WHEN u.tariff IN ('basic','advanced','pro') THEN 0 ELSE 1 END, "
+                "  u.tariff_expires_at DESC NULLS LAST, "
+                "  u.created_at DESC "
+                "LIMIT $1",
+                limit,
+            )
+            return [dict(r) for r in rows]
+        return await self._execute(_op)
+
+    async def get_admin_user_detail(self, telegram_id: int) -> dict | None:
+        """Full drill-down for one telegram_id: profile + subscriptions
+        + payment history. Returns None when the user doesn't exist."""
+        async def _op(conn):
+            user = await conn.fetchrow(
+                "SELECT id, telegram_id, username, created_at, "
+                "       tariff, tariff_expires_at, trial_used "
+                "FROM users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if not user:
+                return None
+            subs = await conn.fetch(
+                "SELECT id, url, source, name, is_active, last_checked_at, "
+                "       error_count, created_at "
+                "FROM subscriptions "
+                "WHERE user_id = $1 AND deleted = FALSE "
+                "ORDER BY created_at DESC",
+                user["id"],
+            )
+            payments = await conn.fetch(
+                "SELECT tariff_id, amount_minor, currency, created_at "
+                "FROM payments WHERE user_id = $1 "
+                "ORDER BY created_at DESC LIMIT 20",
+                user["id"],
+            )
+            return {
+                "user": dict(user),
+                "subs": [dict(r) for r in subs],
+                "payments": [dict(r) for r in payments],
             }
         return await self._execute(_op)
 
