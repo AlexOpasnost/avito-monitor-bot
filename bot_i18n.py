@@ -187,6 +187,82 @@ def timezone_short(code: str | None) -> str:
     return code.split("/")[-1].replace("_", " ")
 
 
+# Date-line phrasing per language. Three patterns each:
+#   "today"     — used when the listing was published earlier today
+#   "yesterday" — published the previous calendar day
+#   "date"      — older items, with explicit DD.MM date
+# Placeholders: {time} = HH:MM, {tz} = short city tag, {date} = DD.MM.
+# Languages without an entry fall back to RU (the bot's defaults).
+_DATE_TEMPLATES: dict[str, dict[str, str]] = {
+    "ru": {"today": "Сегодня в {time} ({tz})",
+           "yesterday": "Вчера в {time} ({tz})",
+           "date": "{date} в {time} ({tz})"},
+    "be": {"today": "Сёння ў {time} ({tz})",
+           "yesterday": "Учора ў {time} ({tz})",
+           "date": "{date} ў {time} ({tz})"},
+    "uk": {"today": "Сьогодні о {time} ({tz})",
+           "yesterday": "Вчора о {time} ({tz})",
+           "date": "{date} о {time} ({tz})"},
+    "kk": {"today": "Бүгін {time} ({tz})",
+           "yesterday": "Кеше {time} ({tz})",
+           "date": "{date}, {time} ({tz})"},
+    "en": {"today": "Today at {time} ({tz})",
+           "yesterday": "Yesterday at {time} ({tz})",
+           "date": "{date} at {time} ({tz})"},
+    "es": {"today": "Hoy a las {time} ({tz})",
+           "yesterday": "Ayer a las {time} ({tz})",
+           "date": "{date} a las {time} ({tz})"},
+    "de": {"today": "Heute um {time} ({tz})",
+           "yesterday": "Gestern um {time} ({tz})",
+           "date": "{date} um {time} ({tz})"},
+    "fr": {"today": "Aujourd'hui à {time} ({tz})",
+           "yesterday": "Hier à {time} ({tz})",
+           "date": "{date} à {time} ({tz})"},
+    "it": {"today": "Oggi alle {time} ({tz})",
+           "yesterday": "Ieri alle {time} ({tz})",
+           "date": "{date} alle {time} ({tz})"},
+    "pl": {"today": "Dziś o {time} ({tz})",
+           "yesterday": "Wczoraj o {time} ({tz})",
+           "date": "{date} o {time} ({tz})"},
+    "pt": {"today": "Hoje às {time} ({tz})",
+           "yesterday": "Ontem às {time} ({tz})",
+           "date": "{date} às {time} ({tz})"},
+    "nl": {"today": "Vandaag om {time} ({tz})",
+           "yesterday": "Gisteren om {time} ({tz})",
+           "date": "{date} om {time} ({tz})"},
+    "tr": {"today": "Bugün {time} ({tz})",
+           "yesterday": "Dün {time} ({tz})",
+           "date": "{date}, {time} ({tz})"},
+    "ro": {"today": "Astăzi la {time} ({tz})",
+           "yesterday": "Ieri la {time} ({tz})",
+           "date": "{date} la {time} ({tz})"},
+    "cs": {"today": "Dnes v {time} ({tz})",
+           "yesterday": "Včera v {time} ({tz})",
+           "date": "{date} v {time} ({tz})"},
+    "hu": {"today": "Ma {time}-kor ({tz})",
+           "yesterday": "Tegnap {time}-kor ({tz})",
+           "date": "{date}, {time} ({tz})"},
+    "el": {"today": "Σήμερα στις {time} ({tz})",
+           "yesterday": "Χθες στις {time} ({tz})",
+           "date": "{date} στις {time} ({tz})"},
+    "bg": {"today": "Днес в {time} ({tz})",
+           "yesterday": "Вчера в {time} ({tz})",
+           "date": "{date} в {time} ({tz})"},
+    "sv": {"today": "Idag kl {time} ({tz})",
+           "yesterday": "Igår kl {time} ({tz})",
+           "date": "{date} kl {time} ({tz})"},
+}
+
+
+def date_template(lang: str | None, kind: str) -> str:
+    """Return the «today / yesterday / date» template for a language.
+
+    Falls back to Russian phrasing when the language isn't on the
+    supported-list or `kind` isn't one of {today, yesterday, date}."""
+    table = _DATE_TEMPLATES.get((lang or "ru").lower(), _DATE_TEMPLATES["ru"])
+    return table.get(kind, _DATE_TEMPLATES["ru"][kind])
+
+
 def language_keyboard(back_callback: str | None = None) -> InlineKeyboardMarkup:
     """2-column grid of language buttons.
 

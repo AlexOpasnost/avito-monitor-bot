@@ -17,7 +17,7 @@ from parser import (
     download_image_bytes,
     fetch_search_items,
 )
-from bot_i18n import default_tz_for_lang, timezone_short
+from bot_i18n import date_template, default_tz_for_lang, timezone_short
 from parsers import source_display_name
 from parsers.common import proxy_for_source
 from parsers.currency import format_with_estimate
@@ -381,7 +381,7 @@ async def _send_notification(
     text = _format_notification(
         item, title=title, description=description, condition=condition,
         user_currency=(prefs.get("currency") or "rub").upper(),
-        user_tz=tz,
+        user_tz=tz, user_lang=lang,
     )
     button_text = _source_button_text(item.source)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -433,6 +433,7 @@ def _format_notification(
     condition: str | None = None,
     user_currency: str = "RUB",
     user_tz: str = "Europe/Moscow",
+    user_lang: str = "ru",
 ) -> str:
     """Unified pretty notification format.
 
@@ -478,7 +479,7 @@ def _format_notification(
     title_html = _escape(raw_title) or "Без названия"
     price_native = _escape(_format_price(item, user_currency)) or "Цена не указана"
     location = _escape(item.location) or "—"
-    when = _format_when_local(item.published_timestamp, user_tz)
+    when = _format_when_local(item.published_timestamp, user_tz, user_lang)
 
     lines = [
         f"<b>{title_html}</b>",
@@ -514,10 +515,16 @@ def _format_price(item: AvitoItem, user_currency: str) -> str:
     return item.price or "Цена не указана"
 
 
-def _format_when_local(ts: int | None, tz_name: str = "Europe/Moscow") -> str:
-    """Pretty-print a unix timestamp in the user's timezone with a short
-    suffix (МСК / Мадрид / Токио / …). Same-day ads show «Сегодня в
-    HH:MM», one-day-old show «Вчера в HH:MM», older ones «DD.MM в HH:MM».
+def _format_when_local(
+    ts: int | None,
+    tz_name: str = "Europe/Moscow",
+    lang: str = "ru",
+) -> str:
+    """Pretty-print a unix timestamp in the user's timezone + language.
+
+    Same-day ads → «Today at HH:MM (City)»; previous-day → «Yesterday
+    at HH:MM (City)»; older → «DD.MM at HH:MM (City)». Phrasing follows
+    `lang` (RU / EN / ES / PL / …), city tag follows `tz_name`.
 
     Falls back to UTC if the IANA name isn't on the system tzdb (which
     shouldn't happen — `tzdata` package is in requirements.txt — but a
@@ -534,12 +541,16 @@ def _format_when_local(ts: int | None, tz_name: str = "Europe/Moscow") -> str:
     dt = datetime.fromtimestamp(ts, tz)
     now = datetime.now(tz)
     hhmm = dt.strftime("%H:%M")
-    suffix = "UTC" if tz is timezone.utc else timezone_short(tz_name)
+    tz_short = "UTC" if tz is timezone.utc else timezone_short(tz_name)
+
     if dt.date() == now.date():
-        return f"Сегодня в {hhmm} ({suffix})"
-    if dt.date() == (now.date() - timedelta(days=1)):
-        return f"Вчера в {hhmm} ({suffix})"
-    return f"{dt.strftime('%d.%m')} в {hhmm} ({suffix})"
+        kind = "today"
+    elif dt.date() == (now.date() - timedelta(days=1)):
+        kind = "yesterday"
+    else:
+        kind = "date"
+    template = date_template(lang, kind)
+    return template.format(date=dt.strftime("%d.%m"), time=hhmm, tz=tz_short)
 
 
 def _escape(s: str) -> str:

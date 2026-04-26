@@ -96,6 +96,12 @@ _LOCATION_RE = re.compile(
     r'\\"text\\":\\"([^"]+?)\\",\\"key\\":\\"location\\"'
     r'|\\"key\\":\\"location\\",\\"text\\":\\"([^"]+?)\\"'
 )
+
+# Fallback patterns — some items omit the user_info "location" entry
+# but still ship the seller's city/country in separate React-stream
+# fields. We stitch them together as "<city>, <country>" when present.
+_FALLBACK_CITY_RE = re.compile(r'\\"city\\":\\"([^"\\]+)\\"')
+_FALLBACK_COUNTRY_RE = re.compile(r'\\"country_title_local\\":\\"([^"\\]+)\\"')
 _ENRICH_CACHE: dict[int, tuple[dict, float]] = {}
 _ENRICH_TTL = 24 * 3600.0
 # Hard cap on per-cycle item-page fetches so a fresh seed doesn't
@@ -446,27 +452,51 @@ def _extract_description_from_html(html: str) -> str | None:
 
 
 def _extract_location_from_html(html: str) -> str | None:
-    """Pull `<city>, <country>` out of the user_info block in the
-    React-stream JSON near the end of the item HTML."""
-    m = _LOCATION_RE.search(html)
-    if not m:
-        return None
-    # Either group 1 (text-then-key order) or group 2 (key-then-text)
-    # matched — pick whichever is present.
-    raw = (m.group(1) or m.group(2) or "").strip()
-    if not raw:
-        return None
-    # Captured value may carry JSON `\uXXXX` escapes for non-ASCII
-    # cities. Round-trip through json.loads to decode them, but fall
-    # back to the raw value if the wrapper makes it un-parseable.
+    """Pull `<city>, <country>` out of the React-stream JSON near the
+    end of the item HTML.
+
+    Tries three sources in order:
+      1. user_info `text:<X>,key:location` block (preferred — already
+         pre-formatted as "City, Country" in the seller's locale).
+      2. Separate `city` + `country_title_local` fields, stitched.
+      3. `city` alone if country isn't there.
+    """
     import json as _json
-    try:
-        decoded = _json.loads(f'"{raw}"')
-        if isinstance(decoded, str) and decoded.strip():
-            return decoded.strip()
-    except Exception:
-        pass
-    return raw
+
+    def _decode(raw: str) -> str | None:
+        s = raw.strip()
+        if not s:
+            return None
+        # Captured value may carry JSON `\uXXXX` escapes for non-ASCII
+        # cities. Round-trip through json.loads to decode them, but
+        # fall back to the raw value if the wrapper makes it un-parseable.
+        try:
+            decoded = _json.loads(f'"{s}"')
+            if isinstance(decoded, str) and decoded.strip():
+                return decoded.strip()
+        except Exception:
+            pass
+        return s
+
+    m = _LOCATION_RE.search(html)
+    if m:
+        raw = m.group(1) or m.group(2) or ""
+        out = _decode(raw)
+        if out:
+            return out
+
+    # Fallback: stitch city + country from separate fields.
+    city_m = _FALLBACK_CITY_RE.search(html)
+    country_m = _FALLBACK_COUNTRY_RE.search(html)
+    city = _decode(city_m.group(1)) if city_m else None
+    country = _decode(country_m.group(1)) if country_m else None
+    if city and country:
+        return f"{city}, {country}"
+    if city:
+        return city
+    if country:
+        return country
+    return None
 
 
 def _metadata_from_cache(item_id: int) -> dict | None:

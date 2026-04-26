@@ -1238,7 +1238,8 @@ def test_bot_i18n_lists_consistent():
 
 
 def test_format_when_local():
-    """Render timestamps in the user's TZ with a localised suffix."""
+    """Render timestamps in the user's TZ + language with the right
+    phrasing per locale."""
     from datetime import datetime, timezone
     from scheduler import _format_when_local
 
@@ -1248,16 +1249,68 @@ def test_format_when_local():
 
     # A fixed timestamp: 2026-04-26 12:00:00 UTC = 15:00 МСК = 14:00 CEST.
     ts = int(datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc).timestamp())
-    moscow = _format_when_local(ts, "Europe/Moscow")
-    madrid = _format_when_local(ts, "Europe/Madrid")
-    assert "15:00" in moscow and "МСК" in moscow
-    assert "14:00" in madrid and "Мадрид" in madrid
+    moscow_ru = _format_when_local(ts, "Europe/Moscow", "ru")
+    madrid_ru = _format_when_local(ts, "Europe/Madrid", "ru")
+    assert "15:00" in moscow_ru and "МСК" in moscow_ru
+    assert "14:00" in madrid_ru and "Мадрид" in madrid_ru
+
+    # English phrasing — "Today at" / "Yesterday at"
+    madrid_en = _format_when_local(ts, "Europe/Madrid", "en")
+    assert "14:00" in madrid_en and "Мадрид" in madrid_en
+    assert madrid_en.startswith(("Today at", "Yesterday at")) or "at " in madrid_en
+
+    # Spanish phrasing — "Hoy a las" / "Ayer a las"
+    madrid_es = _format_when_local(ts, "Europe/Madrid", "es")
+    assert "14:00" in madrid_es
+    assert "Hoy" in madrid_es or "Ayer" in madrid_es or "a las" in madrid_es
+
+    # Polish — "Dziś o" / "Wczoraj o"
+    warsaw_pl = _format_when_local(ts, "Europe/Warsaw", "pl")
+    assert ("Dziś" in warsaw_pl or "Wczoraj" in warsaw_pl
+            or "o " in warsaw_pl)
+
+    # Unknown language falls back to RU phrasing
+    moscow_xx = _format_when_local(ts, "Europe/Moscow", "xx")
+    assert "Сегодня" in moscow_xx or "Вчера" in moscow_xx or " в " in moscow_xx
 
     # Bad TZ falls back to UTC, doesn't crash
-    bad = _format_when_local(ts, "Mars/Olympus")
+    bad = _format_when_local(ts, "Mars/Olympus", "en")
     assert "12:00" in bad and "UTC" in bad
 
     print("OK: scheduler _format_when_local")
+
+
+def test_vinted_location_fallback():
+    """When user_info doesn't carry the location entry, fall back to
+    stitching `city` + `country_title_local`."""
+    from parsers.vinted import _extract_location_from_html as _loc
+
+    # Primary path still wins when present
+    primary = (
+        '<html>...{ a:b }... \\"text\\":\\"Paris, Francia\\",'
+        '\\"key\\":\\"location\\" ...</html>'
+    )
+    assert _loc(primary) == "Paris, Francia"
+
+    # Fallback: only city + country_title_local exposed
+    fallback_both = (
+        '<html>{"some":"thing"}\\"city\\":\\"Madrid\\"...'
+        '\\"country_title_local\\":\\"España\\"...</html>'
+    )
+    assert _loc(fallback_both) == "Madrid, España"
+
+    # City alone (no country)
+    fallback_city = '<html>...\\"city\\":\\"Berlin\\"...</html>'
+    assert _loc(fallback_city) == "Berlin"
+
+    # Country alone (no city)
+    fallback_country = '<html>...\\"country_title_local\\":\\"Italia\\"...</html>'
+    assert _loc(fallback_country) == "Italia"
+
+    # Nothing at all → None
+    assert _loc("<html>no location here</html>") is None
+
+    print("OK: vinted _extract_location_from_html (with fallback)")
 
 
 if __name__ == "__main__":
@@ -1315,4 +1368,5 @@ if __name__ == "__main__":
     test_format_notification_includes_condition_and_user_currency()
     test_bot_i18n_lists_consistent()
     test_format_when_local()
+    test_vinted_location_fallback()
     print("\nALL UNIT TESTS PASSED")
