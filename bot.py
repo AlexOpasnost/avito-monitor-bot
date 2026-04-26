@@ -69,13 +69,14 @@ async def main():
             loop.add_signal_handler(sig, shutdown_handler)
 
     # Slash-command menu (the blue "Menu" button in Telegram).
+    # /settings is folded into /profile (lang/currency live there now)
+    # so we don't expose two doors to the same screen.
     await bot.set_my_commands([
-        BotCommand(command="start",    description="Главное меню"),
-        BotCommand(command="list",     description="Мои поиски"),
-        BotCommand(command="profile",  description="Профиль и статистика"),
-        BotCommand(command="settings", description="Язык и валюта"),
-        BotCommand(command="stop",     description="Поставить на паузу"),
-        BotCommand(command="help",     description="Как это работает"),
+        BotCommand(command="start",   description="Главное меню"),
+        BotCommand(command="list",    description="Мои поиски"),
+        BotCommand(command="profile", description="Профиль и настройки"),
+        BotCommand(command="stop",    description="Поставить на паузу"),
+        BotCommand(command="help",    description="Как это работает"),
     ])
 
     # Bot description: shown on the "Open bot" landing page above the

@@ -77,8 +77,13 @@ def currency_label(code: str | None) -> str:
     return code.upper()
 
 
-def language_keyboard() -> InlineKeyboardMarkup:
-    """2-column grid of language buttons."""
+def language_keyboard(back_callback: str | None = None) -> InlineKeyboardMarkup:
+    """2-column grid of language buttons.
+
+    If `back_callback` is given, an extra «⬅️ Назад» row is appended —
+    used when entering the picker from profile (so the user can cancel
+    without picking). Onboarding leaves it off so the user must choose.
+    """
     rows = []
     row = []
     for code, label in LANGUAGES:
@@ -90,11 +95,13 @@ def language_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    if back_callback:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def currency_keyboard() -> InlineKeyboardMarkup:
-    """2-column grid of currency buttons."""
+def currency_keyboard(back_callback: str | None = None) -> InlineKeyboardMarkup:
+    """2-column grid of currency buttons + optional «⬅️ Назад»."""
     rows = []
     row = []
     for code, label in CURRENCIES:
@@ -106,17 +113,22 @@ def currency_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    if back_callback:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Top-level inline menu, top-bot style.
+    """Top-level inline menu.
 
     Layout:
-        ➕ Добавить поиск           (full row — primary action)
-        📋 Мои поиски  | 👤 Профиль (paired)
-        💎 Тарифы      | ⚙️ Настройки
-        ❓ Помощь                   (full row)
+        ➕ Добавить поиск
+        📋 Мои поиски   | 👤 Профиль
+        💎 Тарифы
+        ❓ Помощь
+
+    Settings (language / currency) lives inside the Profile screen now,
+    so the main grid stays uncluttered.
     """
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить поиск", callback_data="menu:add")],
@@ -124,10 +136,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📋 Мои поиски",  callback_data="menu:list"),
             InlineKeyboardButton(text="👤 Профиль",     callback_data="menu:profile"),
         ],
-        [
-            InlineKeyboardButton(text="💎 Тарифы",      callback_data="menu:tariffs"),
-            InlineKeyboardButton(text="⚙️ Настройки",   callback_data="menu:settings"),
-        ],
+        [InlineKeyboardButton(text="💎 Тарифы",         callback_data="menu:tariffs")],
         [InlineKeyboardButton(text="❓ Помощь",         callback_data="menu:help")],
     ])
 
