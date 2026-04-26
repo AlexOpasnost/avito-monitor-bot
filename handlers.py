@@ -384,7 +384,6 @@ async def callback_set_timezone(callback: CallbackQuery):
 # (id, label, price_pretty, limits, footnote_or_None)
 _TARIFFS = [
     ("trial",    "🎁 Пробный",          "Бесплатно",     "1 поиск, 6 часов",   "(только один раз)"),
-    ("intro",    "🚀 Ознакомительный",  "69 ₽",          "1 поиск, 24 часа",   None),
     ("basic",    "💎 Базовый",          "890 ₽/мес",     "1 поиск, 30 дней",   None),
     ("advanced", "⚡ Продвинутый",       "1 790 ₽/мес",   "3 поиска, 30 дней",  None),
     ("pro",      "👑 Профессиональный", "2 590 ₽/мес",   "5 поисков, 30 дней", None),
