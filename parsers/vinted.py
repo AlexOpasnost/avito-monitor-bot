@@ -104,6 +104,9 @@ _FALLBACK_CITY_RE = re.compile(r'\\"city\\":\\"([^"\\]+)\\"')
 _FALLBACK_COUNTRY_RE = re.compile(r'\\"country_title_local\\":\\"([^"\\]+)\\"')
 _ENRICH_CACHE: dict[int, tuple[dict, float]] = {}
 _ENRICH_TTL = 24 * 3600.0
+# Memory cap — long-running prod accumulates entries faster than the
+# 24h TTL decay. Drop the oldest half when we hit the ceiling.
+_ENRICH_CACHE_MAX = 5000
 # Hard cap on per-cycle item-page fetches so a fresh seed doesn't
 # stampede DataDome (or blow the request budget). At 1.5s spacing
 # this caps the verify pass at ~45s per cycle — under the 60s tick.
@@ -405,6 +408,10 @@ def _fetch_item_metadata_sync(
             "description": _extract_description_from_html(html),
             "location": loc,
         }
+        if len(_ENRICH_CACHE) >= _ENRICH_CACHE_MAX:
+            keys = list(_ENRICH_CACHE.keys())[: _ENRICH_CACHE_MAX // 2]
+            for k in keys:
+                _ENRICH_CACHE.pop(k, None)
         _ENRICH_CACHE[item_id] = (meta, now)
         return meta
     except Exception as e:

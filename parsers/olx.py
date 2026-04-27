@@ -83,6 +83,8 @@ _PROMOTED_MARKERS = (
 # change.
 _CATEGORY_CACHE: dict[str, tuple[int, float]] = {}
 _CATEGORY_TTL = 3600.0
+# Bound the cache so a churn of unique URLs doesn't grow it forever.
+_CATEGORY_CACHE_MAX = 2000
 
 
 class OlxSource:
@@ -289,6 +291,10 @@ async def _extract_category_id(url: str, proxy: str | None) -> int | None:
             item_id, url[:100],
         )
         return None
+    if len(_CATEGORY_CACHE) >= _CATEGORY_CACHE_MAX:
+        keys = list(_CATEGORY_CACHE.keys())[: _CATEGORY_CACHE_MAX // 2]
+        for k in keys:
+            _CATEGORY_CACHE.pop(k, None)
     _CATEGORY_CACHE[url] = (cid, now)
     logger.info("[olx] resolved category_id=%d via item %d (cached 1h)", cid, item_id)
     return cid

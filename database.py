@@ -317,6 +317,34 @@ class Database:
             }
         return await self._execute(_op)
 
+    async def has_active_tariff(self, telegram_id: int) -> bool:
+        """True when the user owns either:
+          - tariff='legacy' (no expiry, grandfathered before paywall)
+          - any other tariff with tariff_expires_at > now
+
+        Returns False for free/expired/missing users. Used by the
+        scheduler to gate notifications: a paid Pro user whose 30 days
+        ran out shouldn't keep getting free updates on their old subs.
+        Admins are checked separately in the scheduler against
+        config.admin_ids and bypass this DB lookup.
+        """
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT tariff, tariff_expires_at FROM users "
+                "WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if not row:
+                return False
+            tariff = row["tariff"]
+            if tariff == "legacy":
+                return True
+            exp = row["tariff_expires_at"]
+            if not tariff or not exp:
+                return False
+            return exp > datetime.now(timezone.utc)
+        return await self._execute(_op)
+
     async def get_user_prefs_by_telegram(self, telegram_id: int) -> dict:
         """Same as get_user_prefs but keyed by telegram_id — used by the
         scheduler when sending notifications without a cached user_id."""

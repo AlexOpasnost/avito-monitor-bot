@@ -50,6 +50,11 @@ _ENRICH_CACHE: dict[str, dict] = {}
 _ENRICH_TTL = 24 * 3600
 _ENRICH_DELAY = 0.2
 _ENRICH_TIMEOUT = 8.0
+# Long-running prod with thousands of items per day will accumulate
+# entries faster than the 24h TTL natural decay; cap the dict and
+# evict the oldest half when we hit the ceiling so memory doesn't
+# grow unbounded over the lifetime of a Railway deploy.
+_ENRICH_CACHE_MAX = 5000
 
 
 class MercariSource:
@@ -207,6 +212,13 @@ async def _enrich_items(items: list[SearchItem], m) -> None:
         if seller_v:
             it.seller_name = seller_v
 
+        if len(_ENRICH_CACHE) >= _ENRICH_CACHE_MAX:
+            # Crude LRU: drop the oldest half. CPython 3.7+ dicts
+            # preserve insertion order, which approximates LRU well
+            # enough for our use case.
+            keys = list(_ENRICH_CACHE.keys())[: _ENRICH_CACHE_MAX // 2]
+            for k in keys:
+                _ENRICH_CACHE.pop(k, None)
         _ENRICH_CACHE[it.external_id] = {
             "ts": now,
             "location": loc,

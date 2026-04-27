@@ -203,15 +203,30 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
     # _send_notification with a shared cache keyed by (text_hash, lang),
     # so multiple subscriptions in the same language reuse work.
     prefs = await db.get_user_prefs_by_telegram(sub["telegram_id"])
+
+    # Tariff gate — a user whose paid tier has expired keeps their
+    # subscriptions on the books but gets nothing pushed to their chat.
+    # Items still get marked as seen below so a renewal doesn't flood
+    # them with backlog. Admins (config.admin_ids) bypass.
+    tg_id = sub["telegram_id"]
+    is_admin_user = tg_id in (config.admin_ids or [])
+    allow_send = is_admin_user or await db.has_active_tariff(tg_id)
+    if not allow_send:
+        logger.info(
+            "Sub #%d (tg=%d): tariff inactive — skipping %d notifications",
+            sub["id"], tg_id, len(to_send),
+        )
+
     sent_keys: set[tuple[str, str]] = set()
-    for item in to_send:
-        try:
-            await _send_notification(bot, sub, item, prefs)
-            sent_keys.add((item.source, item.external_id))
-            await db.mark_item_sent(sub["id"], item.external_id, source=item.source)
-        except Exception as e:
-            logger.warning("Send failed for %s/%s: %s", item.source, item.external_id, e)
-        await asyncio.sleep(0.5)
+    if allow_send:
+        for item in to_send:
+            try:
+                await _send_notification(bot, sub, item, prefs)
+                sent_keys.add((item.source, item.external_id))
+                await db.mark_item_sent(sub["id"], item.external_id, source=item.source)
+            except Exception as e:
+                logger.warning("Send failed for %s/%s: %s", item.source, item.external_id, e)
+            await asyncio.sleep(0.5)
 
     # Mark leftovers as seen so we don't re-process them next cycle
     leftover_by_source: dict[str, list[str]] = {}

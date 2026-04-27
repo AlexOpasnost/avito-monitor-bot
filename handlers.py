@@ -20,6 +20,7 @@ commands and free-text URL pastes still send fresh messages.
 Slash commands (/list /profile /settings /help / ...) work for power
 users; they short-circuit straight to the relevant submenu.
 """
+import html as _html
 import logging
 import re
 
@@ -865,8 +866,14 @@ async def _show_subscription_list(target):
             f" ⚠️ ошибок: {sub['error_count']}" if sub["error_count"] > 0 else ""
         )
         name = _sub_display_name(sub)
+        # Names + URLs come from the user / marketplace, escape before
+        # inlining into HTML mode. Inline-button text is plain (Telegram
+        # doesn't parse HTML there) so the name in callback button is
+        # left raw.
+        safe_name = _html.escape(name)
+        safe_url = _html.escape(sub["url"], quote=True)
         lines.append(
-            f"<b>{i}.</b> <a href=\"{sub['url']}\">{name}</a>\n"
+            f"<b>{i}.</b> <a href=\"{safe_url}\">{safe_name}</a>\n"
             f"   Последняя проверка: {checked_str}{errors}"
         )
         rename_buttons.append([InlineKeyboardButton(
@@ -1031,7 +1038,7 @@ async def _admin_users_list(message: Message):
         username = r.get("username") or "—"
         lifetime = (r.get("lifetime_paid") or 0) // 100
         lines.append(
-            f"<code>{r['telegram_id']}</code> @{username} · "
+            f"<code>{r['telegram_id']}</code> @{_html.escape(username)} · "
             f"{tariff_label} · {exp_str} · "
             f"📋{r['active_subs']} · 💰{lifetime:,}₽"
         )
@@ -1057,8 +1064,9 @@ async def _admin_user_detail(message: Message, target_tg: int):
         if u.get("tariff_expires_at") else "—"
     )
 
+    safe_username = _html.escape(u.get("username") or "—")
     lines = [
-        f"👤 <b>@{u.get('username') or '—'}</b> "
+        f"👤 <b>@{safe_username}</b> "
         f"(<code>{u['telegram_id']}</code>)",
         f"📅 Регистрация: <b>{reg_str}</b>",
         f"💎 Тариф: <b>{tariff_label}</b> до {exp_str}",
@@ -1074,7 +1082,8 @@ async def _admin_user_detail(message: Message, target_tg: int):
             status = "🟢" if s["is_active"] else "⏸"
             errs = f" ⚠️{s['error_count']}" if (s.get("error_count") or 0) > 0 else ""
             lines.append(
-                f"  {status} #{s['id']} {name} ({s.get('source') or '—'}){errs}"
+                f"  {status} #{s['id']} {_html.escape(name)} "
+                f"({s.get('source') or '—'}){errs}"
             )
         if len(subs) > 10:
             lines.append(f"  <i>… и ещё {len(subs) - 10}</i>")
@@ -1155,7 +1164,7 @@ async def callback_rename(callback: CallbackQuery, state: FSMContext):
 
     text = (
         f"✏️ <b>Новое название</b>\n\n"
-        f"Сейчас: <b>{current}</b>\n\n"
+        f"Сейчас: <b>{_html.escape(current)}</b>\n\n"
         f"Пришли новое название следующим сообщением (до {_MAX_NAME_LEN} символов).\n"
         f"<i>/cancel — отмена</i>"
     )
@@ -1209,7 +1218,7 @@ async def handle_rename_input(message: Message, state: FSMContext):
         return
 
     await message.answer(
-        f"✅ Поиск переименован в <b>{raw}</b>.",
+        f"✅ Поиск переименован в <b>{_html.escape(raw)}</b>.",
         parse_mode="HTML",
     )
     await _show_subscription_list(message)
