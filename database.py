@@ -1,7 +1,7 @@
 import asyncio
 import asyncpg
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import config
 
@@ -427,23 +427,37 @@ class Database:
         `max_subscriptions` is the per-tariff cap resolved by the caller.
         Falls back to config.max_subscriptions for legacy callers that
         haven't been updated to look up the tariff yet.
+
+        COUNT + INSERT runs inside a transaction with SELECT FOR UPDATE
+        on the user row so two concurrent adds (e.g. user clicks the
+        same URL on phone and desktop simultaneously) can't both pass
+        the limit check and exceed the cap by 1.
         """
         if max_subscriptions is None:
             max_subscriptions = config.max_subscriptions
         async def _op(conn):
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions "
-                "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
-                user_id,
-            )
-            if count >= max_subscriptions:
-                return None
-            row = await conn.fetchrow(
-                "INSERT INTO subscriptions (user_id, url, source) "
-                "VALUES ($1, $2, $3) RETURNING id",
-                user_id, url, source,
-            )
-            return row["id"]
+            async with conn.transaction():
+                # Lock the user row so concurrent add_subscription
+                # calls for the same user serialise on this row. The
+                # SELECT FOR UPDATE blocks the second caller until
+                # the first commits, then it sees the updated count.
+                await conn.fetchval(
+                    "SELECT id FROM users WHERE id = $1 FOR UPDATE",
+                    user_id,
+                )
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM subscriptions "
+                    "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
+                    user_id,
+                )
+                if count >= max_subscriptions:
+                    return None
+                row = await conn.fetchrow(
+                    "INSERT INTO subscriptions (user_id, url, source) "
+                    "VALUES ($1, $2, $3) RETURNING id",
+                    user_id, url, source,
+                )
+                return row["id"]
         return await self._execute(_op)
 
     async def count_active_subs(self, user_id: int) -> int:
