@@ -1101,6 +1101,103 @@ async def _admin_user_detail(message: Message, target_tg: int):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@router.message(Command("testbuy"))
+async def cmd_testbuy(message: Message):
+    """Admin-only: trigger the real payment flow for a given tariff.
+
+    Bypasses the «admins don't pay» short-circuit on the inline buy
+    buttons (which is there to protect against accidental clicks
+    during demos). Use this command deliberately to verify YooKassa
+    integration end-to-end with a real card / SBP.
+
+    Usage: /testbuy <tariff_id>
+      tariff_id ∈ trial / basic / advanced / pro
+
+    The successful_payment handler will record the payment and write
+    the tariff to DB, but the admin still resolves to 'admin' tariff
+    at runtime via is_admin() — so admin status is not affected.
+    """
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/testbuy &lt;tariff_id&gt;</code>\n\n"
+            "<b>Доступные:</b>\n"
+            "• <code>/testbuy trial</code> — 0 ₽ (один раз на юзера)\n"
+            "• <code>/testbuy basic</code> — 890 ₽\n"
+            "• <code>/testbuy advanced</code> — 1 790 ₽\n"
+            "• <code>/testbuy pro</code> — 2 590 ₽\n\n"
+            "<i>Реальная оплата (или возврат через YooKassa-дашборд "
+            "после теста). Админ-статус не меняется — у тебя останется "
+            "безлимит независимо от платежа.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    tariff_id = parts[1].lower()
+    rules = _TARIFF_RULES.get(tariff_id)
+    if rules is None or tariff_id in ("legacy", "admin"):
+        await message.answer(
+            f"Неизвестный тариф: <code>{_html.escape(tariff_id)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+    meta = _tariff_meta(tariff_id)
+    name = meta[1] if meta else tariff_id
+
+    # Trial — same atomic activation as the normal flow.
+    if tariff_id == "trial":
+        new_exp = await db.activate_tariff(
+            user_id, "trial", rules["hours"], is_trial=True,
+        )
+        if new_exp is None:
+            await message.answer(
+                "Trial у этого аккаунта уже был активирован. "
+                "Тестируй платный тариф или сбрось <code>trial_used</code> "
+                "вручную в БД.",
+                parse_mode="HTML",
+            )
+            return
+        await message.answer(
+            f"✅ Trial активирован для теста ({name}). "
+            f"Админ-статус не изменился."
+        )
+        return
+
+    if not config.payment_provider_token:
+        await message.answer(
+            "PAYMENT_PROVIDER_TOKEN не настроен в env vars — "
+            "оплата не запустится."
+        )
+        return
+
+    try:
+        await message.bot.send_invoice(
+            chat_id=message.chat.id,
+            title=f"[TEST] AutoSearch — {name}",
+            description=(
+                f"Тестовая покупка от админа: {meta[3] if meta else ''}"
+            ),
+            payload=f"tariff:{tariff_id}",
+            provider_token=config.payment_provider_token,
+            currency="RUB",
+            prices=[LabeledPrice(label=name, amount=rules["kopeks"])],
+            need_name=False, need_email=False, need_phone_number=False,
+            send_phone_number_to_provider=False,
+            send_email_to_provider=False,
+            is_flexible=False,
+        )
+    except Exception:
+        logger.exception("[testbuy] send_invoice failed for tariff=%s", tariff_id)
+        await message.answer("Не получилось открыть оплату — гляну логи.")
+
+
 @router.message(Command("stop"))
 async def cmd_stop(message: Message):
     user_id = await db.get_or_create_user(
