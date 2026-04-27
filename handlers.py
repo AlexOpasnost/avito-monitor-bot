@@ -21,6 +21,7 @@ Slash commands (/list /profile /settings /help / ...) work for power
 users; they short-circuit straight to the relevant submenu.
 """
 import html as _html
+import json
 import logging
 import re
 
@@ -33,11 +34,11 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    LabeledPrice,
     Message,
-    PreCheckoutQuery,
 )
 from datetime import datetime, timezone
+
+from services import yookassa as yk
 
 from bot_i18n import (
     LANGUAGE_CODES, CURRENCY_CODES, TIMEZONE_CODES,
@@ -595,151 +596,93 @@ async def callback_buy_tariff(callback: CallbackQuery):
         await callback.answer()
         return
 
-    _, name, price, limits, _ = meta
-    bot = callback.bot
-    try:
-        await bot.send_invoice(
-            chat_id=callback.message.chat.id,
-            title=f"AutoSearch — {name}",
-            description=limits,
-            # payload echoes back in successful_payment so we can map
-            # «what was paid for» without trusting client-side state.
-            payload=f"tariff:{tariff_id}",
-            provider_token=config.payment_provider_token,
-            currency="RUB",
-            prices=[LabeledPrice(label=name, amount=rules["kopeks"])],
-            need_name=False, need_email=False, need_phone_number=False,
-            send_phone_number_to_provider=False,
-            send_email_to_provider=False,
-            is_flexible=False,
+    # Paid tariff via YooKassa REST API. The user clicks a button
+    # that takes them to YooKassa's hosted payment page where they
+    # pick СБП / card / SberPay / etc. After they pay, YooKassa
+    # POSTs our /webhook/yookassa endpoint and that handler
+    # activates the tariff (see webhook.py).
+    if not (config.yookassa_shop_id and config.yookassa_secret_key
+            and config.webhook_base_url):
+        contact = (
+            f"Оплата временно недоступна. Напиши {config.support_handle}."
+            if config.support_handle
+            else "Оплата временно недоступна. Попробуйте позже."
         )
-    except Exception:
-        logger.exception("send_invoice failed for tariff=%s", tariff_id)
+        _, name, price, limits, _ = meta
+        text = (
+            f"<b>{name}</b>\n\n"
+            f"💰 Стоимость: <b>{price}</b>\n"
+            f"📦 Что входит: <b>{limits}</b>\n\n{contact}"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К тарифам",    callback_data="menu:tariffs")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+        ])
+        await _present(callback, text, keyboard=keyboard)
+        await callback.answer()
+        return
+
+    await _start_yookassa_payment(callback, tariff_id, meta, rules)
+
+
+async def _start_yookassa_payment(
+    callback: CallbackQuery, tariff_id: str, meta, rules: dict,
+):
+    """Create a YooKassa payment and reply with the «Оплатить» URL
+    button. Activation happens later via the webhook (see webhook.py)."""
+    _, name, price, limits, _ = meta
+    rub_amount = rules["kopeks"] / 100.0
+
+    receipt_items = [yk.build_receipt_item(name, rub_amount)]
+    metadata = {
+        "telegram_id": str(callback.from_user.id),
+        "tariff_id": tariff_id,
+    }
+    bot_username = (await callback.bot.me()).username
+    return_url = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+
+    try:
+        payment = await yk.create_payment(
+            shop_id=config.yookassa_shop_id,
+            secret_key=config.yookassa_secret_key,
+            amount_rub=rub_amount,
+            description=f"AutoSearch — {name}",
+            metadata=metadata,
+            return_url=return_url,
+            receipt_items=receipt_items,
+        )
+    except yk.YooKassaError:
+        logger.exception("[payment] create_payment failed for tariff=%s", tariff_id)
         await callback.answer(
             "Не получилось открыть оплату. Попробуй чуть позже.",
             show_alert=True,
         )
         return
+
+    confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
+    if not confirmation_url:
+        logger.error("[payment] no confirmation_url in YooKassa response: %s", payment)
+        await callback.answer(
+            "ЮKassa не вернула ссылку на оплату — попробуй ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    text = (
+        f"<b>{name}</b>\n\n"
+        f"💰 Стоимость: <b>{price}</b>\n"
+        f"📦 Что входит: <b>{limits}</b>\n\n"
+        f"Жми кнопку ниже — откроется страница ЮKassa с выбором способа "
+        f"оплаты (карта, СБП, SberPay, ЮMoney). После оплаты тариф "
+        f"активируется автоматически — вернись в Telegram."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {price}", url=confirmation_url)],
+        [InlineKeyboardButton(text="⬅️ К тарифам",    callback_data="menu:tariffs")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+    ])
+    await _present(callback, text, keyboard=keyboard)
     await callback.answer()
-
-
-@router.pre_checkout_query()
-async def pre_checkout_handler(query: PreCheckoutQuery):
-    """Always approve the pre-checkout — Telegram requires a reply
-    within 10 seconds or the payment fails. Validation of payload
-    happens in successful_payment after the user actually pays."""
-    try:
-        await query.bot.answer_pre_checkout_query(query.id, ok=True)
-    except Exception:
-        logger.exception("answer_pre_checkout_query failed")
-
-
-@router.message(F.successful_payment)
-async def successful_payment_handler(message: Message):
-    """Activate the purchased tariff once Telegram confirms payment.
-
-    Telegram + YooKassa have already verified the money. We need to:
-    1. Validate the payload was something we sent.
-    2. Idempotency: skip if Telegram is retrying delivery of a charge
-       we already processed (telegram_payment_charge_id is unique).
-    3. Activate the tariff. If activation crashes (DB down), tell the
-       user to contact support and log the charge id so we can recover
-       manually — the money is real, the user must not silently lose it.
-    """
-    sp = message.successful_payment
-    payload = (sp.invoice_payload or "") if sp else ""
-    if not sp or not payload.startswith("tariff:"):
-        logger.warning("[payment] unknown payload: %r", payload)
-        return
-    tariff_id = payload.split(":", 1)[1]
-    rules = _TARIFF_RULES.get(tariff_id)
-    if rules is None or tariff_id in ("trial", "legacy"):
-        # `trial` and `legacy` shouldn't go through Telegram Payments —
-        # log and ignore to avoid double-applying.
-        logger.warning("[payment] paid invoice for non-purchasable tariff=%s", tariff_id)
-        return
-
-    user_id = await db.get_or_create_user(
-        message.from_user.id, message.from_user.username,
-    )
-
-    # Idempotency: only the first delivery of this charge_id
-    # progresses past this point. A retry hits ON CONFLICT and we
-    # politely re-confirm without re-extending the expiry.
-    try:
-        is_new = await db.record_payment(
-            telegram_charge_id=sp.telegram_payment_charge_id,
-            provider_charge_id=getattr(sp, "provider_payment_charge_id", None),
-            user_id=user_id,
-            tariff_id=tariff_id,
-            amount_minor=sp.total_amount,
-            currency=sp.currency,
-        )
-    except Exception:
-        logger.exception(
-            "[payment] record_payment failed — "
-            "tg_charge=%s provider_charge=%s user=%d tariff=%s amount=%d/%s",
-            sp.telegram_payment_charge_id,
-            getattr(sp, "provider_payment_charge_id", None),
-            user_id, tariff_id, sp.total_amount, sp.currency,
-        )
-        await _payment_recovery_message(message, sp, tariff_id)
-        return
-
-    if not is_new:
-        logger.info(
-            "[payment] duplicate delivery — tg_charge=%s already processed",
-            sp.telegram_payment_charge_id,
-        )
-        await message.answer(
-            "✅ Оплата уже была подтверждена ранее. Тариф активен.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    try:
-        new_exp = await db.activate_tariff(
-            user_id, tariff_id, rules["hours"], is_trial=False,
-        )
-    except Exception:
-        logger.exception(
-            "[payment] activate_tariff failed AFTER recording charge — "
-            "tg_charge=%s user=%d tariff=%s",
-            sp.telegram_payment_charge_id, user_id, tariff_id,
-        )
-        await _payment_recovery_message(message, sp, tariff_id)
-        return
-
-    meta = _tariff_meta(tariff_id)
-    name = meta[1] if meta else tariff_id
-    expires_str = new_exp.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-
-    logger.info(
-        "[payment] user=%d activated tariff=%s exp=%s amount=%d/%s tg_charge=%s",
-        user_id, tariff_id, expires_str, sp.total_amount, sp.currency,
-        sp.telegram_payment_charge_id,
-    )
-
-    await message.answer(
-        f"✅ <b>Оплата получена!</b>\n\n"
-        f"Тариф <b>{name}</b> активирован до <b>{expires_str}</b>.\n"
-        f"Можно добавлять поиски — вернись в главное меню.",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-async def _payment_recovery_message(message, sp, tariff_id: str):
-    """Sent to the user when activation fails after the money has
-    already been taken. Keep it short — the charge_id and tariff_id
-    are logged at WARN level above (handlers.successful_payment_handler)
-    so support can find the failed payment in YooKassa via user
-    telegram_id + timestamp without asking the user for codes."""
-    contact = config.support_handle or "поддержку"
-    await message.answer(
-        f"⚠️ Что-то пошло не так с активацией тарифа. "
-        f"Если деньги списались — напиши {contact}.",
-    )
 
 
 async def _show_add_hint(target):
@@ -1170,32 +1113,56 @@ async def cmd_testbuy(message: Message):
         )
         return
 
-    if not config.payment_provider_token:
+    if not (config.yookassa_shop_id and config.yookassa_secret_key
+            and config.webhook_base_url):
         await message.answer(
-            "PAYMENT_PROVIDER_TOKEN не настроен в env vars — "
-            "оплата не запустится."
+            "YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY / WEBHOOK_BASE_URL "
+            "не настроены — оплата не запустится."
         )
         return
 
+    rub_amount = rules["kopeks"] / 100.0
+    receipt_items = [yk.build_receipt_item(name, rub_amount)]
+    metadata = {
+        "telegram_id": str(message.from_user.id),
+        "tariff_id": tariff_id,
+    }
+    bot_username = (await message.bot.me()).username
+    return_url = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+
     try:
-        await message.bot.send_invoice(
-            chat_id=message.chat.id,
-            title=f"[TEST] AutoSearch — {name}",
-            description=(
-                f"Тестовая покупка от админа: {meta[3] if meta else ''}"
-            ),
-            payload=f"tariff:{tariff_id}",
-            provider_token=config.payment_provider_token,
-            currency="RUB",
-            prices=[LabeledPrice(label=name, amount=rules["kopeks"])],
-            need_name=False, need_email=False, need_phone_number=False,
-            send_phone_number_to_provider=False,
-            send_email_to_provider=False,
-            is_flexible=False,
+        payment = await yk.create_payment(
+            shop_id=config.yookassa_shop_id,
+            secret_key=config.yookassa_secret_key,
+            amount_rub=rub_amount,
+            description=f"[TEST] AutoSearch — {name}",
+            metadata=metadata,
+            return_url=return_url,
+            receipt_items=receipt_items,
         )
-    except Exception:
-        logger.exception("[testbuy] send_invoice failed for tariff=%s", tariff_id)
-        await message.answer("Не получилось открыть оплату — гляну логи.")
+    except yk.YooKassaError as e:
+        logger.exception("[testbuy] create_payment failed for tariff=%s", tariff_id)
+        await message.answer(f"YooKassa error: {e}")
+        return
+
+    confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
+    if not confirmation_url:
+        logger.error("[testbuy] no confirmation_url: %s", payment)
+        await message.answer("ЮKassa не вернула ссылку — гляну логи.")
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {meta[2]}", url=confirmation_url)],
+    ])
+    await message.answer(
+        f"🧪 <b>Тест YooKassa — {name}</b>\n\n"
+        f"Сумма: <b>{rub_amount:.2f} ₽</b>\n"
+        f"Payment ID: <code>{payment.get('id', '?')}</code>\n\n"
+        f"Жми кнопку → откроется страница ЮKassa со всеми способами "
+        f"оплаты. Админ-статус не изменится после оплаты.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
 
 
 @router.message(Command("stop"))

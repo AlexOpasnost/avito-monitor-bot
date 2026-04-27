@@ -37,10 +37,24 @@ class Config:
     payment_url_basic: str = ""     # real payment link (YooMoney / Robokassa / …)
     payment_url_pro: str = ""
     support_handle: str = ""        # e.g. "@autosearch_support"
-    # Telegram Payments provider token (YooKassa / Stripe / …). Set via
-    # @BotFather → bot → Payments. Empty string disables paid tariffs —
-    # in that case the buy buttons fall back to the support handle.
+    # Telegram Payments provider token — kept for back-compat. The
+    # paywall now uses the YooKassa REST API path (supports СБП, all
+    # methods); this token is only checked as a feature flag.
     payment_provider_token: str = ""
+    # YooKassa REST API credentials. Used to create payments
+    # (POST /v3/payments) and verify webhooks (GET /v3/payments/{id}).
+    # Both required for paid tariffs.
+    yookassa_shop_id: str = ""
+    yookassa_secret_key: str = ""
+    # Public HTTPS URL of THIS bot's webhook endpoint, e.g.
+    # https://avito-monitor-bot-production.up.railway.app
+    # Configured in YooKassa dashboard → Notifications →
+    # https://<webhook_base_url>/webhook/yookassa
+    webhook_base_url: str = ""
+    # Local port the aiohttp webhook server listens on. Railway
+    # injects $PORT for the public-facing service; we honour that
+    # at startup if set.
+    webhook_port: int = 8000
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -85,6 +99,10 @@ class Config:
             payment_url_pro=os.getenv("PAYMENT_URL_PRO", ""),
             support_handle=os.getenv("SUPPORT_HANDLE", ""),
             payment_provider_token=os.getenv("PAYMENT_PROVIDER_TOKEN", ""),
+            yookassa_shop_id=os.getenv("YOOKASSA_SHOP_ID", "").strip(),
+            yookassa_secret_key=os.getenv("YOOKASSA_SECRET_KEY", "").strip(),
+            webhook_base_url=os.getenv("WEBHOOK_BASE_URL", "").rstrip("/"),
+            webhook_port=int(os.getenv("WEBHOOK_PORT", "8000")),
         )
 
 

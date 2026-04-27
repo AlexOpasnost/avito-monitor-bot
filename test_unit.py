@@ -1450,51 +1450,35 @@ def test_admin_user_tariff_short_circuit():
     print("OK: handlers admin tariff short-circuit")
 
 
-def test_payment_recovery_message_short_and_actionable():
-    """When activation fails post-payment, the user-facing message
-    is intentionally short — just «что-то пошло не так, напиши
-    {support}». The charge_id and tariff are LOGGED at WARN level
-    (not exposed to the user) so support can find the payment via
-    user telegram_id + timestamp instead of asking for codes."""
-    import asyncio
-    import os
-    from importlib import reload
-    import config as cfg_mod
+def test_yookassa_receipt_item_shape():
+    """build_receipt_item produces the exact dict shape YooKassa
+    expects in `provider_data.receipt.items[]` for самозанятый.
 
-    saved = os.environ.pop("SUPPORT_HANDLE", None)
-    try:
-        os.environ["SUPPORT_HANDLE"] = "@somesupport"
-        reload(cfg_mod)
-        import handlers as handlers_mod
-        reload(handlers_mod)
+    Critical detail: the receipt amount.value is in RUBLES (string,
+    2 decimals) — NOT kopeks like the Telegram-Payments LabeledPrice.
+    Mixing these up would either charge the user 100x or 1/100x of
+    the expected price.
+    """
+    from services.yookassa import build_receipt_item
 
-        captured = {}
+    item = build_receipt_item("Базовый", 890.0)
+    assert item["description"] == "Базовый"
+    assert item["amount"]["value"] == "890.00"
+    assert item["amount"]["currency"] == "RUB"
+    assert item["quantity"] == "1.00"
+    # vat_code=1 = «Без НДС» — required for НПД (самозанятый)
+    assert item["vat_code"] == 1
+    assert item["payment_mode"] == "full_payment"
+    assert item["payment_subject"] == "service"
 
-        class FakeMsg:
-            async def answer(self, text, **kwargs):
-                captured["text"] = text
+    # Long names are truncated to FFD 1.2 max (128)
+    long_item = build_receipt_item("X" * 200, 100.0)
+    assert len(long_item["description"]) == 128
 
-        class FakeSP:
-            telegram_payment_charge_id = "tg_charge_AbCd1234"
-            provider_payment_charge_id = "yk_456"
-
-        asyncio.run(handlers_mod._payment_recovery_message(
-            FakeMsg(), FakeSP(), "basic",
-        ))
-
-        # Short + mentions support handle so the user knows where to go
-        assert "@somesupport" in captured["text"]
-        # Charge id NOT in user-facing text (logs only)
-        assert "tg_charge_AbCd1234" not in captured["text"]
-        assert "basic" not in captured["text"]
-    finally:
-        os.environ.pop("SUPPORT_HANDLE", None)
-        if saved is not None:
-            os.environ["SUPPORT_HANDLE"] = saved
-        reload(cfg_mod)
-        import handlers as handlers_mod
-        reload(handlers_mod)
-    print("OK: handlers _payment_recovery_message (terse)")
+    # Decimal handling — kopeks-precise prices render correctly
+    item2 = build_receipt_item("Pro", 2590.50)
+    assert item2["amount"]["value"] == "2590.50"
+    print("OK: yookassa build_receipt_item shape + RUB units")
 
 
 def test_tariff_rules_consistency():
@@ -1709,7 +1693,7 @@ if __name__ == "__main__":
     test_mercari_enrich_items()
     test_tariff_state_resolution()
     test_tariff_rules_consistency()
-    test_payment_recovery_message_short_and_actionable()
+    test_yookassa_receipt_item_shape()
     test_admin_ids_env_parsing()
     test_admin_user_tariff_short_circuit()
     test_html_injection_safe_in_sub_list()

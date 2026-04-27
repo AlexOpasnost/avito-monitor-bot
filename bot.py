@@ -1,6 +1,7 @@
 """Avito Monitor Bot — main entry point."""
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -8,12 +9,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import BotCommand
+from aiohttp import web
 
 from config import config
 from database import db
 from handlers import router
 from parser import check_proxy_ip, rotate_ip
 from scheduler import run_scheduler
+from webhook import build_app as build_webhook_app
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +108,24 @@ async def main():
         # rate-limited on rapid restarts). The previous value stays.
         logger.warning("set_my_description failed: %s", e)
 
+    # Webhook server runs alongside polling on the same event loop.
+    # Railway injects $PORT for the public-facing service — honour it.
+    webhook_runner: web.AppRunner | None = None
+    try:
+        webhook_app = build_webhook_app(bot)
+        webhook_runner = web.AppRunner(webhook_app)
+        await webhook_runner.setup()
+        port = int(os.getenv("PORT", str(config.webhook_port)))
+        site = web.TCPSite(webhook_runner, "0.0.0.0", port)
+        await site.start()
+        logger.info("Webhook server listening on :%d (POST /webhook/yookassa)", port)
+    except Exception:
+        # Webhook bring-up failures shouldn't block polling — paid
+        # tariffs simply won't activate until restart, but the bot
+        # itself stays usable for free / admin / legacy users.
+        logger.exception("Webhook server failed to start — continuing without it")
+        webhook_runner = None
+
     try:
         logger.info("Bot starting...")
         await dp.start_polling(
@@ -119,6 +140,11 @@ async def main():
             await asyncio.wait_for(scheduler_task, timeout=10)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             scheduler_task.cancel()
+        if webhook_runner is not None:
+            try:
+                await webhook_runner.cleanup()
+            except Exception:
+                pass
         try:
             await bot.session.close()
         except Exception:
