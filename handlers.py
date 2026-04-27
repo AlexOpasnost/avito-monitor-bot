@@ -577,7 +577,7 @@ async def callback_buy_tariff(callback: CallbackQuery):
     # the bot isn't wired up yet (no PAYMENT_PROVIDER_TOKEN set).
     if not config.payment_provider_token:
         contact = (
-            f"Для оформления напиши {config.support_handle}."
+            f"Оплата временно недоступна. Напиши {config.support_handle}."
             if config.support_handle
             else "Оплата временно недоступна. Попробуйте позже."
         )
@@ -731,21 +731,14 @@ async def successful_payment_handler(message: Message):
 
 async def _payment_recovery_message(message, sp, tariff_id: str):
     """Sent to the user when activation fails after the money has
-    already been taken. Includes the charge id so support can find the
-    payment in YooKassa and activate the tariff manually."""
-    contact = (
-        config.support_handle
-        if config.support_handle
-        else "поддержку"
-    )
+    already been taken. Keep it short — the charge_id and tariff_id
+    are logged at WARN level above (handlers.successful_payment_handler)
+    so support can find the failed payment in YooKassa via user
+    telegram_id + timestamp without asking the user for codes."""
+    contact = config.support_handle or "поддержку"
     await message.answer(
-        f"⚠️ <b>Оплата прошла, но активация тарифа не удалась</b>\n\n"
-        f"Деньги уже у нас на стороне, не переживай — это техническая "
-        f"проблема нашего бота, мы её починим вручную.\n\n"
-        f"Напиши <b>{contact}</b> и пришли этот код:\n"
-        f"<code>{sp.telegram_payment_charge_id}</code>\n\n"
-        f"Тариф: <b>{tariff_id}</b>",
-        parse_mode="HTML",
+        f"⚠️ Что-то пошло не так с активацией тарифа. "
+        f"Если деньги списались — напиши {contact}.",
     )
 
 
@@ -763,7 +756,7 @@ async def _show_add_hint(target):
 
 
 async def _show_help(target):
-    text = (
+    body = (
         "❓ <b>Как это работает</b>\n\n"
         "1. Открой нужный маркетплейс и настрой фильтры (бренд, размер, "
         "ценовой диапазон, регион).\n"
@@ -777,7 +770,9 @@ async def _show_help(target):
         "/stop — приостановить все поиски\n"
         "/help — эта справка"
     )
-    await _present(target, text, keyboard=back_to_menu_keyboard())
+    if config.support_handle:
+        body += f"\n\n💬 <b>Поддержка:</b> {config.support_handle}"
+    await _present(target, body, keyboard=back_to_menu_keyboard())
 
 
 async def _show_profile(target, *, prefs: dict | None = None):

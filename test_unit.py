@@ -1450,30 +1450,51 @@ def test_admin_user_tariff_short_circuit():
     print("OK: handlers admin tariff short-circuit")
 
 
-def test_payment_recovery_message_contains_charge_id():
-    """When activation fails post-payment, the user must see the
-    charge_id so support can find the payment in YooKassa."""
+def test_payment_recovery_message_short_and_actionable():
+    """When activation fails post-payment, the user-facing message
+    is intentionally short — just «что-то пошло не так, напиши
+    {support}». The charge_id and tariff are LOGGED at WARN level
+    (not exposed to the user) so support can find the payment via
+    user telegram_id + timestamp instead of asking for codes."""
     import asyncio
-    from handlers import _payment_recovery_message
+    import os
+    from importlib import reload
+    import config as cfg_mod
 
-    captured = {}
+    saved = os.environ.pop("SUPPORT_HANDLE", None)
+    try:
+        os.environ["SUPPORT_HANDLE"] = "@somesupport"
+        reload(cfg_mod)
+        import handlers as handlers_mod
+        reload(handlers_mod)
 
-    class FakeMsg:
-        async def answer(self, text, **kwargs):
-            captured["text"] = text
-            captured["mode"] = kwargs.get("parse_mode")
+        captured = {}
 
-    class FakeSP:
-        telegram_payment_charge_id = "tg_charge_AbCd1234"
-        provider_payment_charge_id = "yk_456"
+        class FakeMsg:
+            async def answer(self, text, **kwargs):
+                captured["text"] = text
 
-    asyncio.run(_payment_recovery_message(FakeMsg(), FakeSP(), "basic"))
+        class FakeSP:
+            telegram_payment_charge_id = "tg_charge_AbCd1234"
+            provider_payment_charge_id = "yk_456"
 
-    assert "tg_charge_AbCd1234" in captured["text"]
-    assert "basic" in captured["text"]
-    # Must be HTML so the <code>...</code> block renders correctly
-    assert captured["mode"] == "HTML"
-    print("OK: handlers _payment_recovery_message")
+        asyncio.run(handlers_mod._payment_recovery_message(
+            FakeMsg(), FakeSP(), "basic",
+        ))
+
+        # Short + mentions support handle so the user knows where to go
+        assert "@somesupport" in captured["text"]
+        # Charge id NOT in user-facing text (logs only)
+        assert "tg_charge_AbCd1234" not in captured["text"]
+        assert "basic" not in captured["text"]
+    finally:
+        os.environ.pop("SUPPORT_HANDLE", None)
+        if saved is not None:
+            os.environ["SUPPORT_HANDLE"] = saved
+        reload(cfg_mod)
+        import handlers as handlers_mod
+        reload(handlers_mod)
+    print("OK: handlers _payment_recovery_message (terse)")
 
 
 def test_tariff_rules_consistency():
@@ -1688,7 +1709,7 @@ if __name__ == "__main__":
     test_mercari_enrich_items()
     test_tariff_state_resolution()
     test_tariff_rules_consistency()
-    test_payment_recovery_message_contains_charge_id()
+    test_payment_recovery_message_short_and_actionable()
     test_admin_ids_env_parsing()
     test_admin_user_tariff_short_circuit()
     test_html_injection_safe_in_sub_list()
