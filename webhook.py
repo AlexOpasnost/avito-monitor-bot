@@ -17,6 +17,7 @@ no second activation happens.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 
 from aiogram import Bot
@@ -29,7 +30,55 @@ from services.yookassa import YooKassaError, get_payment
 logger = logging.getLogger(__name__)
 
 
+def _client_ip(request: web.Request) -> str | None:
+    """Resolve the real client IP behind Railway's edge proxy.
+
+    Railway forwards the original client IP in X-Forwarded-For —
+    take the leftmost entry (the entry the upstream wrote, not
+    intermediate proxies). Falls back to peer remote when the
+    header is absent (local dev / direct connection)."""
+    fwd = request.headers.get("X-Forwarded-For", "").strip()
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote
+
+
+def _is_yookassa_ip(ip_str: str | None) -> bool:
+    """Match `ip_str` against the configured YooKassa CIDR allowlist.
+    Empty allowlist = bypass (we still verify each event by re-fetching
+    the payment from YooKassa with our secret, so the IP gate is
+    defense-in-depth, not the only line of defense)."""
+    allow = config.yookassa_allowed_ips or []
+    if not allow:
+        return True
+    if not ip_str:
+        return False
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    for cidr in allow:
+        try:
+            if ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 async def handle_yookassa_webhook(request: web.Request) -> web.Response:
+    # IP gate — refuse non-YooKassa sources outright. Defense in
+    # depth: a forged POST with the right shape would still fail
+    # the GET-back check below, but the IP gate stops the attack
+    # at the door so we don't burn YooKassa API quota on every
+    # random scanner that finds the endpoint.
+    client_ip = _client_ip(request)
+    if not _is_yookassa_ip(client_ip):
+        logger.warning(
+            "[yookassa-wh] reject non-allowlisted IP=%s", client_ip,
+        )
+        return web.Response(status=403, text="forbidden")
+
     try:
         body = await request.json()
     except Exception:

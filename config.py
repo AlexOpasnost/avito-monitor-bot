@@ -55,6 +55,21 @@ class Config:
     # injects $PORT for the public-facing service; we honour that
     # at startup if set.
     webhook_port: int = 8000
+    # CIDR ranges allowed to POST to /webhook/yookassa. YooKassa
+    # publishes its outbound IPs at
+    # https://yookassa.ru/developers/using-api/webhooks#ip — keep
+    # this in sync if they change. Empty list = no IP gate (fall
+    # back to the GET-back verification only). Override with the
+    # YOOKASSA_ALLOWED_IPS env var (comma-separated CIDRs).
+    yookassa_allowed_ips: list[str] = field(default_factory=lambda: [
+        "185.71.76.0/27",
+        "185.71.77.0/27",
+        "77.75.153.0/25",
+        "77.75.154.0/25",
+        "77.75.156.11/32",
+        "77.75.156.35/32",
+        "2a02:5180::/32",
+    ])
     # Compliance kill-switch — names of marketplace sources that
     # are temporarily disabled (e.g. after a cease-and-desist
     # notice). Add via DISABLED_SOURCES=avito,kufar env var, save,
@@ -119,6 +134,20 @@ class Config:
             yookassa_secret_key=os.getenv("YOOKASSA_SECRET_KEY", "").strip(),
             webhook_base_url=os.getenv("WEBHOOK_BASE_URL", "").rstrip("/"),
             webhook_port=int(os.getenv("WEBHOOK_PORT", "8000")),
+            yookassa_allowed_ips=([
+                s.strip()
+                for s in os.getenv("YOOKASSA_ALLOWED_IPS", "").split(",")
+                if s.strip()
+            ] or [
+                # Default = YooKassa's documented production IPs.
+                "185.71.76.0/27",
+                "185.71.77.0/27",
+                "77.75.153.0/25",
+                "77.75.154.0/25",
+                "77.75.156.11/32",
+                "77.75.156.35/32",
+                "2a02:5180::/32",
+            ]),
             disabled_sources=[
                 s.strip().lower()
                 for s in os.getenv("DISABLED_SOURCES", "").split(",")
