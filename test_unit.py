@@ -1450,6 +1450,94 @@ def test_admin_user_tariff_short_circuit():
     print("OK: handlers admin tariff short-circuit")
 
 
+def test_disabled_sources_kill_switch():
+    """DISABLED_SOURCES env var → is_source_disabled flips to True
+    on listed names. Empty / missing → all sources allowed.
+
+    Used by:
+      - scheduler.py: skip cycle (no error increment) for paused source
+      - handlers.handle_url: reject new subscription with friendly msg
+    """
+    import os
+    from importlib import reload
+    import config as cfg_mod
+
+    saved = os.environ.pop("DISABLED_SOURCES", None)
+    try:
+        os.environ["DISABLED_SOURCES"] = " AVITO , kufar ,, "
+        reload(cfg_mod)
+        # parsers/__init__.py reads config lazily so no need to reload it
+        from parsers import is_source_disabled
+
+        # Case-insensitive match + whitespace tolerated
+        assert is_source_disabled("avito") is True
+        assert is_source_disabled("AVITO") is True
+        assert is_source_disabled("kufar") is True
+        # Not in list
+        assert is_source_disabled("olx") is False
+        assert is_source_disabled("vinted") is False
+        # Edge cases
+        assert is_source_disabled("") is False
+        assert is_source_disabled(None) is False
+
+        # Empty env var → no source disabled
+        os.environ["DISABLED_SOURCES"] = ""
+        reload(cfg_mod)
+        assert is_source_disabled("avito") is False
+    finally:
+        os.environ.pop("DISABLED_SOURCES", None)
+        if saved is not None:
+            os.environ["DISABLED_SOURCES"] = saved
+        reload(cfg_mod)
+    print("OK: parsers is_source_disabled kill-switch")
+
+
+def test_legal_footer_renders_only_published_links():
+    """Onboarding hero appends «соглашаешься с …» when at least one
+    of PRIVACY_URL / OFFER_URL is configured. Empty config = no
+    footer (don't pretend documents exist when they don't).
+    """
+    import os
+    from importlib import reload
+    import config as cfg_mod
+
+    saved_p = os.environ.pop("PRIVACY_URL", None)
+    saved_o = os.environ.pop("OFFER_URL", None)
+    try:
+        # Both empty → no footer
+        reload(cfg_mod)
+        import handlers as handlers_mod
+        reload(handlers_mod)
+        assert handlers_mod._legal_footer() == ""
+
+        # Only offer
+        os.environ["OFFER_URL"] = "https://example.com/offer"
+        reload(cfg_mod)
+        reload(handlers_mod)
+        out = handlers_mod._legal_footer()
+        assert "офертой" in out
+        assert "политикой" not in out
+        assert "https://example.com/offer" in out
+
+        # Both
+        os.environ["PRIVACY_URL"] = "https://example.com/privacy"
+        reload(cfg_mod)
+        reload(handlers_mod)
+        out = handlers_mod._legal_footer()
+        assert "офертой" in out and "политикой" in out
+    finally:
+        for k in ("PRIVACY_URL", "OFFER_URL"):
+            os.environ.pop(k, None)
+        if saved_p is not None:
+            os.environ["PRIVACY_URL"] = saved_p
+        if saved_o is not None:
+            os.environ["OFFER_URL"] = saved_o
+        reload(cfg_mod)
+        import handlers as handlers_mod
+        reload(handlers_mod)
+    print("OK: handlers _legal_footer publishes only configured links")
+
+
 def test_yookassa_receipt_item_shape():
     """build_receipt_item produces the exact dict shape YooKassa
     expects in `provider_data.receipt.items[]` for самозанятый.
@@ -1694,6 +1782,8 @@ if __name__ == "__main__":
     test_tariff_state_resolution()
     test_tariff_rules_consistency()
     test_yookassa_receipt_item_shape()
+    test_disabled_sources_kill_switch()
+    test_legal_footer_renders_only_published_links()
     test_admin_ids_env_parsing()
     test_admin_user_tariff_short_circuit()
     test_html_injection_safe_in_sub_list()

@@ -50,7 +50,7 @@ from bot_i18n import (
 from config import config
 from database import db
 from parser import detect_source, fetch_search_items, supported_sources
-from parsers import source_display_name
+from parsers import is_source_disabled, source_display_name
 from parsers.common import proxy_for_source
 
 logger = logging.getLogger(__name__)
@@ -195,7 +195,29 @@ def _extract_avito_url(message_or_text) -> str | None:
 # Onboarding wizard + main menu
 # ---------------------------------------------------------------------------
 
-_HERO_TEXT = (
+def _legal_footer() -> str:
+    """Build the «нажимая Поехали соглашаешься...» line shown in the
+    onboarding hero. We only mention the documents that are actually
+    published — empty config values drop the link cleanly."""
+    parts = []
+    if config.offer_url:
+        parts.append(f"<a href=\"{_html.escape(config.offer_url)}\">офертой</a>")
+    if config.privacy_url:
+        parts.append(
+            f"<a href=\"{_html.escape(config.privacy_url)}\">"
+            "политикой обработки ПД</a>"
+        )
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return f"\n\n<i>Нажимая «🚀 Поехали», соглашаешься с {parts[0]}.</i>"
+    return (
+        f"\n\n<i>Нажимая «🚀 Поехали», соглашаешься с "
+        f"{parts[0]} и {parts[1]}.</i>"
+    )
+
+
+_HERO_TEXT_BASE = (
     "👋 <b>Добро пожаловать в AutoSearch!</b>\n\n"
     "Я мониторю Avito, OLX, Vinted, Kufar, Mercari и другие площадки и "
     "присылаю новые объявления в реальном времени.\n\n"
@@ -221,7 +243,7 @@ _TZ_PROMPT = (
 
 async def _show_hero(target):
     await _present(
-        target, _HERO_TEXT,
+        target, _HERO_TEXT_BASE + _legal_footer(),
         keyboard=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🚀 Поехали", callback_data="onboard:lang"),
         ]]),
@@ -437,6 +459,18 @@ def is_admin(telegram_id: int | None) -> bool:
     return telegram_id in (config.admin_ids or [])
 
 
+async def _npd_ceiling_hit() -> bool:
+    """Soft block on new sales when the 12-month rolling revenue
+    would push the operator over the 2.4M ₽/year НПД cap. Going over
+    auto-revokes the самозанятый status with FNS — we don't want to
+    accidentally trigger that. Returns True when sales should be
+    rejected for compliance reasons."""
+    if config.npd_annual_limit_rub <= 0:
+        return False
+    minor = await db.get_revenue_minor_last_n_days(365)
+    return minor >= config.npd_annual_limit_rub * 100  # kopeks vs rub
+
+
 def _tariff_meta(tariff_id: str | None) -> tuple | None:
     """Return the human row from _TARIFFS for a given id, or None."""
     if not tariff_id:
@@ -606,6 +640,21 @@ async def callback_buy_tariff(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
         ])
         await _present(callback, text, keyboard=keyboard)
+        await callback.answer()
+        return
+
+    # NPD ceiling — refuse new paid sales once the 12-month rolling
+    # revenue would put the operator over the 2.4M ₽ self-employed
+    # cap. Crossing it auto-revokes НПД status; admins are allowed
+    # past so the operator can still test and process edge cases.
+    if not is_admin(callback.from_user.id) and await _npd_ceiling_hit():
+        contact = config.support_handle or "поддержку"
+        await _present(
+            callback,
+            f"⚠️ Приём оплат временно приостановлен по техническим "
+            f"причинам. Напиши {contact} — поможем оформить тариф вручную.",
+            keyboard=back_to_menu_keyboard(),
+        )
         await callback.answer()
         return
 
@@ -816,6 +865,20 @@ async def _show_help(target):
     )
     if config.support_handle:
         body += f"\n\n💬 <b>Поддержка:</b> {config.support_handle}"
+
+    legal_lines = []
+    if config.offer_url:
+        legal_lines.append(
+            f"📄 <a href=\"{_html.escape(config.offer_url)}\">Публичная оферта</a>"
+        )
+    if config.privacy_url:
+        legal_lines.append(
+            f"🔒 <a href=\"{_html.escape(config.privacy_url)}\">"
+            "Политика обработки персональных данных</a>"
+        )
+    if legal_lines:
+        body += "\n\n" + "\n".join(legal_lines)
+
     await _present(target, body, keyboard=back_to_menu_keyboard())
 
 
@@ -1029,6 +1092,28 @@ async def _admin_dashboard(message: Message):
     rev_total = stats.get("revenue_total", 0) // 100  # kopeks → rubles
     rev_30d = stats.get("revenue_30d", 0) // 100
 
+    # 12-month rolling sum vs the НПД ceiling — surface the percentage
+    # so the operator notices well before the cap auto-revokes their
+    # самозанятый status.
+    rev_12m_minor = await db.get_revenue_minor_last_n_days(365)
+    rev_12m_rub = rev_12m_minor // 100
+    cap_rub = config.npd_annual_limit_rub
+    pct = (rev_12m_minor / (cap_rub * 100) * 100) if cap_rub > 0 else 0.0
+    if pct >= 100:
+        cap_line = (
+            f"🚨 <b>НПД лимит ПРЕВЫШЕН:</b> {rev_12m_rub:,} / {cap_rub:,} ₽ "
+            f"({pct:.0f}%) — новые продажи блокируются. Срочно переходи на ИП."
+        )
+    elif pct >= 90:
+        cap_line = (
+            f"⚠️ <b>НПД близко к лимиту:</b> {rev_12m_rub:,} / {cap_rub:,} ₽ "
+            f"({pct:.0f}%). Готовься к переходу на ИП."
+        )
+    else:
+        cap_line = (
+            f"📈 НПД лимит: {rev_12m_rub:,} / {cap_rub:,} ₽ ({pct:.0f}%)"
+        )
+
     await message.answer(
         f"📊 <b>Админ-панель</b>\n\n"
         f"<b>💰 Выручка</b>\n"
@@ -1036,7 +1121,8 @@ async def _admin_dashboard(message: Message):
         f"  За 30 дней:   <b>{rev_30d:,} ₽</b>\n"
         f"  Платящих сейчас: <b>{stats.get('active_paid_users', 0):,}</b>\n"
         f"  Уникальных платежей: <b>{stats.get('paid_users_total', 0):,}</b> "
-        f"(за 30д: {stats.get('paid_users_30d', 0):,})\n\n"
+        f"(за 30д: {stats.get('paid_users_30d', 0):,})\n"
+        f"  {cap_line}\n\n"
         f"<b>👥 Юзеры</b>\n"
         f"  Всего: <b>{stats['total_users']:,}</b>\n"
         f"  Новых за 24ч: <b>{stats['new_users_24h']:,}</b>\n\n"
@@ -1410,6 +1496,20 @@ async def handle_url(message: Message):
         )
         return
     source_name, url = extracted
+
+    # Compliance kill-switch: if this source is on the disabled list,
+    # reject the new subscription up-front so we don't accumulate
+    # entries we're not allowed to scrape.
+    if is_source_disabled(source_name):
+        pretty = source_display_name(source_name)
+        await message.answer(
+            f"⚠️ Источник <b>{pretty}</b> временно недоступен. "
+            f"Попробуй другой маркетплейс или напиши "
+            f"{config.support_handle or 'в поддержку'}.",
+            parse_mode="HTML",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
 
     user_id = await db.get_or_create_user(
         message.from_user.id, message.from_user.username,

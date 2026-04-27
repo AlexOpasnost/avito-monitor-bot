@@ -45,6 +45,14 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
 
     logger.info("[yookassa-wh] event=%s payment_id=%s", event, payment_id)
 
+    # Refund delivery — when the operator processes a return through
+    # YooKassa dashboard, the merchant gets a separate refund.succeeded
+    # event. We revoke the user's tariff so they don't keep getting
+    # paid features after their money is gone. Idempotent: a tariff
+    # that's already NULL stays NULL.
+    if event == "refund.succeeded":
+        return await _handle_refund_event(request, obj)
+
     # We only care about the "succeeded" terminal state. Other events
     # (waiting_for_capture, canceled) are acked + ignored so YooKassa
     # doesn't keep retrying.
@@ -175,6 +183,59 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
         "[yookassa-wh] activated user=%d tariff=%s exp=%s amount=%d/%s",
         user_id, tariff_id, expires_str, amount_minor, currency,
     )
+    return web.Response(status=200, text="ok")
+
+
+async def _handle_refund_event(request: web.Request, refund_obj: dict) -> web.Response:
+    """Refund cycle — the operator hit «Возврат» in YooKassa dashboard
+    and the customer's card got the money back. We deactivate the
+    tariff so the user doesn't keep getting paid features for free.
+
+    The refund event carries `payment_id` (the original payment that
+    was refunded) — we look up the affected user via the `payments`
+    table, then reset users.tariff. trial_used is preserved so
+    refunded users can't re-claim the freebie.
+    """
+    payment_id = refund_obj.get("payment_id") or refund_obj.get("id")
+    if not payment_id:
+        logger.warning("[yookassa-wh] refund event missing payment_id")
+        return web.Response(status=200, text="ok")
+
+    user_id = await db.get_payment_user_id(payment_id)
+    if user_id is None:
+        logger.warning(
+            "[yookassa-wh] refund for unknown payment_id=%s — no-op",
+            payment_id,
+        )
+        return web.Response(status=200, text="ok")
+
+    try:
+        await db.deactivate_user_tariff(user_id)
+    except Exception:
+        logger.exception(
+            "[yookassa-wh] deactivate_user_tariff failed: user=%d payment=%s",
+            user_id, payment_id,
+        )
+        return web.Response(status=200, text="ok")
+
+    logger.info(
+        "[yookassa-wh] refund — deactivated tariff for user=%d (payment=%s)",
+        user_id, payment_id,
+    )
+
+    # Best-effort DM to the user.
+    bot: Bot = request.app["bot"]
+    try:
+        tg_id = await db.get_telegram_id(user_id)
+        if tg_id:
+            await bot.send_message(
+                tg_id,
+                "💸 Возврат прошёл. Тариф отключён, текущие поиски остаются "
+                "сохранёнными — активируешь их, когда снова оформишь подписку.",
+            )
+    except Exception as e:
+        logger.warning("[yookassa-wh] refund notify failed: %s", e)
+
     return web.Response(status=200, text="ok")
 
 

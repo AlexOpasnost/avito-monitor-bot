@@ -537,6 +537,51 @@ class Database:
             return new_exp
         return await self._execute(_op)
 
+    async def deactivate_user_tariff(self, user_id: int) -> None:
+        """Force the user's tariff back to free state. Used by the
+        webhook handler when YooKassa reports a refund — the customer
+        got their money back, so we revoke access immediately. Trial
+        history is preserved (trial_used stays as-is) so they can't
+        re-claim the freebie.
+        """
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET tariff = NULL, tariff_expires_at = NULL "
+                "WHERE id = $1", user_id,
+            )
+        await self._execute(_op)
+
+    async def get_telegram_id(self, user_id: int) -> int | None:
+        """Reverse-lookup the user's Telegram id from our internal id."""
+        async def _op(conn):
+            return await conn.fetchval(
+                "SELECT telegram_id FROM users WHERE id = $1", user_id,
+            )
+        return await self._execute(_op)
+
+    async def get_revenue_minor_last_n_days(self, days: int = 365) -> int:
+        """Sum of all amount_minor in payments within the last N days.
+        Used to track approach to the НПД 2.4M ₽/year ceiling."""
+        async def _op(conn):
+            value = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_minor), 0) FROM payments "
+                "WHERE created_at > NOW() - ($1::int || ' days')::interval",
+                days,
+            )
+            return int(value or 0)
+        return await self._execute(_op)
+
+    async def get_payment_user_id(self, payment_id: str) -> int | None:
+        """Look up which user a YooKassa payment belonged to. Used by
+        the refund webhook to find the affected user without trusting
+        the metadata in the refund event (which YooKassa doesn't echo)."""
+        async def _op(conn):
+            return await conn.fetchval(
+                "SELECT user_id FROM payments WHERE telegram_charge_id = $1",
+                payment_id,
+            )
+        return await self._execute(_op)
+
     async def record_payment(
         self, telegram_charge_id: str, provider_charge_id: str | None,
         user_id: int, tariff_id: str,

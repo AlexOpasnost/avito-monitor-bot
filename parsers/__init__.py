@@ -37,6 +37,21 @@ def supported_sources() -> list[str]:
     return [s.name for s in SOURCES]
 
 
+def is_source_disabled(name: str | None) -> bool:
+    """Compliance kill-switch — checked on every scheduler cycle and
+    on every new-subscription attempt. Driven by config.disabled_sources
+    which is sourced from the DISABLED_SOURCES env var. Lets the
+    operator pull a misbehaving / legally-contested source off the
+    air with one Railway redeploy, no code change needed."""
+    if not name:
+        return False
+    # Local import — keeps this module dependency-free at top level
+    # (config.py imports os/dotenv which we don't want to drag in
+    # for trivial readers like the test harness).
+    from config import config
+    return name.lower() in (config.disabled_sources or [])
+
+
 # Single source of truth for human-facing source names.
 # Used in user-facing bot messages and inline buttons.
 SOURCE_DISPLAY_NAMES: dict[str, str] = {
@@ -57,6 +72,6 @@ def source_display_name(name: str | None) -> str:
 
 __all__ = [
     "SearchItem", "Source", "SOURCES",
-    "detect_source", "supported_sources",
+    "detect_source", "supported_sources", "is_source_disabled",
     "SOURCE_DISPLAY_NAMES", "source_display_name",
 ]

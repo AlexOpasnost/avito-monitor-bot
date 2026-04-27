@@ -18,7 +18,7 @@ from parser import (
     fetch_search_items,
 )
 from bot_i18n import date_template, default_tz_for_lang, timezone_short
-from parsers import source_display_name
+from parsers import is_source_disabled, source_display_name
 from parsers.common import proxy_for_source
 from parsers.currency import format_with_estimate
 
@@ -105,6 +105,26 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
                 _url = sub["url"]
                 src = detect_source(_url)
                 source_name = src.name if src else ""
+                # Compliance kill-switch: skip the cycle entirely if
+                # this source is in DISABLED_SOURCES. last_checked_at
+                # is updated so the «Last check» moves and the sub
+                # doesn't look broken; we explicitly do NOT mark it as
+                # a parse failure (that would burn the error budget
+                # and pause the sub after 3 cycles).
+                if is_source_disabled(source_name):
+                    logger.info(
+                        "Sub #%d: source=%s is in DISABLED_SOURCES — skipping cycle",
+                        sub["id"], source_name,
+                    )
+                    await db.update_last_checked(sub["id"])
+                    consecutive_failures = 0
+                    # Sleep until next tick and continue without the
+                    # failure-handling block below.
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=60)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
                 proxy = proxy_for_source(source_name)
                 logger.info(
                     "[scheduler] Sub #%d cycle: source=%s proxy=%s url='%s...%s' (len=%d)",

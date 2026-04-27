@@ -55,6 +55,22 @@ class Config:
     # injects $PORT for the public-facing service; we honour that
     # at startup if set.
     webhook_port: int = 8000
+    # Compliance kill-switch — names of marketplace sources that
+    # are temporarily disabled (e.g. after a cease-and-desist
+    # notice). Add via DISABLED_SOURCES=avito,kufar env var, save,
+    # service redeploys in ~30s and parsing stops. New subscriptions
+    # to those sources are also rejected.
+    disabled_sources: list[str] = field(default_factory=list)
+    # Public URLs for the legal documents shown in /start and /help.
+    # Empty = the link is hidden (still legal until you publish them
+    # somewhere, but a recommended pre-launch step).
+    privacy_url: str = ""
+    offer_url: str = ""
+    # Self-employed (НПД) annual income limit in rubles. The admin
+    # dashboard alerts at 90% and new sales are soft-blocked at 100%
+    # so the operator never accidentally crosses the cap (which would
+    # force a switch to ИП and back-tax penalties).
+    npd_annual_limit_rub: int = 2_400_000
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -103,6 +119,16 @@ class Config:
             yookassa_secret_key=os.getenv("YOOKASSA_SECRET_KEY", "").strip(),
             webhook_base_url=os.getenv("WEBHOOK_BASE_URL", "").rstrip("/"),
             webhook_port=int(os.getenv("WEBHOOK_PORT", "8000")),
+            disabled_sources=[
+                s.strip().lower()
+                for s in os.getenv("DISABLED_SOURCES", "").split(",")
+                if s.strip()
+            ],
+            privacy_url=os.getenv("PRIVACY_URL", "").strip(),
+            offer_url=os.getenv("OFFER_URL", "").strip(),
+            npd_annual_limit_rub=int(
+                os.getenv("NPD_ANNUAL_LIMIT_RUB", "2400000")
+            ),
         )
 
 
