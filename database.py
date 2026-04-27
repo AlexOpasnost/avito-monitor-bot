@@ -166,6 +166,12 @@ class Database:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS name TEXT"
             )
+            # Customer email — required by YooKassa to issue a fiscal
+            # receipt under Мой налог (самозанятый). Asked once per
+            # user on first paid purchase, reused on later buys.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT"
+            )
             # Paid-tariff state. NULL tariff = user hasn't activated
             # anything (no trial, no purchase). Resolved at read time
             # against the in-code tariff table to know max_subs etc.
@@ -383,6 +389,24 @@ class Database:
         async def _op(conn):
             await conn.execute(
                 "UPDATE users SET timezone = $2 WHERE id = $1", user_id, tz,
+            )
+        await self._execute(_op)
+
+    async def get_user_email(self, user_id: int) -> str | None:
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT email FROM users WHERE id = $1", user_id,
+            )
+            if not row:
+                return None
+            email = row["email"]
+            return email.strip() if isinstance(email, str) and email.strip() else None
+        return await self._execute(_op)
+
+    async def set_user_email(self, user_id: int, email: str):
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET email = $2 WHERE id = $1", user_id, email,
             )
         await self._execute(_op)
 

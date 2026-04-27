@@ -69,6 +69,19 @@ class RenameStates(StatesGroup):
     waiting_for_name = State()
 
 
+class BuyStates(StatesGroup):
+    """FSM: user clicked a paid tariff button, we asked for their
+    email (required for the YooKassa receipt under Мой налог), the
+    next text message they send is the email."""
+    waiting_for_email = State()
+
+
+# Loose email shape check — YooKassa does the real validation when
+# it tries to send the receipt. We just gate against obvious
+# mistypes (missing @, missing domain dot, whitespace).
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
+
+
 def _sub_display_name(sub: dict) -> str:
     """Custom name if set, otherwise a sensible default built from
     the marketplace name."""
@@ -533,7 +546,7 @@ async def _show_tariffs(target):
 
 
 @router.callback_query(F.data.startswith("buy:"))
-async def callback_buy_tariff(callback: CallbackQuery):
+async def callback_buy_tariff(callback: CallbackQuery, state: FSMContext):
     tariff_id = callback.data.split(":", 1)[1]
     meta = _tariff_meta(tariff_id)
     rules = _TARIFF_RULES.get(tariff_id)
@@ -622,50 +635,89 @@ async def callback_buy_tariff(callback: CallbackQuery):
         await callback.answer()
         return
 
-    await _start_yookassa_payment(callback, tariff_id, meta, rules)
+    # YooKassa requires customer.email for fiscal receipts under
+    # Мой налог (мы — самозанятый). Ask once, save in DB, reuse on
+    # subsequent purchases.
+    email = await db.get_user_email(user_id)
+    if not email:
+        await state.set_state(BuyStates.waiting_for_email)
+        await state.update_data(buy_tariff_id=tariff_id)
+        text = (
+            "📧 <b>Email для чека</b>\n\n"
+            "Я самозанятый — на каждую оплату выпускается чек по 422-ФЗ. "
+            "Пришли свой email сообщением, я сохраню его и больше не буду "
+            "спрашивать.\n\n"
+            "<i>/cancel — отмена</i>"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data="buy:cancel")],
+        ])
+        await _present(callback, text, keyboard=keyboard)
+        await callback.answer()
+        return
+
+    await _start_yookassa_payment(callback, tariff_id, meta, rules, email=email)
 
 
 async def _start_yookassa_payment(
-    callback: CallbackQuery, tariff_id: str, meta, rules: dict,
+    target, tariff_id: str, meta, rules: dict, *,
+    email: str, label_prefix: str = "",
 ):
     """Create a YooKassa payment and reply with the «Оплатить» URL
-    button. Activation happens later via the webhook (see webhook.py)."""
+    button. Activation happens later via the webhook (see webhook.py).
+
+    `target` is either a CallbackQuery (when entering directly from
+    the tariffs grid) or a Message (when entering after the email
+    FSM step finished). `_present` handles both.
+    """
     _, name, price, limits, _ = meta
     rub_amount = rules["kopeks"] / 100.0
 
     receipt_items = [yk.build_receipt_item(name, rub_amount)]
     metadata = {
-        "telegram_id": str(callback.from_user.id),
+        "telegram_id": str(target.from_user.id),
         "tariff_id": tariff_id,
     }
-    bot_username = (await callback.bot.me()).username
-    return_url = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+    bot = target.bot if hasattr(target, "bot") else None
+    bot_username = ""
+    if bot:
+        try:
+            me = await bot.me()
+            bot_username = me.username or ""
+        except Exception:
+            pass
+    return_url = (
+        f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+    )
 
     try:
         payment = await yk.create_payment(
             shop_id=config.yookassa_shop_id,
             secret_key=config.yookassa_secret_key,
             amount_rub=rub_amount,
-            description=f"AutoSearch — {name}",
+            description=f"{label_prefix}AutoSearch — {name}".strip(),
             metadata=metadata,
             return_url=return_url,
             receipt_items=receipt_items,
+            customer_email=email,
         )
     except yk.YooKassaError:
         logger.exception("[payment] create_payment failed for tariff=%s", tariff_id)
-        await callback.answer(
-            "Не получилось открыть оплату. Попробуй чуть позже.",
-            show_alert=True,
-        )
+        msg = "Не получилось открыть оплату. Попробуй чуть позже."
+        if isinstance(target, CallbackQuery):
+            await target.answer(msg, show_alert=True)
+        else:
+            await target.answer(msg)
         return
 
     confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
     if not confirmation_url:
         logger.error("[payment] no confirmation_url in YooKassa response: %s", payment)
-        await callback.answer(
-            "ЮKassa не вернула ссылку на оплату — попробуй ещё раз.",
-            show_alert=True,
-        )
+        msg = "ЮKassa не вернула ссылку на оплату — попробуй ещё раз."
+        if isinstance(target, CallbackQuery):
+            await target.answer(msg, show_alert=True)
+        else:
+            await target.answer(msg)
         return
 
     text = (
@@ -681,8 +733,57 @@ async def _start_yookassa_payment(
         [InlineKeyboardButton(text="⬅️ К тарифам",    callback_data="menu:tariffs")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
     ])
-    await _present(callback, text, keyboard=keyboard)
-    await callback.answer()
+    await _present(target, text, keyboard=keyboard)
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+
+
+@router.callback_query(F.data == "buy:cancel")
+async def callback_buy_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Отменено")
+    await _show_tariffs(callback)
+
+
+@router.message(Command("cancel"), StateFilter(BuyStates.waiting_for_email))
+async def cmd_cancel_buy(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("✅ Отменено.", reply_markup=back_to_menu_keyboard())
+
+
+@router.message(StateFilter(BuyStates.waiting_for_email), F.text)
+async def handle_email_input(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not _EMAIL_RE.match(raw):
+        await message.answer(
+            "Это не похоже на email. Пришли в формате <code>name@example.com</code> "
+            "или /cancel чтобы отмена.",
+            parse_mode="HTML",
+        )
+        return
+
+    data = await state.get_data()
+    tariff_id = data.get("buy_tariff_id")
+    await state.clear()
+    if not tariff_id:
+        await message.answer(
+            "Сессия покупки потерялась. Открой 💎 Тарифы заново.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    rules = _TARIFF_RULES.get(tariff_id)
+    meta = _tariff_meta(tariff_id)
+    if rules is None or meta is None:
+        await message.answer("Неизвестный тариф.")
+        return
+
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+    await db.set_user_email(user_id, raw)
+
+    await _start_yookassa_payment(message, tariff_id, meta, rules, email=raw)
 
 
 async def _show_add_hint(target):
@@ -1121,6 +1222,12 @@ async def cmd_testbuy(message: Message):
         )
         return
 
+    # Email needed for the receipt under Мой налог. Reuse the value
+    # the admin already saved (likely from a previous /testbuy run);
+    # fall back to a hardcoded test address otherwise so the admin
+    # doesn't have to type it on every iteration.
+    email = await db.get_user_email(user_id) or "test@example.com"
+
     rub_amount = rules["kopeks"] / 100.0
     receipt_items = [yk.build_receipt_item(name, rub_amount)]
     metadata = {
@@ -1139,6 +1246,7 @@ async def cmd_testbuy(message: Message):
             metadata=metadata,
             return_url=return_url,
             receipt_items=receipt_items,
+            customer_email=email,
         )
     except yk.YooKassaError as e:
         logger.exception("[testbuy] create_payment failed for tariff=%s", tariff_id)
@@ -1157,6 +1265,7 @@ async def cmd_testbuy(message: Message):
     await message.answer(
         f"🧪 <b>Тест YooKassa — {name}</b>\n\n"
         f"Сумма: <b>{rub_amount:.2f} ₽</b>\n"
+        f"Email чека: <code>{_html.escape(email)}</code>\n"
         f"Payment ID: <code>{payment.get('id', '?')}</code>\n\n"
         f"Жми кнопку → откроется страница ЮKassa со всеми способами "
         f"оплаты. Админ-статус не изменится после оплаты.",

@@ -39,6 +39,8 @@ async def create_payment(
     amount_rub: float, description: str,
     metadata: dict, return_url: str,
     receipt_items: list[dict] | None = None,
+    customer_email: str | None = None,
+    customer_phone: str | None = None,
 ) -> dict:
     """Create a YooKassa payment and return the response dict.
 
@@ -52,6 +54,13 @@ async def create_payment(
     the webhook event. We put `telegram_id` and `tariff_id` here so
     the webhook handler can route activation without holding any
     server-side state between create and confirm.
+
+    When the shop has Мой налог auto-receipts on (mandatory for
+    самозанятый), YooKassa requires `receipt.customer.email` or
+    `.phone` at create time — passing the receipt block alone
+    fails with HTTP 400. The hosted page does NOT collect this on
+    our behalf, contrary to what the docs imply. Caller must pass
+    `customer_email` (or `customer_phone`).
     """
     body = {
         "amount": {
@@ -68,10 +77,15 @@ async def create_payment(
         "metadata": metadata,
     }
     if receipt_items:
-        # `customer` is omitted on purpose — YooKassa's hosted page
-        # collects the email/phone from the payer when the receipt
-        # is required, so we don't have to.
-        body["receipt"] = {"items": receipt_items}
+        receipt: dict = {"items": receipt_items}
+        customer: dict = {}
+        if customer_email:
+            customer["email"] = customer_email
+        if customer_phone:
+            customer["phone"] = customer_phone
+        if customer:
+            receipt["customer"] = customer
+        body["receipt"] = receipt
 
     # YooKassa requires Idempotence-Key on POSTs that mutate state.
     # Passing a fresh random key on each create is correct — if our
