@@ -427,10 +427,10 @@ async def callback_set_timezone(callback: CallbackQuery):
 # string for the UI, the limits string, an optional footnote, plus
 # the machine-readable price/duration/sub-limit triplet.
 _TARIFFS = [
-    ("trial",    "🎁 Пробный",          "Бесплатно",     "1 поиск, 6 часов",   "(только один раз)"),
-    ("basic",    "💎 Базовый",          "890 ₽/мес",     "1 поиск, 30 дней",   None),
-    ("advanced", "⚡ Продвинутый",       "1 790 ₽/мес",   "3 поиска, 30 дней",  None),
-    ("pro",      "👑 Профессиональный", "2 590 ₽/мес",   "5 поисков, 30 дней", None),
+    ("trial",    "🎁 Пробный",          "Бесплатно",     "1 ссылка-поиск, 6 часов",     "(только один раз)"),
+    ("basic",    "💎 Базовый",          "890 ₽/мес",     "1 ссылка-поиск, 30 дней",     None),
+    ("advanced", "⚡ Продвинутый",       "1 790 ₽/мес",   "3 ссылки-поиска, 30 дней",    None),
+    ("pro",      "👑 Профессиональный", "2 590 ₽/мес",   "5 ссылок-поисков, 30 дней",   None),
 ]
 
 # tariff_id → (max_subs, hours, price_kopeks). `legacy` is the
