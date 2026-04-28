@@ -12,9 +12,11 @@ import orjson
 from config import config
 from .base import SearchItem
 from .common import (
+    MAX_JSON_BYTES,
     download_image_bytes,
     get_cloudscraper,
     global_request_lock,
+    host_in_allowlist,
     invalidate_session,
     looks_like_image_url,
     proxies_dict,
@@ -26,14 +28,18 @@ logger = logging.getLogger(__name__)
 _HOST = "avito"
 _WARMUP_URLS = ("https://www.avito.ru/", "https://m.avito.ru/")
 
-_AVITO_URL_RE = re.compile(r"https?://(?:www\.|m\.)?avito\.ru/", re.IGNORECASE)
+# Strict hostname allowlist. Was previously `re.search(r"avito\.ru/", url)`
+# which matched substrings anywhere in the URL (incl. the query string),
+# letting an attacker SSRF arbitrary hosts via `?u=https://avito.ru/x`.
+# urlparse().hostname extraction + exact set membership closes that path.
+_AVITO_HOSTS = frozenset({"avito.ru", "www.avito.ru", "m.avito.ru"})
 
 
 class AvitoSource:
     name = "avito"
 
     def matches(self, url: str) -> bool:
-        return bool(_AVITO_URL_RE.search(url or ""))
+        return host_in_allowlist(url, _AVITO_HOSTS)
 
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
@@ -129,6 +135,9 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[SearchItem] | Non
     for idx, script in enumerate(mfe_scripts):
         body = (script.text or "").strip()
         if not body or "sandbox" in body[:200]:
+            continue
+        if len(body) > MAX_JSON_BYTES:
+            logger.warning("[avito] mfe #%d body oversized: %d bytes", idx, len(body))
             continue
         try:
             data = orjson.loads(html_lib.unescape(body))

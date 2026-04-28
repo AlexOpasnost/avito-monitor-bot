@@ -20,6 +20,7 @@ the create-payment body. `vat_code=1` (без НДС) matches НПД rules.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 
 import httpx
@@ -32,6 +33,32 @@ TIMEOUT_SECONDS = 15.0
 
 class YooKassaError(Exception):
     """Raised when YooKassa returns a non-2xx or the request fails."""
+
+
+def _sanitize_error_body(text: str | None, max_len: int = 200) -> str:
+    """Trim YooKassa error bodies for safe logging.
+
+    Errors from YooKassa sometimes echo customer-controlled data back
+    (the email we passed, the description), and on `cancellation_details`
+    rare paths can include card metadata. Logging the full body wrote
+    that into Railway logs / any downstream sink. Strip emails and
+    keep the structure ({code, parameter, type, description}) but
+    mask values that look like personal data.
+    """
+    if not text:
+        return ""
+    sample = text[:max_len]
+    # Mask anything that smells like an email — leaves enough to
+    # identify the value class without exposing the address.
+    sample = re.sub(
+        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}",
+        "<email>", sample,
+    )
+    # Mask 13–19 digit runs (PAN-shaped). YooKassa shouldn't leak full
+    # PANs, but cancellation_details has been observed with last4 in
+    # the past — still mask just in case.
+    sample = re.sub(r"\b\d{13,19}\b", "<digits>", sample)
+    return sample
 
 
 async def create_payment(
@@ -107,12 +134,13 @@ async def create_payment(
         raise YooKassaError(f"network: {e}") from e
 
     if resp.status_code >= 400:
+        sanitized = _sanitize_error_body(resp.text)
         logger.error(
             "[yookassa] create_payment %d body=%s",
-            resp.status_code, resp.text[:500],
+            resp.status_code, sanitized,
         )
         raise YooKassaError(
-            f"create_payment HTTP {resp.status_code}: {resp.text[:200]}"
+            f"create_payment HTTP {resp.status_code}: {sanitized}"
         )
     return resp.json()
 
@@ -137,12 +165,48 @@ async def get_payment(
         raise YooKassaError(f"network: {e}") from e
 
     if resp.status_code >= 400:
+        sanitized = _sanitize_error_body(resp.text)
         logger.error(
             "[yookassa] get_payment %d body=%s",
-            resp.status_code, resp.text[:500],
+            resp.status_code, sanitized,
         )
         raise YooKassaError(
-            f"get_payment HTTP {resp.status_code}: {resp.text[:200]}"
+            f"get_payment HTTP {resp.status_code}: {sanitized}"
+        )
+    return resp.json()
+
+
+async def get_refund(
+    refund_id: str, *, shop_id: str, secret_key: str,
+) -> dict:
+    """Fetch an existing refund by id.
+
+    Used by the refund webhook handler as a verification step. The
+    POST body of a refund.succeeded event is fully attacker-controlled
+    if the IP allowlist is ever bypassed (X-Forwarded-For spoofing,
+    misconfigured proxy, direct path) — without this GET-back, an
+    attacker could deactivate any user's tariff and spam them with a
+    "refund processed" DM. With it, only refunds that actually exist
+    in our shop's books can drive deactivation.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                f"{API_BASE}/refunds/{refund_id}",
+                auth=(shop_id, secret_key),
+            )
+    except httpx.RequestError as e:
+        logger.exception("[yookassa] get_refund network err: %s", e)
+        raise YooKassaError(f"network: {e}") from e
+
+    if resp.status_code >= 400:
+        sanitized = _sanitize_error_body(resp.text)
+        logger.error(
+            "[yookassa] get_refund %d body=%s",
+            resp.status_code, sanitized,
+        )
+        raise YooKassaError(
+            f"get_refund HTTP {resp.status_code}: {sanitized}"
         )
     return resp.json()
 

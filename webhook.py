@@ -25,7 +25,7 @@ from aiohttp import web
 
 from config import config
 from database import db
-from services.yookassa import YooKassaError, get_payment
+from services.yookassa import YooKassaError, get_payment, get_refund
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +33,31 @@ logger = logging.getLogger(__name__)
 def _client_ip(request: web.Request) -> str | None:
     """Resolve the real client IP behind Railway's edge proxy.
 
-    Railway forwards the original client IP in X-Forwarded-For —
-    take the leftmost entry (the entry the upstream wrote, not
-    intermediate proxies). Falls back to peer remote when the
-    header is absent (local dev / direct connection)."""
+    Security note: the **leftmost** entry of `X-Forwarded-For` is fully
+    attacker-controlled — any HTTP client can set
+    `X-Forwarded-For: 185.71.76.5, real-attacker-ip` and the leftmost
+    value will look like a YooKassa CIDR even though the connection
+    came from somewhere else. The previous code did exactly that and
+    was bypassable by anyone who could reach the aiohttp listener
+    directly (Railway internal network co-tenants, future re-deploys
+    without an edge proxy, or local dev).
+
+    Correct trust model: trust the **rightmost** hop that *we*
+    appended (the one closest to our server). Railway's edge sets
+    `X-Real-IP` to the canonical client address after stripping the
+    untrusted leftmost entries, so prefer that when present. Fall back
+    to the rightmost X-Forwarded-For entry, then to the peer remote.
+    """
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
     fwd = request.headers.get("X-Forwarded-For", "").strip()
     if fwd:
-        return fwd.split(",")[0].strip()
+        # Rightmost = the IP the upstream proxy *we* trust observed.
+        # Leftmost is whatever the client typed and is forgeable.
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.remote
 
 
@@ -173,41 +191,47 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         amount_minor = 0
 
-    # Idempotency: payment_id is unique per YooKassa transaction.
-    # ON CONFLICT DO NOTHING in record_payment makes the second
-    # delivery a no-op.
+    # Atomic record + activate. The combined transaction prevents the
+    # "paid but no tariff" failure mode that the old two-step flow had:
+    # if record_payment succeeded server-side but the client never got
+    # the ack, _execute's retry-on-network-error would re-run the INSERT,
+    # hit ON CONFLICT, and tell us "already activated" — but the second
+    # step (activate_tariff) had never actually run. Customer money,
+    # no service. See database.record_and_activate_payment for the full
+    # rationale.
     try:
-        is_new = await db.record_payment(
+        is_new, new_exp = await db.record_and_activate_payment(
             telegram_charge_id=payment_id,
             provider_charge_id=payment_id,
             user_id=user_id,
             tariff_id=tariff_id,
             amount_minor=amount_minor,
             currency=currency,
+            hours=rules["hours"],
         )
     except Exception:
         logger.exception(
-            "[yookassa-wh] record_payment failed: payment=%s user=%d tariff=%s",
+            "[yookassa-wh] record_and_activate failed: payment=%s user=%d tariff=%s",
             payment_id, user_id, tariff_id,
         )
-        return web.Response(status=200, text="ok")
+        # Return 500 so YooKassa retries — nothing committed because the
+        # whole record+activate is a single transaction. A retry will
+        # either succeed cleanly or hit the same error for triage.
+        return web.Response(status=500, text="retry")
 
     if not is_new:
         logger.info("[yookassa-wh] duplicate %s — already activated", payment_id)
         return web.Response(status=200, text="ok")
 
-    try:
-        new_exp = await db.activate_tariff(
-            user_id, tariff_id, rules["hours"], is_trial=False,
+    if new_exp is None:
+        # Should never happen — INSERT succeeded but UPDATE returned no
+        # row, which means user_id was deleted between get_or_create_user
+        # and the UPDATE. Log loudly; ack 200 because re-delivery won't
+        # help (the conflicting payment row is already in the table).
+        logger.error(
+            "[yookassa-wh] new payment %s recorded but UPDATE returned no row "
+            "(user=%d gone?)", payment_id, user_id,
         )
-    except Exception:
-        logger.exception(
-            "[yookassa-wh] activate_tariff failed AFTER record_payment: "
-            "payment=%s user=%d tariff=%s",
-            payment_id, user_id, tariff_id,
-        )
-        # Still ack — payments row already locked the charge_id, so
-        # a retry won't double-activate; manual fix needed.
         return web.Response(status=200, text="ok")
 
     bot: Bot = request.app["bot"]
@@ -240,39 +264,115 @@ async def _handle_refund_event(request: web.Request, refund_obj: dict) -> web.Re
     and the customer's card got the money back. We deactivate the
     tariff so the user doesn't keep getting paid features for free.
 
-    The refund event carries `payment_id` (the original payment that
-    was refunded) — we look up the affected user via the `payments`
-    table, then reset users.tariff. trial_used is preserved so
-    refunded users can't re-claim the freebie.
+    Two defenses against forged/replayed refund POSTs:
+
+    1. GET-back to /v3/refunds/{id} with our shop credentials. A
+       forged refund event with an arbitrary `payment_id` would let
+       an attacker deactivate any user's tariff (and spam their DM)
+       once the IP allowlist is bypassed. Looking the refund up by
+       its own id, with our secret, means only refunds that actually
+       exist on YooKassa's books can drive deactivation here. We
+       also read the canonical `payment_id` from this response, not
+       from the POST body.
+
+    2. `refunds` idempotency table. A second delivery of the same
+       refund_id (legitimate retry, replay, our own _execute retry)
+       is a no-op — no second deactivation, no second DM. Without
+       this, an attacker spraying duplicates triggers Telegram's
+       anti-spam against the bot.
     """
-    payment_id = refund_obj.get("payment_id") or refund_obj.get("id")
+    refund_id = refund_obj.get("id")
+    if not refund_id:
+        logger.warning("[yookassa-wh] refund event missing refund id")
+        return web.Response(status=200, text="ok")
+
+    if not (config.yookassa_shop_id and config.yookassa_secret_key):
+        logger.error("[yookassa-wh] YOOKASSA_SHOP_ID/SECRET_KEY not configured")
+        return web.Response(status=503, text="not configured")
+
+    # Re-fetch the refund from YooKassa with our shop credentials.
+    # Forged POSTs can carry any refund id; only real refunds in our
+    # books come back with a 200 here.
+    try:
+        refund = await get_refund(
+            refund_id,
+            shop_id=config.yookassa_shop_id,
+            secret_key=config.yookassa_secret_key,
+        )
+    except YooKassaError as e:
+        logger.error("[yookassa-wh] refund verify failed for %s: %s", refund_id, e)
+        # Ack 200 — same reasoning as the payment.succeeded path.
+        return web.Response(status=200, text="ok")
+
+    status = refund.get("status")
+    if status != "succeeded":
+        logger.info(
+            "[yookassa-wh] refund %s status=%s — skipping deactivation",
+            refund_id, status,
+        )
+        return web.Response(status=200, text="ok")
+
+    # Authoritative payment_id from the verified refund response, not
+    # the POST body.
+    payment_id = refund.get("payment_id")
     if not payment_id:
-        logger.warning("[yookassa-wh] refund event missing payment_id")
+        logger.warning(
+            "[yookassa-wh] refund %s has no payment_id in verified response",
+            refund_id,
+        )
         return web.Response(status=200, text="ok")
 
     user_id = await db.get_payment_user_id(payment_id)
     if user_id is None:
         logger.warning(
-            "[yookassa-wh] refund for unknown payment_id=%s — no-op",
-            payment_id,
+            "[yookassa-wh] refund %s for unknown payment_id=%s — no-op",
+            refund_id, payment_id,
         )
+        return web.Response(status=200, text="ok")
+
+    amount = refund.get("amount") or {}
+    currency = (amount.get("currency") or "RUB").upper()
+    try:
+        amount_minor = int(round(float(amount.get("value", "0")) * 100))
+    except (TypeError, ValueError):
+        amount_minor = 0
+
+    # Idempotency gate — first delivery proceeds, dupes return early.
+    try:
+        is_new = await db.record_refund(
+            refund_id=refund_id,
+            payment_id=payment_id,
+            user_id=user_id,
+            amount_minor=amount_minor,
+            currency=currency,
+        )
+    except Exception:
+        logger.exception(
+            "[yookassa-wh] record_refund failed: refund=%s payment=%s",
+            refund_id, payment_id,
+        )
+        return web.Response(status=500, text="retry")
+
+    if not is_new:
+        logger.info("[yookassa-wh] duplicate refund %s — already processed", refund_id)
         return web.Response(status=200, text="ok")
 
     try:
         await db.deactivate_user_tariff(user_id)
     except Exception:
         logger.exception(
-            "[yookassa-wh] deactivate_user_tariff failed: user=%d payment=%s",
-            user_id, payment_id,
+            "[yookassa-wh] deactivate_user_tariff failed: user=%d refund=%s",
+            user_id, refund_id,
         )
         return web.Response(status=200, text="ok")
 
     logger.info(
-        "[yookassa-wh] refund — deactivated tariff for user=%d (payment=%s)",
-        user_id, payment_id,
+        "[yookassa-wh] refund %s — deactivated tariff for user=%d (payment=%s)",
+        refund_id, user_id, payment_id,
     )
 
-    # Best-effort DM to the user.
+    # Best-effort DM to the user — only sent on the first (is_new=True)
+    # processing of this refund_id, so a duplicate delivery never spams.
     bot: Bot = request.app["bot"]
     try:
         tg_id = await db.get_telegram_id(user_id)

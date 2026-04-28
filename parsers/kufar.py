@@ -17,9 +17,11 @@ import orjson
 
 from .base import SearchItem
 from .common import (
+    MAX_JSON_BYTES,
     download_image_bytes,
     get_cloudscraper,
     global_request_lock,
+    host_in_allowlist,
     invalidate_session,
     proxies_dict,
     rotate_ip,
@@ -29,7 +31,8 @@ logger = logging.getLogger(__name__)
 
 _HOST = "kufar"
 _WARMUP_URLS = ("https://www.kufar.by/",)
-_KUFAR_URL_RE = re.compile(r"https?://(?:www\.|m\.)?kufar\.by/", re.IGNORECASE)
+# Hostname allowlist (see common.host_in_allowlist for SSRF rationale).
+_KUFAR_HOSTS = frozenset({"kufar.by", "www.kufar.by", "m.kufar.by"})
 
 # Kufar image CDN. `path` in __NEXT_DATA__ is "adim1/<uuid>.jpg".
 # list_thumbs_2x = the size the listings page itself renders.
@@ -40,7 +43,7 @@ class KufarSource:
     name = "kufar"
 
     def matches(self, url: str) -> bool:
-        return bool(_KUFAR_URL_RE.search(url or ""))
+        return host_in_allowlist(url, _KUFAR_HOSTS)
 
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
@@ -137,6 +140,9 @@ def _extract_items(html: str, url: str) -> list[SearchItem] | None:
         return None
     body = (script.text or "").strip()
     if not body:
+        return None
+    if len(body) > MAX_JSON_BYTES:
+        logger.warning("[kufar] __NEXT_DATA__ body oversized: %d bytes", len(body))
         return None
     try:
         data = orjson.loads(body)

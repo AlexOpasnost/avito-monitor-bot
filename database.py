@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self):
         self.pool: asyncpg.Pool | None = None
+        # Serialises pool tear-down + recreation so a thundering herd of
+        # coroutines all hitting a transient DB error can't each spawn
+        # their own new pool (which would over-saturate Neon/Railway's
+        # connection budget and keep cascading).
+        self._pool_swap_lock = asyncio.Lock()
 
     async def connect(self):
         # Step 1: wake up PG (Neon/Railway) with direct connection
@@ -49,9 +54,24 @@ class Database:
             max_inactive_connection_lifetime=30,
         )
 
-    async def _execute(self, coro_fn):
-        """Execute a DB operation with automatic reconnect on failure."""
-        for attempt in range(3):
+    async def _execute(self, coro_fn, *, idempotent: bool = True):
+        """Execute a DB operation with automatic reconnect on failure.
+
+        `idempotent` controls retry safety. The retry envelope catches
+        connection errors and timeouts — but a TimeoutError on a
+        non-idempotent statement (INSERT, INCREMENT) can fire AFTER the
+        server committed the change, just before the client got the ack.
+        Re-running the statement then duplicates the work. So:
+
+        - idempotent=True (default, safe for SELECT, ON CONFLICT
+          DO NOTHING, atomic CAS UPDATEs): retry up to 3 times.
+        - idempotent=False: try once; on connection/timeout error,
+          give up and propagate so the caller can decide
+          (e.g. webhook returns 500 and YooKassa retries the whole
+          event with full atomic state).
+        """
+        max_attempts = 3 if idempotent else 1
+        for attempt in range(max_attempts):
             conn = None
             try:
                 conn = await asyncio.wait_for(self.pool.acquire(), timeout=10)
@@ -60,26 +80,41 @@ class Database:
                     asyncpg.InterfaceError,
                     OSError,
                     asyncio.TimeoutError) as e:
-                logger.warning("DB error (attempt %d/3): %s", attempt + 1, e)
+                logger.warning(
+                    "DB error (attempt %d/%d, idempotent=%s): %s",
+                    attempt + 1, max_attempts, idempotent, e,
+                )
                 if conn:
                     try:
                         await self.pool.release(conn)
                     except Exception:
                         pass
                     conn = None
-                try:
-                    await asyncio.wait_for(self.pool.close(), timeout=5)
-                except Exception:
-                    pass
-                self.pool = await self._create_pool()
-                await asyncio.sleep(1)
+                # Pool tear-down + recreate is a thundering-herd risk:
+                # without serialisation, every concurrent failing op
+                # spawns its own new pool, blowing past PG's connection
+                # cap. The lock funnels recreation through one path;
+                # subsequent waiters re-check whether the pool was
+                # already swapped before tearing it down again.
+                broken = self.pool
+                async with self._pool_swap_lock:
+                    if self.pool is broken:
+                        try:
+                            await asyncio.wait_for(broken.close(), timeout=5)
+                        except Exception:
+                            pass
+                        self.pool = await self._create_pool()
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(1)
             finally:
                 if conn:
                     try:
                         await self.pool.release(conn)
                     except Exception:
                         pass
-        raise RuntimeError("DB operation failed after 3 attempts")
+        if idempotent:
+            raise RuntimeError("DB operation failed after 3 attempts")
+        raise RuntimeError("DB operation failed (non-idempotent, no retry)")
 
     async def close(self):
         if self.pool:
@@ -185,6 +220,17 @@ class Database:
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used "
                 "BOOLEAN DEFAULT FALSE"
             )
+            # `_migrations` MUST exist before the first _apply_once
+            # call — _apply_once reads/writes this table to track
+            # one-shot migrations. Previously placed below the first
+            # _apply_once, which crashed on fresh DBs (caught by the
+            # silent debug-log; now we re-raise on failure).
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
             # Grandfather everyone who registered before paywall existed —
             # if they ever had a subscription, give them tariff='legacy'
             # (no expiry, max 5 searches) so the new limit doesn't lock
@@ -207,6 +253,22 @@ class Database:
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
+            # Refund idempotency. The webhook handler INSERTs here with
+            # ON CONFLICT DO NOTHING; a second delivery of the same
+            # refund_id is then a no-op (no second tariff deactivation,
+            # no second DM to the user). Without this, a forged or
+            # replayed refund.succeeded event could repeatedly DM the
+            # victim — Telegram anti-spam catches the bot first.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS refunds (
+                    refund_id TEXT PRIMARY KEY,
+                    payment_id TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    amount_minor BIGINT NOT NULL,
+                    currency TEXT NOT NULL,
+                    processed_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
             # Backfill any NULLs that may have crept in from older rows.
             await conn.execute(
                 "UPDATE subscriptions SET source='avito' WHERE source IS NULL"
@@ -224,17 +286,18 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_sent_items_source ON sent_items(source)"
             )
 
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS _migrations (
-                    name TEXT PRIMARY KEY,
-                    applied_at TIMESTAMPTZ DEFAULT NOW()
-                )
-            """)
             await self._apply_once(conn, "cleanup_2026_04_19",
                                     self._cleanup_subscriptions_2026_04_19)
             logger.info("Migrations applied")
-        except Exception as e:
-            logger.debug("Migration note: %s", e)
+        except Exception:
+            # The whole migration block was previously try/except'd at
+            # logger.debug — silently swallowing every schema error,
+            # including ones that left the DB in a half-migrated state
+            # (no _migrations table created, partial column adds, etc.).
+            # Re-raise so a broken schema fails the bot at startup
+            # instead of running for hours and corrupting data.
+            logger.exception("[migrations] schema migration failed — refusing to start")
+            raise
 
     async def _apply_once(self, conn, name: str, op):
         """Run a one-shot migration exactly once, tracked in _migrations."""
@@ -458,7 +521,10 @@ class Database:
                     user_id, url, source,
                 )
                 return row["id"]
-        return await self._execute(_op)
+        # Non-idempotent: a TimeoutError after a committed INSERT would
+        # otherwise re-run the INSERT and create a duplicate sub. Caller
+        # gets the exception and surfaces "ошибка, попробуй ещё раз".
+        return await self._execute(_op, idempotent=False)
 
     async def count_active_subs(self, user_id: int) -> int:
         async def _op(conn):
@@ -551,18 +617,160 @@ class Database:
             return new_exp
         return await self._execute(_op)
 
+    async def record_refund(
+        self, *, refund_id: str, payment_id: str,
+        user_id: int, amount_minor: int, currency: str,
+    ) -> bool:
+        """Record a verified refund for idempotency.
+
+        Returns True if this is the first time we see this refund_id;
+        the caller should then deactivate the user's tariff and DM
+        them once. Returns False on a duplicate delivery (replay,
+        YooKassa retry, our own retry-on-network-error) — caller acks
+        and moves on without re-deactivating or re-DMing.
+        """
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "INSERT INTO refunds "
+                "(refund_id, payment_id, user_id, amount_minor, currency) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (refund_id) DO NOTHING "
+                "RETURNING refund_id",
+                refund_id, payment_id, user_id, amount_minor, currency,
+            )
+            return row is not None
+        return await self._execute(_op)
+
+    async def prune_sent_items(self, days: int = 30) -> int:
+        """Delete sent_items rows older than `days`. Returns deleted count.
+
+        152-ФЗ §5(4) data minimization: we only need recent history
+        to dedup notifications — items older than ~30 days won't
+        re-appear in marketplace feeds anyway. Without a prune job
+        this table grows unbounded (~80 items × N subs × 1 cycle/min)
+        and accumulates a per-user shopping-history footprint that's
+        legally exposed PII over time.
+        """
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "WITH d AS ("
+                "  DELETE FROM sent_items "
+                "  WHERE sent_at < NOW() - ($1::int || ' days')::interval "
+                "  RETURNING 1"
+                ") SELECT COUNT(*) AS n FROM d",
+                days,
+            )
+            return int(row["n"] if row else 0)
+        return await self._execute(_op)
+
+    async def export_user_data(self, user_id: int) -> dict | None:
+        """152-ФЗ Art. 14 right of access — full data dump for the user.
+
+        Returns a JSON-serializable dict with the user's profile,
+        subscriptions (incl. soft-deleted), and payment history.
+        Returns None if the user_id doesn't exist.
+        """
+        async def _op(conn):
+            user = await conn.fetchrow(
+                "SELECT id, telegram_id, username, email, lang, currency, "
+                "       timezone, onboarded, tariff, tariff_expires_at, "
+                "       trial_used, created_at "
+                "FROM users WHERE id = $1",
+                user_id,
+            )
+            if not user:
+                return None
+            subs = await conn.fetch(
+                "SELECT id, url, source, name, is_active, deleted, "
+                "       error_count, last_error, last_checked_at, "
+                "       created_at "
+                "FROM subscriptions WHERE user_id = $1 ORDER BY created_at",
+                user_id,
+            )
+            pays = await conn.fetch(
+                "SELECT telegram_charge_id, tariff_id, amount_minor, "
+                "       currency, created_at "
+                "FROM payments WHERE user_id = $1 ORDER BY created_at",
+                user_id,
+            )
+            return {
+                "user": dict(user),
+                "subscriptions": [dict(s) for s in subs],
+                "payments": [dict(p) for p in pays],
+            }
+        return await self._execute(_op)
+
+    async def delete_user_data(self, user_id: int) -> dict:
+        """152-ФЗ Art. 14 right of erasure — hard-delete the user.
+
+        Subscriptions and sent_items cascade on FK. Payments are
+        retained but anonymized (user_id → -1) because НК РФ requires
+        merchants to keep fiscal records for 4 years; anonymizing the
+        link to a person satisfies both 152-ФЗ data minimization and
+        the tax-retention obligation.
+
+        Trial usage history is lost with the user row — re-registration
+        from the same Telegram account would get a fresh trial. This is
+        accepted: an attacker exploiting it pays via SIM rotation
+        anyway, and we'd rather honor erasure cleanly than carry a
+        deletion-resistant blocklist that itself becomes PII.
+        """
+        async def _op(conn):
+            async with conn.transaction():
+                payments_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM payments WHERE user_id = $1",
+                    user_id,
+                ) or 0
+                if payments_count:
+                    await conn.execute(
+                        "UPDATE payments SET user_id = -1 WHERE user_id = $1",
+                        user_id,
+                    )
+                subs_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1",
+                    user_id,
+                ) or 0
+                sent_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM sent_items "
+                    "WHERE subscription_id IN "
+                    "  (SELECT id FROM subscriptions WHERE user_id = $1)",
+                    user_id,
+                ) or 0
+                # ON DELETE CASCADE on subscriptions and sent_items wipes
+                # them when the user row is removed.
+                await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+                return {
+                    "payments_anonymized": int(payments_count),
+                    "subscriptions_deleted": int(subs_count),
+                    "sent_items_deleted": int(sent_count),
+                }
+        return await self._execute(_op, idempotent=False)
+
     async def deactivate_user_tariff(self, user_id: int) -> None:
         """Force the user's tariff back to free state. Used by the
         webhook handler when YooKassa reports a refund — the customer
         got their money back, so we revoke access immediately. Trial
         history is preserved (trial_used stays as-is) so they can't
         re-claim the freebie.
+
+        Also pauses all the user's active subscriptions so the
+        scheduler stops fetching marketplace pages on their behalf —
+        previously a refunded user kept burning proxy/parser cycles
+        until their subs hit their own error budget. Subscriptions
+        are paused (is_active=FALSE), not deleted, so when they
+        re-subscribe the URLs come back with one /start.
         """
         async def _op(conn):
-            await conn.execute(
-                "UPDATE users SET tariff = NULL, tariff_expires_at = NULL "
-                "WHERE id = $1", user_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE users SET tariff = NULL, tariff_expires_at = NULL "
+                    "WHERE id = $1", user_id,
+                )
+                await conn.execute(
+                    "UPDATE subscriptions SET is_active = FALSE "
+                    "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
+                    user_id,
+                )
         await self._execute(_op)
 
     async def get_telegram_id(self, user_id: int) -> int | None:
@@ -606,6 +814,15 @@ class Database:
         Returns True if this is a new charge (caller should activate the
         tariff), False if the same telegram_charge_id was already
         recorded (Telegram is retrying the delivery; skip activation).
+
+        NB: for the YooKassa webhook path, prefer
+        `record_and_activate_payment` — it folds the INSERT and the
+        tariff UPDATE into one transaction so the user can never end up
+        with a recorded payment but no activation (which is what would
+        happen here if the caller crashes between record_payment and
+        activate_tariff, or if `_execute`'s retry-on-network-error path
+        triggers after the INSERT committed but before the client got
+        the ack).
         """
         async def _op(conn):
             row = await conn.fetchrow(
@@ -619,6 +836,84 @@ class Database:
                 tariff_id, amount_minor, currency,
             )
             return row is not None
+        return await self._execute(_op)
+
+    async def record_and_activate_payment(
+        self, *,
+        telegram_charge_id: str, provider_charge_id: str | None,
+        user_id: int, tariff_id: str,
+        amount_minor: int, currency: str,
+        hours: int,
+    ) -> tuple[bool, datetime | None]:
+        """Atomically record a paid charge AND extend the user's tariff.
+
+        Returns (was_new, new_expiry):
+        - was_new=True  → first time we see this charge; tariff was
+                          extended in this call. new_expiry is the
+                          updated `tariff_expires_at`.
+        - was_new=False → duplicate delivery (YooKassa retried, or our
+                          `_execute` retried after a network blip that
+                          actually committed). The tariff was extended
+                          in a *previous* call, so we MUST NOT extend
+                          again. new_expiry is None — the caller should
+                          treat this as "ack and move on".
+
+        Why this exists (was a real bug before this method):
+        - The previous flow was `record_payment()` then a separate
+          `activate_tariff()`. If `record_payment` succeeded server-side
+          but the client never got the ack, the connection-error retry
+          in `_execute` would re-run the INSERT, hit ON CONFLICT, and
+          return False — telling the webhook "already activated", but
+          activate_tariff was never actually called. Customer paid, no
+          tariff. Catastrophic.
+        - The previous activate_tariff for paid tariffs did
+          SELECT-then-UPDATE without a row lock. Two concurrent webhooks
+          for the same user (legitimate: e.g. two payments completing
+          within milliseconds) both read the same `current_exp`, both
+          computed `current_exp + hours`, second UPDATE overwrote the
+          first → user lost a paid month.
+
+        Both classes of bug collapse here:
+        - INSERT and UPDATE share one transaction. Failure → both
+          rolled back, retry safe. Success → both committed.
+        - The UPDATE uses GREATEST(NOW(), COALESCE(...)) so concurrent
+          extends stack instead of clobbering each other. Whichever
+          UPDATE runs second sees the first's committed value (REPEATABLE
+          READ in default isolation isn't enough on its own, but two
+          concurrent extends BOTH go through INSERT first; only one wins
+          ON CONFLICT, the other returns was_new=False and skips the
+          UPDATE entirely).
+        """
+        async def _op(conn):
+            async with conn.transaction():
+                ins = await conn.fetchrow(
+                    "INSERT INTO payments "
+                    "(telegram_charge_id, provider_charge_id, user_id, "
+                    " tariff_id, amount_minor, currency) "
+                    "VALUES ($1, $2, $3, $4, $5, $6) "
+                    "ON CONFLICT (telegram_charge_id) DO NOTHING "
+                    "RETURNING 1",
+                    telegram_charge_id, provider_charge_id, user_id,
+                    tariff_id, amount_minor, currency,
+                )
+                if ins is None:
+                    # Duplicate — activation already done in a prior call.
+                    return False, None
+
+                # Atomic extend: GREATEST guards against two concurrent
+                # extends collapsing into one (each goes through ON CONFLICT
+                # serialization, but defense-in-depth — and it correctly
+                # handles the case where current expiry is in the past).
+                row = await conn.fetchrow(
+                    "UPDATE users SET tariff = $2, "
+                    "  tariff_expires_at = "
+                    "    GREATEST(NOW(), COALESCE(tariff_expires_at, NOW())) "
+                    "    + ($3::int || ' hours')::interval "
+                    "WHERE id = $1 "
+                    "RETURNING tariff_expires_at",
+                    user_id, tariff_id, hours,
+                )
+                return True, (row["tariff_expires_at"] if row else None)
         return await self._execute(_op)
 
     async def get_user_subscriptions(self, user_id: int):
@@ -690,13 +985,22 @@ class Database:
             )
         return await self._execute(_op)
 
-    async def deactivate_subscription(self, sub_id: int):
+    async def deactivate_subscription(self, sub_id: int, user_id: int) -> bool:
+        # Ownership-checked soft delete. Both predicates are non-negotiable —
+        # the user_id guard is what stops a remote attacker from feeding
+        # `del:<random_id>` callbacks via the public Bot API and wiping
+        # other people's subscriptions. Returns False when no row matched
+        # so the caller can surface "не найдено" instead of pretending the
+        # delete succeeded.
         async def _op(conn):
-            await conn.execute(
-                "UPDATE subscriptions SET is_active = FALSE, deleted = TRUE WHERE id = $1",
-                sub_id,
+            row = await conn.fetchrow(
+                "UPDATE subscriptions SET is_active = FALSE, deleted = TRUE "
+                "WHERE id = $1 AND user_id = $2 AND deleted = FALSE "
+                "RETURNING id",
+                sub_id, user_id,
             )
-        await self._execute(_op)
+            return row is not None
+        return await self._execute(_op)
 
     async def deactivate_all(self, user_id: int):
         async def _op(conn):
@@ -740,7 +1044,11 @@ class Database:
                 )
                 return True
             return False
-        return await self._execute(_op)
+        # Non-idempotent — `error_count = error_count + 1` doubles on a
+        # naive retry, which would deactivate the sub a cycle early.
+        # Scheduler tolerates a one-cycle miss far better than a wrong
+        # deactivation, so we let this fail loudly.
+        return await self._execute(_op, idempotent=False)
 
     # --- Sent Items ---
 

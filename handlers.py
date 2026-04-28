@@ -24,6 +24,7 @@ import html as _html
 import json
 import logging
 import re
+import time
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -31,6 +32,7 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -76,10 +78,16 @@ class BuyStates(StatesGroup):
     waiting_for_email = State()
 
 
-# Loose email shape check — YooKassa does the real validation when
-# it tries to send the receipt. We just gate against obvious
-# mistypes (missing @, missing domain dot, whitespace).
-_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
+# Tightened email check. YooKassa validates the format properly when
+# issuing the receipt, but we want to reject obvious mistypes AND
+# anything that looks like an injection payload before storing in DB
+# / logging / sending to YooKassa. The previous regex (`[^\s@]+@…`)
+# accepted `<script>@x.co`, `"foo"@bar.co`, and any value with `<`,
+# `>`, `'`, `"`, backslashes, control chars — none of those are
+# producible by a real email address per RFC 5321 unprefixed.
+_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,24}$"
+)
 
 
 def _sub_display_name(sub: dict) -> str:
@@ -283,9 +291,14 @@ async def cmd_start(message: Message):
     user_id = await db.get_or_create_user(
         message.from_user.id, message.from_user.username,
     )
-    # Silently reactivate any paused subs — returning users don't need
-    # to re-do /start clicks to get their monitor back.
-    await db.reactivate_all(user_id)
+    # Reactivate paused subs ONLY if the user still has the tariff to
+    # back them. Admins also bypass — they always have access.
+    # Previously /start blanket-reactivated subs even after a refund,
+    # which kept the scheduler fetching marketplace pages for users
+    # who couldn't actually receive the notifications (gated by
+    # has_active_tariff in the scheduler) — pure proxy/CPU waste.
+    if is_admin(message.from_user.id) or await db.has_active_tariff(message.from_user.id):
+        await db.reactivate_all(user_id)
 
     prefs = await db.get_user_prefs(user_id)
     if prefs.get("onboarded"):
@@ -708,6 +721,40 @@ async def callback_buy_tariff(callback: CallbackQuery, state: FSMContext):
     await _start_yookassa_payment(callback, tariff_id, meta, rules, email=email)
 
 
+_PAYMENT_COOLDOWN_SECONDS = 60.0
+_PAYMENT_BUCKET_MAX = 1000
+_LAST_PAYMENT_AT: dict[int, float] = {}
+
+
+def _payment_cooldown_remaining(tg_id: int) -> int:
+    """Return seconds remaining on the per-user payment cooldown, or 0
+    if the user is allowed to create a payment right now.
+
+    Why this exists: every click on a "buy" button hits YooKassa's
+    /v3/payments endpoint and (under Мой налог) writes a fiscal-receipt
+    line item — auto-issued through ОФД. A spamming user can rack up
+    dozens of pending fiscal documents on the operator's tax account
+    and burn the YooKassa per-shop API quota at the same time. 60s
+    between create-payment calls per Telegram user is a generous
+    legitimate cadence (a real human filling out an email FSM and
+    clicking takes longer) and a hard wall against autoclickers.
+
+    LRU eviction caps memory at ~1000 entries; on a hot bot we
+    over-evict on any call that sees the dict over the cap.
+    """
+    now = time.monotonic()
+    last = _LAST_PAYMENT_AT.get(tg_id, 0.0)
+    elapsed = now - last
+    if elapsed >= _PAYMENT_COOLDOWN_SECONDS:
+        _LAST_PAYMENT_AT[tg_id] = now
+        if len(_LAST_PAYMENT_AT) > _PAYMENT_BUCKET_MAX:
+            cutoff = now - _PAYMENT_COOLDOWN_SECONDS * 4
+            for uid in [u for u, t in _LAST_PAYMENT_AT.items() if t < cutoff]:
+                del _LAST_PAYMENT_AT[uid]
+        return 0
+    return int(_PAYMENT_COOLDOWN_SECONDS - elapsed) + 1
+
+
 async def _start_yookassa_payment(
     target, tariff_id: str, meta, rules: dict, *,
     email: str, label_prefix: str = "",
@@ -719,6 +766,23 @@ async def _start_yookassa_payment(
     the tariffs grid) or a Message (when entering after the email
     FSM step finished). `_present` handles both.
     """
+    # Per-user cooldown — see _payment_cooldown_remaining for rationale.
+    # This is the only place that calls yk.create_payment, so gating
+    # here covers every entry point (tariffs button, email FSM finish,
+    # rebuy after refund). Admins are not exempted: the cooldown is
+    # 60s and even the operator should not need to mint payments faster.
+    cooldown = _payment_cooldown_remaining(target.from_user.id)
+    if cooldown > 0:
+        msg = (
+            f"⏳ Подожди {cooldown} сек. перед следующей попыткой оплаты — "
+            f"защита от случайных дублей."
+        )
+        if isinstance(target, CallbackQuery):
+            await target.answer(msg, show_alert=True)
+        else:
+            await target.answer(msg)
+        return
+
     _, name, price, limits, _ = meta
     rub_amount = rules["kopeks"] / 100.0
 
@@ -1050,6 +1114,133 @@ async def cmd_delete(message: Message):
     await _show_delete_picker(message)
 
 
+# ---------------------------------------------------------------------------
+# 152-ФЗ Art. 14 — right of access (export) and right of erasure (delete)
+# ---------------------------------------------------------------------------
+#
+# PRIVACY.md commits us to fulfilling these on user request. The
+# previous flow was "DM the operator", which technically satisfies
+# the law but breaks the 30-day SLA whenever the operator's away.
+# Self-service commands are operationally cleaner and audit-trail
+# better.
+
+def _serialize_for_export(value):
+    """Recursively convert datetime objects to ISO strings for JSON
+    output. asyncpg returns datetime/Decimal which json.dumps can't
+    handle natively."""
+    from decimal import Decimal
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _serialize_for_export(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_serialize_for_export(v) for v in value]
+    return value
+
+
+@router.message(Command("export_my_data"))
+async def cmd_export_my_data(message: Message):
+    """Send the caller a JSON dump of all their data.
+
+    152-ФЗ §14 §7 grants users the right to obtain copies of the
+    personal data being processed about them. We satisfy this with
+    a self-service command instead of a manual support workflow.
+    """
+    if message.chat.type != "private":
+        await message.answer(
+            "Эта команда работает только в личных сообщениях боту.",
+        )
+        return
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+    data = await db.export_user_data(user_id)
+    if data is None:
+        await message.answer("Нет данных для экспорта.")
+        return
+    payload = json.dumps(_serialize_for_export(data), ensure_ascii=False, indent=2)
+    blob = payload.encode("utf-8")
+    file = BufferedInputFile(blob, filename=f"autosearch_export_{user_id}.json")
+    await message.answer_document(
+        file,
+        caption=(
+            "Твои данные в формате JSON. Здесь профиль, активные и "
+            "удалённые поиски, история платежей.\n\n"
+            "Если хочешь полностью удалить аккаунт — "
+            "/delete_my_account."
+        ),
+    )
+
+
+@router.message(Command("delete_my_account"))
+async def cmd_delete_my_account(message: Message):
+    """Show a confirm prompt; the actual erasure runs only on
+    explicit callback to avoid accidental data loss.
+    """
+    if message.chat.type != "private":
+        await message.answer(
+            "Эта команда работает только в личных сообщениях боту.",
+        )
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🗑 Да, удалить навсегда",
+            callback_data="gdpr:confirm_delete",
+        )],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data="gdpr:cancel_delete")],
+    ])
+    await message.answer(
+        "⚠️ <b>Удаление аккаунта</b>\n\n"
+        "Будет удалено:\n"
+        "• Профиль (telegram_id, username, email, настройки)\n"
+        "• Все поиски (активные и удалённые)\n"
+        "• История уведомлений\n\n"
+        "Будет сохранено (для налоговой отчётности — НК РФ требует "
+        "хранить 4 года):\n"
+        "• История оплат — <b>обезличена</b>, без привязки к тебе\n\n"
+        "Действие необратимо. Подтверди или отменись.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "gdpr:confirm_delete")
+async def callback_gdpr_confirm_delete(callback: CallbackQuery):
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    try:
+        stats = await db.delete_user_data(user_id)
+    except Exception:
+        logger.exception("[gdpr] delete_user_data failed for user_id=%d", user_id)
+        await callback.answer(
+            "Не удалось выполнить удаление. Напиши в поддержку.",
+            show_alert=True,
+        )
+        return
+    logger.info(
+        "[gdpr] erasure executed: user_id=%d stats=%s",
+        user_id, stats,
+    )
+    await callback.message.edit_text(
+        "✅ Аккаунт удалён.\n\n"
+        f"Удалено поисков: {stats['subscriptions_deleted']}\n"
+        f"Удалено уведомлений: {stats['sent_items_deleted']}\n"
+        f"Обезличено платежей: {stats['payments_anonymized']}\n\n"
+        "/start запустит регистрацию заново — но это будет новый "
+        "аккаунт без истории.",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "gdpr:cancel_delete")
+async def callback_gdpr_cancel_delete(callback: CallbackQuery):
+    await callback.message.edit_text("Отменено. Аккаунт не тронут.")
+    await callback.answer()
+
+
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
     """Multi-tab admin panel.
@@ -1060,6 +1251,15 @@ async def cmd_admin(message: Message):
       /admin user <tg_id> — drill-down: profile + subs + payments
     """
     if not is_admin(message.from_user.id):
+        return
+    # DM-only: the bot's admin panel renders revenue, customer emails,
+    # and payment history. If a real admin types `/admin` in a group
+    # the bot also got added to, that data leaks to every member of
+    # the group. Refuse with a quiet hint instead of silently leaking.
+    if message.chat.type != "private":
+        await message.answer(
+            "Админ-команды работают только в личных сообщениях боту.",
+        )
         return
 
     raw = (message.text or "").strip().split()
@@ -1249,6 +1449,11 @@ async def cmd_testbuy(message: Message):
     """
     if not is_admin(message.from_user.id):
         return
+    if message.chat.type != "private":
+        await message.answer(
+            "Админ-команды работают только в личных сообщениях боту.",
+        )
+        return
 
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
@@ -1387,7 +1592,17 @@ async def callback_delete(callback: CallbackQuery):
     except (ValueError, IndexError):
         await callback.answer("Неверный ID")
         return
-    await db.deactivate_subscription(sub_id)
+    # callback_data is user-controlled — anyone with a Telegram client can
+    # send `del:<int>`. Resolve the caller's user_id and let the DB layer
+    # enforce ownership; deny silently when no row matches so we don't leak
+    # whether sub_id exists for some other user.
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    ok = await db.deactivate_subscription(sub_id, user_id)
+    if not ok:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
     await callback.answer("Удалено")
     # Refresh the list — the deleted item disappears in place.
     await _show_subscription_list(callback)
@@ -1575,9 +1790,16 @@ async def handle_url(message: Message):
         )],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
     ])
+    # Escape with quote=True — the URL goes inside an href="..." attribute,
+    # so a `"` in the URL would close the attribute and let an attacker
+    # inject a second <a href="https://attacker.com/phishing">…</a> that
+    # Telegram renders as a clickable phishing link inside the bot's own
+    # confirmation message. _GENERIC_URL_RE accepts any non-whitespace, so
+    # the raw value can contain quotes; never trust it as-is here.
+    safe_url = _html.escape(url, quote=True)
     await message.answer(
         f"✅ <b>Мониторинг запущен</b> ({pretty})\n\n"
-        f"🔗 <a href=\"{url}\">Твоя ссылка</a>\n\n"
+        f"🔗 <a href=\"{safe_url}\">Твоя ссылка</a>\n\n"
         f"Записал {seeded} текущих объявлений как уже виденные. "
         f"Как появится новое — пришлю с фото, ценой и описанием.\n\n"
         f"<i>Хочешь дать поиску своё название? Жми ✏️</i>",

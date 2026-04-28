@@ -31,9 +31,11 @@ import orjson
 
 from .base import SearchItem
 from .common import (
+    MAX_JSON_BYTES,
     download_image_bytes,
     get_cloudscraper,
     global_request_lock,
+    host_matches_pattern,
     invalidate_session,
     proxies_dict,
 )
@@ -41,10 +43,11 @@ from .common import (
 logger = logging.getLogger(__name__)
 
 _HOST = "vinted"
-# All TLDs Vinted operates on, plus the "common" /com root.
-_VINTED_URL_RE = re.compile(
-    r"https?://(?:www\.|m\.)?vinted\.(?:com|fr|de|es|it|nl|pl|cz|sk|"
-    r"co\.uk|at|be|hu|lt|lv|ro|pt|fi|se|dk|gr|lu|ie)/",
+# Anchored to hostname via host_matches_pattern. Same SSRF rationale as
+# OLX: a `?u=https://vinted.fr/x` substring can no longer pass through.
+_VINTED_HOST_RE = re.compile(
+    r"(?:www\.|m\.)?vinted\.(?:com|fr|de|es|it|nl|pl|cz|sk|"
+    r"co\.uk|at|be|hu|lt|lv|ro|pt|fi|se|dk|gr|lu|ie)",
     re.IGNORECASE,
 )
 
@@ -132,7 +135,7 @@ class VintedSource:
     name = "vinted"
 
     def matches(self, url: str) -> bool:
-        return bool(_VINTED_URL_RE.search(url or ""))
+        return host_matches_pattern(url, _VINTED_HOST_RE)
 
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
@@ -186,6 +189,9 @@ async def _fetch_api(api_url: str, user_url: str, proxy: str | None):
     if status != 200:
         logger.debug("[vinted] HTTP %d", status)
         return None, False
+    if len(body) > MAX_JSON_BYTES:
+        logger.warning("[vinted] body oversized: %d bytes", len(body))
+        return None, False
     try:
         data = orjson.loads(body)
     except Exception as e:
@@ -230,7 +236,12 @@ def _fetch_api_sync(api_url: str, user_url: str, proxy: str | None):
             "Referer": origin + "/",
         }
         logger.info("[vinted] API REQUEST %s", api_url[:200])
-        resp = s.get(api_url, proxies=proxies, timeout=30, headers=headers)
+        # allow_redirects=False — see olx.py for SSRF rationale. The
+        # /api/v2/catalog/items endpoint always responds 200 directly.
+        resp = s.get(
+            api_url, proxies=proxies, timeout=30, headers=headers,
+            allow_redirects=False,
+        )
         logger.info(
             "[vinted] API status=%d, size=%d",
             resp.status_code, len(resp.text),
@@ -377,7 +388,8 @@ def _fetch_item_metadata_sync(
             "Accept-Encoding": "gzip, deflate, br",
             "Referer": origin + "/",
         }
-        resp = s.get(url, proxies=proxies, timeout=30, headers=headers)
+        resp = s.get(url, proxies=proxies, timeout=30, headers=headers,
+                     allow_redirects=False)
         if resp.status_code not in (200, 206):
             logger.debug("[vinted] item %d page HTTP %d", item_id, resp.status_code)
             return None
@@ -435,6 +447,8 @@ def _extract_description_from_html(html: str) -> str | None:
         body = (m.group(1) or "").strip()
         if not body:
             continue
+        if len(body) > MAX_JSON_BYTES:
+            continue
         try:
             data = orjson.loads(body)
         except Exception:
@@ -485,16 +499,28 @@ def _extract_location_from_html(html: str) -> str | None:
             pass
         return s
 
-    m = _LOCATION_RE.search(html)
+    # ReDoS bound: _LOCATION_RE uses lazy [^"]+? which on a 2 MB HTML
+    # body without a matching close-quote runs in roughly O(n²) due to
+    # per-position backtracking. A hostile listing description with
+    # many `\"text\":\"…` openers and no close-quotes could wedge the
+    # scheduler for tens of seconds while holding the global request
+    # lock. The location block is always in the React user-info chunk
+    # which loads near the end of the document — searching the last
+    # 500 KB is sufficient and bounds CPU.
+    search_window = html[-500_000:] if len(html) > 500_000 else html
+    m = _LOCATION_RE.search(search_window)
     if m:
         raw = m.group(1) or m.group(2) or ""
         out = _decode(raw)
         if out:
             return out
 
-    # Fallback: stitch city + country from separate fields.
-    city_m = _FALLBACK_CITY_RE.search(html)
-    country_m = _FALLBACK_COUNTRY_RE.search(html)
+    # Fallback: stitch city + country from separate fields. Same window
+    # bound applies — both regexes use [^"\\]+ which is safer (anchored
+    # character class, no backtracking explosion possible) but bounding
+    # the input keeps work consistent.
+    city_m = _FALLBACK_CITY_RE.search(search_window)
+    country_m = _FALLBACK_COUNTRY_RE.search(search_window)
     city = _decode(city_m.group(1)) if city_m else None
     country = _decode(country_m.group(1)) if country_m else None
     if city and country:

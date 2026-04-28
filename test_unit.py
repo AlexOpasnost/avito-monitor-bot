@@ -144,6 +144,36 @@ def test_dispatcher_rejects_unknown():
     print("OK: dispatcher rejects unknown")
 
 
+def test_dispatcher_rejects_ssrf_payloads():
+    # Substring-based regexes were vulnerable: a `?u=https://avito.ru/x`
+    # query in any URL would match. The hostname-allowlist fix makes
+    # detect_source operate on urlparse().hostname only, so these all
+    # resolve to attacker-controlled hosts and must be rejected.
+    ssrf_cases = [
+        # Internal/loopback targets pretending to host a marketplace URL
+        "http://127.0.0.1/admin?u=https://avito.ru/x",
+        "http://localhost:6379/?https://kufar.by/x",
+        "http://[::1]/?u=https://olx.pl/x",
+        # AWS metadata endpoint
+        "http://169.254.169.254/latest/meta-data/?u=https://vinted.fr/x",
+        # Public attacker domain with a marketplace URL hidden in query
+        "http://attacker.com/redirect?url=https://avito.ru/x",
+        "https://evil.example/?olx.pl=1",
+        # Confusable subdomain — hostname is attacker.com, not avito.ru
+        "https://www.avito.ru.attacker.com/x",
+        "https://kufar.by.evil.tld/x",
+        # Userinfo trick — netloc is attacker.com
+        "http://avito.ru@attacker.com/admin",
+        # Non-marketplace TLD that the old regex's `[a-z]{2,3}` would have
+        # admitted via substring (e.g. olx.zip in a query) — now rejected
+        # because hostname is attacker.com
+        "http://attacker.com/?u=https://olx.zip/x",
+    ]
+    for url in ssrf_cases:
+        assert detect_source(url) is None, f"SSRF leak: {url!r} matched a source"
+    print(f"OK: dispatcher rejects {len(ssrf_cases)} SSRF payloads")
+
+
 def test_supported_sources():
     sources = supported_sources()
     assert "avito" in sources
@@ -160,8 +190,14 @@ def test_avito_source_matches():
     src = AvitoSource()
     assert src.matches("https://www.avito.ru/x")
     assert src.matches("https://m.avito.ru/x")
+    assert src.matches("https://avito.ru/")
     assert not src.matches("https://kufar.by/x")
-    print("OK: AvitoSource.matches")
+    # SSRF payloads — must reject:
+    assert not src.matches("http://127.0.0.1/?u=https://avito.ru/")
+    assert not src.matches("https://www.avito.ru.attacker.com/x")
+    assert not src.matches("http://avito.ru@attacker.com/x")
+    assert not src.matches("https://attacker.com/?fake=avito.ru/x")
+    print("OK: AvitoSource.matches (incl. SSRF rejection)")
 
 
 def test_parse_item_full():
@@ -1727,6 +1763,7 @@ if __name__ == "__main__":
     test_dispatcher_matches_kufar()
     test_dispatcher_matches_olx()
     test_dispatcher_rejects_unknown()
+    test_dispatcher_rejects_ssrf_payloads()
     test_supported_sources()
     test_avito_source_matches()
     test_parse_item_full()

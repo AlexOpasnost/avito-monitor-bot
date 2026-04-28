@@ -14,6 +14,7 @@ from aiohttp import web
 from config import config
 from database import db
 from handlers import router
+from middleware import PerUserThrottle
 from parser import check_proxy_ip, rotate_ip
 from scheduler import run_scheduler
 from webhook import build_app as build_webhook_app
@@ -41,7 +42,13 @@ async def main():
     logger.info("Database connected")
 
     if config.proxy_list:
-        logger.info("Proxy configured: %s", config.proxy_list[0].split("@")[-1])
+        # Use urlparse-based redaction — `.split("@")[-1]` was fragile:
+        # it returns the full string for proxies without userinfo
+        # (socks5://1.2.3.4:1080 → "socks5://1.2.3.4:1080") and would
+        # mis-handle passwords containing '@'. _redact_proxy_for_log
+        # strips userinfo properly via urllib.parse.
+        from parsers.common import _redact_proxy_for_log
+        logger.info("Proxy configured: %s", _redact_proxy_for_log(config.proxy_list[0]))
         await rotate_ip()
         ip = await check_proxy_ip()
         logger.info("Proxy IP: %s", ip or "UNKNOWN")
@@ -57,6 +64,13 @@ async def main():
         logger.info("Using direct Telegram API")
 
     dp = Dispatcher()
+    # Per-user throttle: drop events faster than 2/sec for messages,
+    # 3/sec for callbacks. Without this, a single user can spam /list
+    # × 1000 and stall the asyncpg pool (max_size=5) for every other
+    # user. Callback rate is a bit higher because real navigation
+    # (rapid menu clicks) legitimately fires several events per second.
+    dp.message.middleware(PerUserThrottle(rate_seconds=0.5, label="msg"))
+    dp.callback_query.middleware(PerUserThrottle(rate_seconds=0.3, label="cb"))
     dp.include_router(router)
 
     stop_event = asyncio.Event()

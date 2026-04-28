@@ -32,12 +32,40 @@ MAX_ITEMS_PER_CYCLE = 10
 MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
 
 
+async def _sent_items_pruner(stop_event: asyncio.Event):
+    """Background task: prune sent_items rows older than 30 days every
+    24 hours. Bounds DB growth and satisfies 152-ФЗ §5(4) data
+    minimization on the per-user shopping-history footprint."""
+    interval = 24 * 3600
+    # First run after a short warmup so a fresh bot doesn't slam the
+    # DB with a multi-million-row DELETE on cold start.
+    initial_delay = 600
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=initial_delay)
+        return
+    except asyncio.TimeoutError:
+        pass
+    while not stop_event.is_set():
+        try:
+            deleted = await db.prune_sent_items(days=30)
+            if deleted:
+                logger.info("[prune] sent_items: deleted %d rows older than 30d", deleted)
+        except Exception:
+            logger.exception("[prune] sent_items prune failed")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
     # Hard-coded sem=1: never fire two subscriptions simultaneously.
     # parser.py also holds its own lock, so this is belt-and-suspenders.
     logger.info("Scheduler started (per-sub interval=60s, sem=1, no stagger)")
     sem = asyncio.Semaphore(1)
     tasks: dict[int, asyncio.Task] = {}
+    pruner_task = asyncio.create_task(_sent_items_pruner(stop_event))
 
     while not stop_event.is_set():
         try:
@@ -77,6 +105,11 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
             await t
         except (asyncio.CancelledError, Exception):
             pass
+    pruner_task.cancel()
+    try:
+        await pruner_task
+    except (asyncio.CancelledError, Exception):
+        pass
     logger.info("Scheduler stopped")
 
 

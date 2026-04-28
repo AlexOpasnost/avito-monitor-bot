@@ -7,12 +7,78 @@ import logging
 import random
 import re
 import time
+from urllib.parse import urlparse
 
 import httpx
 
 from config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Host allowlist helpers — primary defense against SSRF
+# ---------------------------------------------------------------------------
+#
+# The naive approach of `re.search(r"avito\.ru/", url)` matches a substring
+# anywhere in the URL — including the query string. That meant an attacker
+# could paste `http://127.0.0.1/admin?u=https://avito.ru/x` and the bot
+# would happily fetch 127.0.0.1 (full SSRF on Railway internal network,
+# AWS metadata, Redis, Postgres, etc.). The fix is to extract the hostname
+# via urlparse and compare it exactly (or against a tightened pattern that
+# is full-anchored at hostname boundaries).
+#
+# Both helpers below normalize the hostname to lowercase and treat any
+# parse error as "not a match" — fail-closed by design.
+
+def _parse_hostname(url: str) -> str:
+    """Extract the lowercased hostname from a URL, '' on failure."""
+    if not url:
+        return ""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def host_in_allowlist(url: str, allowed: frozenset[str]) -> bool:
+    """True iff the URL's hostname (case-insensitive, exact) is in allowed."""
+    host = _parse_hostname(url)
+    return bool(host and host in allowed)
+
+
+def host_matches_pattern(url: str, pattern: re.Pattern[str]) -> bool:
+    """True iff the URL's hostname fully matches `pattern`.
+    Pattern must be anchored to the whole hostname — fullmatch is used,
+    not search, so a substring like `?u=avito.ru` cannot slip through."""
+    host = _parse_hostname(url)
+    return bool(host and pattern.fullmatch(host))
+
+
+# TODO(abuse-policy): per-host outbound budget — currently nothing
+# stops one user with 5 subs from generating ~7,200 fetches/day on a
+# single host. Mostly mitigated by Semaphore(1) globally (all fetches
+# serialise) and per-source cooldowns (5–10s), but a user with 5 subs
+# all pointing at the same domain can still saturate that domain's
+# share. Defer until we hit the abuse case in prod — the capacity
+# implications are real but not a security boundary.
+
+
+# ---------------------------------------------------------------------------
+# Body-size cap before orjson.loads — OOM defense
+# ---------------------------------------------------------------------------
+#
+# Marketplace responses we've actually observed:
+#   - OLX /api/v1/offers: ~200 KB
+#   - Kufar __NEXT_DATA__: ~500 KB
+#   - Avito mfe-state: ~300 KB
+#   - Vinted /api/v2/catalog/items: ~150 KB
+#   - Vinted /items/{id} HTML: ~2.1 MB (largest legit case)
+# 20 MB cap leaves ~10× headroom over the largest legit body. Without
+# it, a hostile / compromised marketplace endpoint could ship a 200 MB
+# response that fully buffers in resp.text/.content before parsing,
+# OOM-ing Railway's 512 MB container.
+MAX_JSON_BYTES = 20 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -61,19 +127,68 @@ def proxy_for_source(source_name: str | None) -> str | None:
     return config.proxy_list[0]
 
 
+_SECRET_QS_KEYS = ("proxy_key", "key", "token", "secret", "api_key", "apikey")
+
+
+def _redact_url(url: str) -> str:
+    """Strip secret-looking query-string values from a URL for logging.
+
+    The proxy rotation URL (mobileproxy.space) carries a `proxy_key=…`
+    that is the *only* credential needed to take over IP rotation for
+    this shop's proxy plan. Logging the full URL leaked it to anyone
+    with Railway log access. We log host+path only and replace any
+    secret-named query-string value with `***`.
+    """
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+        parts = urlparse(url)
+        qs = parse_qsl(parts.query, keep_blank_values=True)
+        redacted = [
+            (k, "***" if k.lower() in _SECRET_QS_KEYS else v)
+            for k, v in qs
+        ]
+        return urlunparse(parts._replace(query=urlencode(redacted)))
+    except Exception:
+        return "<unloggable url>"
+
+
+def _redact_proxy_for_log(proxy_url: str) -> str:
+    """Strip userinfo from a proxy URL — log host:port only."""
+    if not proxy_url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(proxy_url)
+        netloc = p.hostname or ""
+        if p.port:
+            netloc = f"{netloc}:{p.port}"
+        return f"{p.scheme}://{netloc}" if p.scheme else netloc
+    except Exception:
+        return "<unloggable proxy>"
+
+
 async def rotate_ip() -> bool:
-    """Call proxy rotation URL (if configured). Logs full URL + body."""
+    """Call proxy rotation URL (if configured). Logs redacted URL only."""
     rotate_url = config.proxy_rotate_url
     if not rotate_url:
         return False
-    logger.info("[proxy] rotate URL: %r (len=%d)", rotate_url, len(rotate_url))
+    logger.info(
+        "[proxy] rotate URL: %s (len=%d)",
+        _redact_url(rotate_url), len(rotate_url),
+    )
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(rotate_url)
-            body = (resp.text or "").strip()[:300]
+            # Don't log the body — mobileproxy.space sometimes echoes
+            # the proxy_key back in JSON. Length + status is enough for
+            # debugging; if you need the body, attach a debug logger
+            # to a one-off env-gated path, never to the prod stream.
+            body_len = len(resp.text or "")
             logger.info(
-                "[proxy] changeip HTTP %d, body=%r, final URL=%r",
-                resp.status_code, body, str(resp.url),
+                "[proxy] changeip HTTP %d, body_len=%d, final URL=%s",
+                resp.status_code, body_len, _redact_url(str(resp.url)),
             )
             return resp.status_code == 200
     except Exception as e:
@@ -188,12 +303,26 @@ async def download_image_bytes(url: str, host: str = "generic",
             headers = {}
             if referer:
                 headers["Referer"] = referer
-            resp = s.get(url, proxies=proxies, timeout=15, headers=headers or None)
+            # allow_redirects=False + max content size cap. A redirect
+            # chain from a hostile/compromised CDN could land on
+            # 127.0.0.1 / cloud metadata; size cap (5 MB matches
+            # Telegram's photo upload limit) bounds memory pressure
+            # from a hostile huge image.
+            resp = s.get(
+                url, proxies=proxies, timeout=15,
+                headers=headers or None, allow_redirects=False,
+            )
             if resp.status_code != 200:
                 logger.debug("[image] HTTP %d for %s", resp.status_code, url[:80])
                 return None
             content = resp.content
             if not content or len(content) < 500:
+                return None
+            if len(content) > 5 * 1024 * 1024:
+                logger.debug(
+                    "[image] oversized %d bytes for %s — dropping",
+                    len(content), url[:80],
+                )
                 return None
             if content.startswith(_IMG_MAGIC):
                 return content

@@ -27,13 +27,15 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 from .base import SearchItem
+from .common import host_in_allowlist
 
 logger = logging.getLogger(__name__)
 
-_MERCARI_URL_RE = re.compile(
-    r"https?://(?:www\.|jp\.)?mercari\.(?:com|jp)/",
-    re.IGNORECASE,
-)
+# Hostname allowlist (see common.host_in_allowlist for SSRF rationale).
+_MERCARI_HOSTS = frozenset({
+    "mercari.com", "www.mercari.com",
+    "mercari.jp", "www.mercari.jp", "jp.mercari.com",
+})
 
 # Rough JPY → USD rate (April 2026). Update quarterly.
 _JPY_TO_USD = 0.0065
@@ -61,7 +63,7 @@ class MercariSource:
     name = "mercari"
 
     def matches(self, url: str) -> bool:
-        return bool(_MERCARI_URL_RE.search(url or ""))
+        return host_in_allowlist(url, _MERCARI_HOSTS)
 
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,

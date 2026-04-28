@@ -33,9 +33,11 @@ import orjson
 
 from .base import SearchItem
 from .common import (
+    MAX_JSON_BYTES,
     download_image_bytes,
     get_cloudscraper,
     global_request_lock,
+    host_matches_pattern,
     invalidate_session,
     proxies_dict,
     rotate_ip,
@@ -44,8 +46,13 @@ from .common import (
 logger = logging.getLogger(__name__)
 
 _HOST = "olx"
-_OLX_URL_RE = re.compile(
-    r"https?://(?:www\.|m\.)?olx\.(?:com\.[a-z]{2}|[a-z]{2,3})/",
+# Anchored to the *hostname* (not the URL), via fullmatch in
+# host_matches_pattern. The TLD shape stays permissive (OLX runs in 30+
+# countries) but a query-string substring like `?u=https://olx.pl/...`
+# can no longer slip through — host_matches_pattern parses the URL and
+# matches against the hostname only.
+_OLX_HOST_RE = re.compile(
+    r"(?:www\.|m\.)?olx\.(?:com\.[a-z]{2}|[a-z]{2,3})",
     re.IGNORECASE,
 )
 
@@ -91,7 +98,7 @@ class OlxSource:
     name = "olx"
 
     def matches(self, url: str) -> bool:
-        return bool(_OLX_URL_RE.search(url or ""))
+        return host_matches_pattern(url, _OLX_HOST_RE)
 
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
@@ -148,6 +155,9 @@ async def _fetch_api(api_url: str, user_url: str, proxy: str | None):
     if status != 200:
         logger.debug("[olx] API HTTP %d for %s", status, api_url[:100])
         return None, False
+    if len(body) > MAX_JSON_BYTES:
+        logger.warning("[olx] API body oversized: %d bytes", len(body))
+        return None, False
     try:
         data = orjson.loads(body)
     except Exception as e:
@@ -164,9 +174,15 @@ def _fetch_api_sync(api_url: str, proxy: str | None):
         proxies = proxies_dict(proxy)
         headers = {"Accept": "application/json"}
         logger.info("[olx] API REQUEST url=%r", api_url)
+        # allow_redirects=False blocks redirect-based SSRF: the URL
+        # already passed the hostname allowlist, but a 302 from a
+        # compromised CDN/edge could send us to 127.0.0.1 / cloud
+        # metadata. /api/v1/offers responds 200 directly when the
+        # request is well-formed; if we ever hit a 30x here we want
+        # to log it as a warning, not silently follow.
         resp = s.get(
             api_url, proxies=proxies, timeout=30, headers=headers,
-            allow_redirects=True,
+            allow_redirects=False,
         )
         logger.info("[olx] API response status=%d, size=%d",
                     resp.status_code, len(resp.text))
@@ -347,6 +363,9 @@ async def _lookup_category_via_item(
     )
     if not body:
         return None
+    if len(body) > MAX_JSON_BYTES:
+        logger.warning("[olx] item %d body oversized: %d bytes", item_id, len(body))
+        return None
     try:
         data = orjson.loads(body)
     except Exception as e:
@@ -370,7 +389,8 @@ def _fetch_simple_sync(url: str, proxy: str | None) -> str | None:
         proxies = proxies_dict(proxy)
         logger.info("[olx] category probe: %s", url[:100])
         resp = s.get(url, proxies=proxies, timeout=20,
-                     headers={"Accept": "application/json"})
+                     headers={"Accept": "application/json"},
+                     allow_redirects=False)
         if resp.status_code != 200:
             logger.debug("[olx] category probe HTTP %d", resp.status_code)
             return None
@@ -394,7 +414,9 @@ def _fetch_html_head_sync(url: str, proxy: str | None) -> str | None:
         s = get_cloudscraper(_HOST, warmup_urls=[origin + "/"], proxy=proxy)
         proxies = proxies_dict(proxy)
         logger.info("[olx] HTML probe for category_id: %s", url[:100])
-        resp = s.get(url, proxies=proxies, timeout=45, allow_redirects=True)
+        # See comment on the API path: redirect chains here would be
+        # post-validation SSRF.
+        resp = s.get(url, proxies=proxies, timeout=45, allow_redirects=False)
         if resp.status_code != 200:
             logger.warning("[olx] html probe HTTP %d", resp.status_code)
             return None
