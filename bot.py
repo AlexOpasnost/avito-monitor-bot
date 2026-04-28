@@ -26,6 +26,13 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
     force=True,
 )
+# httpx logs every outbound request at INFO with the FULL URL. That
+# leaks the mobileproxy `proxy_key` (we redact it in our own
+# parsers.common logs, but httpx's internal logger bypasses that
+# entirely). Pin httpx + httpcore to WARNING — request errors still
+# surface, but the per-request URL line goes away.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
