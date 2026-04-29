@@ -183,7 +183,36 @@ def test_supported_sources():
     assert "vinted" in sources
     assert "youla" in sources
     assert "fruitsfamily" in sources
+    assert "grailed" in sources
     print(f"OK: supported sources = {sources}")
+
+
+def test_grailed_url_routing():
+    from parsers.grailed import GrailedSource, _algolia_params_from_url
+    s = GrailedSource()
+    assert s.matches("https://www.grailed.com/categories/menswear/tops")
+    assert s.matches("https://grailed.com/shop?query=stone+island")
+    assert not s.matches("https://avito.ru/")
+    # SSRF reject — hostname is attacker.com
+    assert not s.matches("http://attacker.com/?u=https://grailed.com/x")
+    # /shop?query=...
+    p = _algolia_params_from_url("https://www.grailed.com/shop?query=stone+island")
+    assert "query=stone%20island" in p or "query=stone+island" in p, p
+    assert "hitsPerPage=40" in p
+    # /categories/menswear/tops
+    p = _algolia_params_from_url("https://www.grailed.com/categories/menswear/tops")
+    assert "department%3Amenswear" in p, p
+    assert "category%3Atops" in p, p
+    # /designers/stone-island — strict facet filter, not optional boost
+    p = _algolia_params_from_url("https://www.grailed.com/designers/stone-island")
+    assert "designers.name%3Astone%20island" in p, p
+    # Should be in facetFilters (strict), not optionalFacetFilters (boost)
+    assert "facetFilters=" in p and "optionalFacetFilters=" not in p, p
+    # Personal feed → refuse
+    assert _algolia_params_from_url("https://www.grailed.com/feed/Z2dDpGWAdg") is None
+    # Login / homepage with no query → refuse
+    assert _algolia_params_from_url("https://www.grailed.com/") is None
+    print("OK: GrailedSource.matches + _algolia_params_from_url")
 
 
 def test_youla_url_parsing():
@@ -1886,6 +1915,7 @@ if __name__ == "__main__":
     test_youla_url_parsing()
     test_youla_source_matches()
     test_fruitsfamily_source_matches()
+    test_grailed_url_routing()
     test_avito_source_matches()
     test_parse_item_full()
     test_parse_item_plain_price()

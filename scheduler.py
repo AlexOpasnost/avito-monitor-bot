@@ -347,7 +347,7 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
 # it detects each item separately rather than guessing per source.
 _TRANSLATED_SOURCES: frozenset[str] = frozenset(
     {"olx", "vinted", "mercari", "avito", "kufar", "goofish",
-     "youla", "fruitsfamily"}
+     "youla", "fruitsfamily", "grailed"}
 )
 
 
@@ -530,6 +530,7 @@ _SOURCE_IMAGE_REFERER = {
     "mercari":      "https://jp.mercari.com/",
     "youla":        "https://youla.ru/",
     "fruitsfamily": "https://fruitsfamily.com/",
+    "grailed":      "https://www.grailed.com/",
     "goofish":      "https://www.goofish.com/",
 }
 

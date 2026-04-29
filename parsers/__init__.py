@@ -10,6 +10,7 @@ from __future__ import annotations
 from .avito import AvitoSource
 from .base import SearchItem, Source
 from .fruitsfamily import FruitsfamilySource
+from .grailed import GrailedSource
 from .kufar import KufarSource
 from .mercari import MercariSource
 from .olx import OlxSource
@@ -24,6 +25,7 @@ SOURCES: list[Source] = [
     VintedSource(),
     YoulaSource(),
     FruitsfamilySource(),
+    GrailedSource(),
 ]
 
 
@@ -66,6 +68,7 @@ SOURCE_DISPLAY_NAMES: dict[str, str] = {
     "mercari":      "Mercari",
     "youla":        "Юла",
     "fruitsfamily": "Fruitsfamily",
+    "grailed":      "Grailed",
     "goofish":      "Goofish",
 }
 
