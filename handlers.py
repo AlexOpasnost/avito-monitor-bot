@@ -1067,7 +1067,11 @@ async def _show_subscription_list(target):
             except Exception:
                 bl_raw = []
         bl_count = len(bl_raw) if isinstance(bl_raw, list) else 0
-        bl_label = f"🚫 {bl_count}" if bl_count else "🚫"
+        # Spell out the action — bare "🚫 3" is ambiguous (block what?
+        # mute? delete?). Tell the user what's behind the button.
+        bl_label = (
+            f"🚫 Стоп-слова ({bl_count})" if bl_count else "🚫 Стоп-слова"
+        )
         # Names + URLs come from the user / marketplace, escape before
         # inlining into HTML mode. Inline-button text is plain (Telegram
         # doesn't parse HTML there) so the name in callback button is
@@ -1810,7 +1814,12 @@ async def _show_blacklist_screen(target, sub_id: int):
         plural=_ru_plural_words(len(words)),
     )
     if words:
-        text += "\n" + "\n".join(f"• {_html.escape(w)}" for w in words)
+        text += (
+            "\n<b>Стоп-слова в этом поиске:</b>\n"
+            + "\n".join(f"🚫 {_html.escape(w)}" for w in words)
+            + "\n\n<i>Нажми кнопку «❌ Удалить стоп-слово ...» чтобы "
+              "снять конкретное слово.</i>"
+        )
     else:
         text += (
             "\n<i>Список пуст. Нажми «Добавить» и пришли слова через "
@@ -1819,23 +1828,21 @@ async def _show_blacklist_screen(target, sub_id: int):
 
     rows: list[list[InlineKeyboardButton]] = [[
         InlineKeyboardButton(
-            text="➕ Добавить",
+            text="➕ Добавить стоп-слово",
             callback_data=f"bl_add:{sub_id}",
         ),
     ]]
-    # Show ❌ buttons in pairs to keep the keyboard compact.
-    for i in range(0, len(words), 2):
-        chunk = words[i:i + 2]
-        rows.append([
-            InlineKeyboardButton(
-                text=f"❌ {w[:18]}",
-                callback_data=f"bl_del:{sub_id}:{i + j}",
-            )
-            for j, w in enumerate(chunk)
-        ])
+    # One ❌ button per line so the action ("Удалить стоп-слово ‹word›")
+    # is unambiguous. Telegram inline buttons clip at ~30 chars, so we
+    # truncate the word but keep the verb.
+    for i, w in enumerate(words):
+        rows.append([InlineKeyboardButton(
+            text=f"❌ Удалить стоп-слово «{w[:14]}»",
+            callback_data=f"bl_del:{sub_id}:{i}",
+        )])
     if words:
         rows.append([InlineKeyboardButton(
-            text="🧹 Очистить всё",
+            text="🧹 Очистить весь стоп-лист",
             callback_data=f"bl_clear:{sub_id}",
         )])
     rows.append([InlineKeyboardButton(
