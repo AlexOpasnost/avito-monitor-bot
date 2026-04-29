@@ -349,16 +349,52 @@ _TRANSLATED_SOURCES: frozenset[str] = frozenset(
     {"olx", "vinted", "mercari", "avito", "kufar", "goofish"}
 )
 
-# When the user picked a language that already matches the item's
-# native language we skip the Google round-trip. Mapping is best-effort;
-# missing entries fall through to "translate anyway" (Google no-ops same-
-# language calls cheaply).
-_SOURCE_NATIVE_LANG: dict[str, str] = {
-    "avito":   "ru",
-    "kufar":   "ru",
-    "mercari": "ja",
-    "goofish": "zh",
-}
+
+def _looks_like_lang(text: str, lang: str) -> bool:
+    """Per-field heuristic: does `text` look like it's already in
+    the script of `lang`? Returns True only when most non-space chars
+    fit the expected Unicode block, so listings on Avito written in
+    Italian/English (`Pantaloncini corti...`) DON'T match `ru` and
+    will get translated.
+
+    Used to skip the Google round-trip per-field, replacing the old
+    blanket "Avito is always RU" assumption that left foreign-language
+    Avito listings untranslated.
+    """
+    if not text or not lang:
+        return False
+    visible = [c for c in text.strip()[:200] if not c.isspace() and not c.isdigit()]
+    if not visible:
+        return False
+    lang = lang.lower()
+
+    def _share(predicate) -> float:
+        n = sum(1 for c in visible if predicate(c))
+        return n / len(visible)
+
+    if lang in ("ru", "be", "uk", "bg"):
+        return _share(lambda c: "Ѐ" <= c <= "ӿ") >= 0.5
+    if lang == "ja":
+        return _share(lambda c: (
+            "぀" <= c <= "ゟ"  # hiragana
+            or "゠" <= c <= "ヿ"  # katakana
+            or "一" <= c <= "鿿"  # CJK unified
+        )) >= 0.5
+    if lang == "zh":
+        return _share(lambda c: "一" <= c <= "鿿") >= 0.5
+    if lang in ("kk",):
+        # Kazakh is mostly cyrillic with extra letters in 0x04xx
+        return _share(lambda c: "Ѐ" <= c <= "ӿ") >= 0.5
+    if lang == "el":
+        return _share(lambda c: "Ͱ" <= c <= "Ͽ") >= 0.5
+    if lang == "tr":
+        return _share(lambda c: c.isascii() or c in "ÇçĞğİıÖöŞşÜü") >= 0.5
+    # Latin-script langs (en/de/es/fr/it/pl/pt/nl/ro/cs/hu/sv): ASCII +
+    # latin-extended diacritics. Cyrillic share must be near zero.
+    cyr_share = _share(lambda c: "Ѐ" <= c <= "ӿ")
+    if cyr_share >= 0.2:
+        return False
+    return _share(lambda c: c.isascii() or "À" <= c <= "ɏ") >= 0.5
 
 # Cap concurrent Google Translate calls so a batch of 10 new items
 # doesn't fire 20 parallel requests and get rate-limited into 429s.
@@ -426,47 +462,56 @@ async def _translate(text: str, target_lang: str) -> str:
 
 async def _localise_item(
     item: SearchItem, target_lang: str,
-) -> tuple[str, str | None, str | None]:
-    """Return (title, description, condition) translated into target_lang.
+) -> tuple[str, str | None, str | None, str | None]:
+    """Return (title, description, condition, location) translated into
+    target_lang.
+
+    Per-field skip via _looks_like_lang: only fields that are NOT
+    already in the target language go to Google. Replaces the old
+    blanket "Avito is RU-native, skip everything for ru users" rule
+    which left foreign-language Avito listings untranslated.
 
     The original `item` is left unchanged so the same item can be sent
     to multiple users in different languages from the same scheduler
     cycle without cross-talk."""
     if item.source not in _TRANSLATED_SOURCES:
-        return item.title, item.description, item.condition
-    native = _SOURCE_NATIVE_LANG.get(item.source)
-    # Skip the round-trip when the source language already matches the
-    # user's pick (RU user reading Avito etc.). Catches the common case;
-    # auto-detect handles the rest.
-    if native and native == target_lang:
-        return item.title, item.description, item.condition
+        return item.title, item.description, item.condition, item.location
 
-    tasks = []
-    fields: list[str] = []
-    if item.title:
-        tasks.append(_translate(item.title, target_lang)); fields.append("title")
-    if item.description:
-        tasks.append(_translate(item.description, target_lang)); fields.append("desc")
-    if item.condition:
-        tasks.append(_translate(item.condition, target_lang)); fields.append("cond")
-    if not tasks:
-        return item.title, item.description, item.condition
+    pending: list[tuple[str, str]] = []
+    for name, value in (
+        ("title", item.title),
+        ("desc", item.description),
+        ("cond", item.condition),
+        ("location", item.location),
+    ):
+        if not value:
+            continue
+        if _looks_like_lang(value, target_lang):
+            continue
+        pending.append((name, value))
+
+    if not pending:
+        return item.title, item.description, item.condition, item.location
+
     try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(
+            *(_translate(v, target_lang) for _, v in pending),
+            return_exceptions=True,
+        )
     except Exception as e:
         logger.debug("[translate] gather err: %s", e)
-        return item.title, item.description, item.condition
-    out_title, out_desc, out_cond = item.title, item.description, item.condition
-    for name, r in zip(fields, results):
-        if not isinstance(r, str) or not r.strip():
-            continue
-        if name == "title":
-            out_title = r
-        elif name == "desc":
-            out_desc = r
-        elif name == "cond":
-            out_cond = r
-    return out_title, out_desc, out_cond
+        return item.title, item.description, item.condition, item.location
+
+    out = {
+        "title": item.title,
+        "desc": item.description,
+        "cond": item.condition,
+        "location": item.location,
+    }
+    for (name, _), r in zip(pending, results):
+        if isinstance(r, str) and r.strip():
+            out[name] = r
+    return out["title"], out["desc"], out["cond"], out["location"]
 
 
 def _source_button_text(source: str | None) -> str:
@@ -495,9 +540,10 @@ async def _send_notification(
     # (text, lang) so a 10-item batch runs ~10 Google calls, not 30.
     lang = prefs.get("lang") or "ru"
     tz = prefs.get("tz") or default_tz_for_lang(lang)
-    title, description, condition = await _localise_item(item, lang)
+    title, description, condition, location = await _localise_item(item, lang)
     text = _format_notification(
         item, title=title, description=description, condition=condition,
+        location=location,
         user_currency=(prefs.get("currency") or "rub").upper(),
         user_tz=tz, user_lang=lang,
     )
@@ -549,6 +595,7 @@ def _format_notification(
     title: str | None = None,
     description: str | None = None,
     condition: str | None = None,
+    location: str | None = None,
     user_currency: str = "RUB",
     user_tz: str = "Europe/Moscow",
     user_lang: str = "ru",
@@ -596,13 +643,17 @@ def _format_notification(
 
     title_html = _escape(raw_title) or "Без названия"
     price_native = _escape(_format_price(item, user_currency)) or "Цена не указана"
-    location = _escape(item.location) or "—"
+    # Location goes through the same translation pass as title/description
+    # in _localise_item; fall back to the raw value if translation skipped
+    # it (e.g. it was already in target lang).
+    raw_loc = location if location is not None else item.location
+    location_html = _escape(raw_loc) or "—"
     when = _format_when_local(item.published_timestamp, user_tz, user_lang)
 
     lines = [
         f"<b>{title_html}</b>",
         f"💰 <b>{price_native}</b>",
-        f"📍 {location}",
+        f"📍 {location_html}",
         f"📅 {when}",
     ]
 
@@ -659,7 +710,7 @@ def _format_when_local(
     dt = datetime.fromtimestamp(ts, tz)
     now = datetime.now(tz)
     hhmm = dt.strftime("%H:%M")
-    tz_short = "UTC" if tz is timezone.utc else timezone_short(tz_name)
+    tz_short = "UTC" if tz is timezone.utc else timezone_short(tz_name, lang)
 
     if dt.date() == now.date():
         kind = "today"

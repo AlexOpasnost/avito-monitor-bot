@@ -1290,9 +1290,11 @@ def test_format_when_local():
     assert "15:00" in moscow_ru and "МСК" in moscow_ru
     assert "14:00" in madrid_ru and "Мадрид" in madrid_ru
 
-    # English phrasing — "Today at" / "Yesterday at"
+    # English phrasing — "Today at" / "Yesterday at" + English city tag
+    # (Cyrillic "Мадрид" is reserved for ru/be/uk/bg/kk users now.)
     madrid_en = _format_when_local(ts, "Europe/Madrid", "en")
-    assert "14:00" in madrid_en and "Мадрид" in madrid_en
+    assert "14:00" in madrid_en and "Madrid" in madrid_en
+    assert "Мадрид" not in madrid_en, "EN users should see latin city names"
     assert madrid_en.startswith(("Today at", "Yesterday at")) or "at " in madrid_en
 
     # Spanish phrasing — "Hoy a las" / "Ayer a las"

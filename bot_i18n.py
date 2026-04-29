@@ -153,7 +153,7 @@ def timezone_label(code: str | None) -> str:
 # Short tag rendered next to the date in notifications. Picked to be
 # recognisable at a glance without bloating the line; falls back to
 # the city slice for zones not in the curated list.
-_TIMEZONE_SHORT: dict[str, str] = {
+_TIMEZONE_SHORT_RU: dict[str, str] = {
     "Europe/Moscow":    "МСК",
     "Europe/Minsk":     "Минск",
     "Europe/Kyiv":      "Киев",
@@ -177,14 +177,59 @@ _TIMEZONE_SHORT: dict[str, str] = {
     "Asia/Shanghai":    "Шанхай",
 }
 
+# English city labels for non-RU users. The naïve approach of running
+# the RU labels through Google Translate per-notification gave us
+# "(Шанхай)" in the middle of an Italian message body — see the
+# notification rendering bug from 2026-04-29. English city names are
+# universally readable in EU/JP locales and don't require a network
+# round-trip.
+_TIMEZONE_SHORT_EN: dict[str, str] = {
+    "Europe/Moscow":    "Moscow",
+    "Europe/Minsk":     "Minsk",
+    "Europe/Kyiv":      "Kyiv",
+    "Asia/Almaty":      "Almaty",
+    "Europe/London":    "London",
+    "Europe/Madrid":    "Madrid",
+    "Europe/Berlin":    "Berlin",
+    "Europe/Paris":     "Paris",
+    "Europe/Rome":      "Rome",
+    "Europe/Warsaw":    "Warsaw",
+    "Europe/Lisbon":    "Lisbon",
+    "Europe/Amsterdam": "Amsterdam",
+    "Europe/Istanbul":  "Istanbul",
+    "Europe/Bucharest": "Bucharest",
+    "Europe/Prague":    "Prague",
+    "Europe/Budapest":  "Budapest",
+    "Europe/Athens":    "Athens",
+    "Europe/Sofia":     "Sofia",
+    "Europe/Stockholm": "Stockholm",
+    "Asia/Tokyo":       "Tokyo",
+    "Asia/Shanghai":    "Shanghai",
+}
 
-def timezone_short(code: str | None) -> str:
+# Cyrillic-script langs share the RU labels (close-enough orthography);
+# everyone else gets EN city names.
+_CYRILLIC_LANGS = frozenset({"ru", "be", "uk", "bg", "kk"})
+
+
+def timezone_short(code: str | None, lang: str | None = "ru") -> str:
+    """Return a short city tag for `code` in the user's display language.
+
+    Falls back to the IANA city slice ("New_York" → "New York") when
+    the code isn't curated."""
     if not code:
-        return "МСК"
-    short = _TIMEZONE_SHORT.get(code)
+        return "МСК" if (lang or "ru").lower() in _CYRILLIC_LANGS else "Moscow"
+    table = _TIMEZONE_SHORT_RU if (lang or "ru").lower() in _CYRILLIC_LANGS else _TIMEZONE_SHORT_EN
+    short = table.get(code)
     if short:
         return short
     return code.split("/")[-1].replace("_", " ")
+
+
+# Back-compat alias for any callers that still imported the dict
+# directly. Keeping it pointed at the RU table preserves behaviour
+# from before the lang-aware split.
+_TIMEZONE_SHORT = _TIMEZONE_SHORT_RU
 
 
 # Date-line phrasing per language. Three patterns each:
