@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from .avito import AvitoSource
 from .base import SearchItem, Source
+from .fruitsfamily import FruitsfamilySource
 from .kufar import KufarSource
 from .mercari import MercariSource
 from .olx import OlxSource
 from .vinted import VintedSource
+from .youla import YoulaSource
 
 SOURCES: list[Source] = [
     AvitoSource(),
@@ -20,6 +22,8 @@ SOURCES: list[Source] = [
     OlxSource(),
     MercariSource(),
     VintedSource(),
+    YoulaSource(),
+    FruitsfamilySource(),
 ]
 
 
@@ -55,12 +59,14 @@ def is_source_disabled(name: str | None) -> bool:
 # Single source of truth for human-facing source names.
 # Used in user-facing bot messages and inline buttons.
 SOURCE_DISPLAY_NAMES: dict[str, str] = {
-    "avito":   "Авито",
-    "kufar":   "Kufar",
-    "olx":     "OLX",
-    "vinted":  "Vinted",
-    "mercari": "Mercari",
-    "goofish": "Goofish",
+    "avito":        "Авито",
+    "kufar":        "Kufar",
+    "olx":          "OLX",
+    "vinted":       "Vinted",
+    "mercari":      "Mercari",
+    "youla":        "Юла",
+    "fruitsfamily": "Fruitsfamily",
+    "goofish":      "Goofish",
 }
 
 

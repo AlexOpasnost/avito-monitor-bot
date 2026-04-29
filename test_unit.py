@@ -181,7 +181,72 @@ def test_supported_sources():
     assert "olx" in sources
     assert "mercari" in sources
     assert "vinted" in sources
+    assert "youla" in sources
+    assert "fruitsfamily" in sources
     print(f"OK: supported sources = {sources}")
+
+
+def test_youla_url_parsing():
+    from parsers.youla import _parse_user_url
+    # Path-based URL with city slug + category — extract category as keyword
+    kw, pf, pt = _parse_user_url("https://youla.ru/sankt-peterburg/iphone-13")
+    assert kw == "iphone 13", f"got {kw!r}"
+    assert pf is None and pt is None
+    # Post-redirect form with q= and price filter
+    kw, pf, pt = _parse_user_url(
+        "https://youla.ru/sankt-peterburg?q=iphone+13"
+        "&attributes%5Bprice%5D%5Bfrom%5D=1000"
+        "&attributes%5Bprice%5D%5Bto%5D=5000",
+    )
+    assert "iphone" in (kw or "").lower(), f"got {kw!r}"
+    assert pf == 1000 and pt == 5000
+    # No keyword extractable → None (refuse to fan out to whole site)
+    kw, pf, pt = _parse_user_url("https://youla.ru/")
+    assert kw is None
+    # Listing URL with trailing 24-hex object id should not pollute keyword
+    kw, _, _ = _parse_user_url(
+        "https://youla.ru/sankt-peterburg/odezhda 5d03af8393800097504b8282",
+    )
+    # Will go through path-segment branch; we don't assert specific output
+    # — just that it doesn't crash.
+    print("OK: youla _parse_user_url")
+
+
+def test_youla_source_matches():
+    from parsers.youla import YoulaSource
+    s = YoulaSource()
+    assert s.matches("https://youla.ru/all/odezhda")
+    assert s.matches("https://m.youla.ru/all")
+    assert not s.matches("https://avito.ru/")
+    # SSRF: hostname is attacker.com, query has youla.ru — must reject
+    assert not s.matches("http://attacker.com/?u=https://youla.ru/x")
+    assert not s.matches("https://youla.ru.attacker.com/x")
+    print("OK: YoulaSource.matches (incl. SSRF rejection)")
+
+
+def test_fruitsfamily_source_matches():
+    from parsers.fruitsfamily import FruitsfamilySource, _filter_from_url
+    s = FruitsfamilySource()
+    assert s.matches("https://fruitsfamily.com/search?gender=MEN&subcategoryIds=1")
+    assert s.matches("https://www.fruitsfamily.com/")
+    assert not s.matches("https://avito.ru/")
+    assert not s.matches("http://attacker.com/?u=https://fruitsfamily.com/x")
+    # Filter extraction — single subcategory
+    f = _filter_from_url(
+        "https://fruitsfamily.com/search?gender=MEN&subcategoryIds=1",
+    )
+    assert f == {"gender": "MEN", "subcategory_ids": [1]}, f"got {f!r}"
+    # Filter extraction — multi subcategory + price
+    f = _filter_from_url(
+        "https://fruitsfamily.com/search?gender=WOMEN"
+        "&subcategoryIds=1&subcategoryIds=2&priceMin=10000&priceMax=50000",
+    )
+    assert f["gender"] == "WOMEN"
+    assert f["subcategory_ids"] == [1, 2]
+    assert f["price_min"] == 10000 and f["price_max"] == 50000
+    # No filter at all → None (refuse fan-out)
+    assert _filter_from_url("https://fruitsfamily.com/") is None
+    print("OK: FruitsfamilySource.matches + _filter_from_url")
 
 
 # ---------- avito plugin internals ----------
@@ -1818,6 +1883,9 @@ if __name__ == "__main__":
     test_dispatcher_rejects_unknown()
     test_dispatcher_rejects_ssrf_payloads()
     test_supported_sources()
+    test_youla_url_parsing()
+    test_youla_source_matches()
+    test_fruitsfamily_source_matches()
     test_avito_source_matches()
     test_parse_item_full()
     test_parse_item_plain_price()

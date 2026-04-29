@@ -112,15 +112,15 @@ async def main():
         "🎁 Бесплатный пробный период\n"
         "📋 До 5 одновременных ссылок-поисков\n"
         "🛒 Огромный выбор площадок\n"
-        "(Avito, Kufar, Olx, Vinted, Mercari и другие)\n"
+        "(Avito, Юла, Kufar, Olx, Vinted, Mercari, Fruitsfamily)\n"
         "💵 Лучшая цена на рынке. Одна находка позволяет полностью "
         "окупить подписку в несколько раз.\n\n"
         "💬 Поддержка: @Autosearch_support\n\n"
         "👇 Нажми «Старт» чтобы начать 👇"
     )
     short_description = (
-        "Мониторит Avito, OLX, Vinted, Kufar, Mercari — присылает новые "
-        "объявления в реальном времени."
+        "Мониторит Avito, Юла, OLX, Vinted, Kufar, Mercari, Fruitsfamily — "
+        "присылает новые объявления в реальном времени."
     )
     try:
         await bot.set_my_description(bot_description)

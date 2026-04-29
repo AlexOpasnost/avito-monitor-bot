@@ -346,7 +346,8 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
 # uses the seller's native language. We feed source="auto" to Google so
 # it detects each item separately rather than guessing per source.
 _TRANSLATED_SOURCES: frozenset[str] = frozenset(
-    {"olx", "vinted", "mercari", "avito", "kufar", "goofish"}
+    {"olx", "vinted", "mercari", "avito", "kufar", "goofish",
+     "youla", "fruitsfamily"}
 )
 
 
@@ -522,12 +523,14 @@ def _source_button_text(source: str | None) -> str:
 # Per-source Referer for image downloads — Avito's CDN refuses requests
 # without the Avito Referer; other sites have similar checks.
 _SOURCE_IMAGE_REFERER = {
-    "avito":   "https://www.avito.ru/",
-    "kufar":   "https://www.kufar.by/",
-    "olx":     "https://www.olx.com/",
-    "vinted":  "https://www.vinted.com/",
-    "mercari": "https://jp.mercari.com/",
-    "goofish": "https://www.goofish.com/",
+    "avito":        "https://www.avito.ru/",
+    "kufar":        "https://www.kufar.by/",
+    "olx":          "https://www.olx.com/",
+    "vinted":       "https://www.vinted.com/",
+    "mercari":      "https://jp.mercari.com/",
+    "youla":        "https://youla.ru/",
+    "fruitsfamily": "https://fruitsfamily.com/",
+    "goofish":      "https://www.goofish.com/",
 }
 
 
