@@ -803,6 +803,19 @@ async def _start_yookassa_payment(
         f"https://t.me/{bot_username}" if bot_username else "https://t.me"
     )
 
+    # Both error paths below render an actionable screen with a retry
+    # button instead of a transient toast. Reusing `buy:<tariff_id>`
+    # as callback_data sends the user straight back through the same
+    # flow — and if their email is already saved, it skips the FSM
+    # ask and goes directly to YooKassa create_payment.
+    retry_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔁 Попробовать снова", callback_data=f"buy:{tariff_id}",
+        )],
+        [InlineKeyboardButton(text="⬅️ К тарифам",    callback_data="menu:tariffs")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+    ])
+
     try:
         payment = await yk.create_payment(
             shop_id=config.yookassa_shop_id,
@@ -816,21 +829,28 @@ async def _start_yookassa_payment(
         )
     except yk.YooKassaError:
         logger.exception("[payment] create_payment failed for tariff=%s", tariff_id)
-        msg = "Не получилось открыть оплату. Попробуй чуть позже."
+        await _present(
+            target,
+            "❌ Не получилось открыть оплату.\n\n"
+            "Скорее всего временная проблема со стороны ЮKassa или сети. "
+            "Жми «Попробовать снова» — обычно со второй попытки проходит.",
+            keyboard=retry_keyboard,
+        )
         if isinstance(target, CallbackQuery):
-            await target.answer(msg, show_alert=True)
-        else:
-            await target.answer(msg)
+            await target.answer()
         return
 
     confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
     if not confirmation_url:
         logger.error("[payment] no confirmation_url in YooKassa response: %s", payment)
-        msg = "ЮKassa не вернула ссылку на оплату — попробуй ещё раз."
+        await _present(
+            target,
+            "❌ ЮKassa не вернула ссылку на оплату.\n\n"
+            "Жми «Попробовать снова» — это редкая ошибка, обычно сразу проходит.",
+            keyboard=retry_keyboard,
+        )
         if isinstance(target, CallbackQuery):
-            await target.answer(msg, show_alert=True)
-        else:
-            await target.answer(msg)
+            await target.answer()
         return
 
     text = (
@@ -1672,7 +1692,14 @@ async def handle_rename_input(message: Message, state: FSMContext):
     sub_id = data.get("rename_sub_id")
     await state.clear()
     if sub_id is None:
-        await message.answer("Что-то пошло не так. Попробуй ещё раз через 📋 «Мои поиски».")
+        await message.answer(
+            "Что-то пошло не так — переименование сбросилось. Открой "
+            "«Мои поиски» и попробуй заново.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Мои поиски", callback_data="menu:list")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+            ]),
+        )
         return
 
     user_id = await db.get_or_create_user(
