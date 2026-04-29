@@ -1775,9 +1775,11 @@ async def handle_rename_input(message: Message, state: FSMContext):
 
 
 _BLACKLIST_SCREEN_NOTE = (
-    "🚫 <b>Стоп-слова</b> для поиска <b>{name}</b>\n\n"
+    "🚫 <b>Стоп-слова</b> для поиска <b>{name}</b>\n"
+    "<i>(только для этого поиска — на другие подписки не влияют)</i>\n\n"
     "Объявления, в заголовке или описании которых встречается "
-    "хотя бы одно из этих слов, не будут приходить.\n\n"
+    "хотя бы одно из этих слов, не будут приходить <b>именно "
+    "из этого поиска</b>.\n\n"
     "Сейчас в списке: <b>{count}</b> {plural}.\n"
 )
 
@@ -1872,13 +1874,16 @@ async def callback_blacklist_add(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(BlacklistStates.waiting_for_words)
     await state.update_data(blacklist_sub_id=sub_id)
+    sub_name = _sub_display_name(dict(sub))
     await callback.message.answer(
-        "Пришли слова через запятую или с новой строки. Например:\n"
-        "<code>женский, детский, фейк</code>\n\n"
-        "Регистр не важен. Поиск идёт по подстроке — «женск» "
-        "поймает все варианты («женский», «женское»…).\n\n"
-        "Ограничения: 2–30 символов на слово, до 50 слов.\n"
-        "<code>/cancel</code> — отмена.",
+        f"Добавляем стоп-слова <b>только для поиска «{_html.escape(sub_name)}»</b> "
+        f"(на другие подписки не повлияет).\n\n"
+        f"Пришли слова через запятую или с новой строки. Например:\n"
+        f"<code>женский, детский, фейк</code>\n\n"
+        f"Регистр не важен. Поиск идёт по подстроке — «женск» "
+        f"поймает все варианты («женский», «женское»…).\n\n"
+        f"Ограничения: 2–30 символов на слово, до 50 слов.\n"
+        f"<code>/cancel</code> — отмена.",
         parse_mode="HTML",
     )
     await callback.answer()
@@ -1980,8 +1985,15 @@ async def handle_blacklist_input(message: Message, state: FSMContext):
         return
     saved = await db.get_subscription_blacklist(int(sub_id), user_id) or []
     added = len(saved) - len(existing)
+    # Re-fetch the sub for its display name so the confirmation makes
+    # the per-subscription scope explicit.
+    sub_row = await db.get_subscription_owned_by(int(sub_id), user_id)
+    sub_name = _sub_display_name(dict(sub_row)) if sub_row else "?"
     await message.answer(
-        f"✅ Добавлено: <b>{added}</b>. Всего в списке: <b>{len(saved)}</b>.",
+        f"✅ Добавлено: <b>{added}</b>. "
+        f"В поиске <b>«{_html.escape(sub_name)}»</b> теперь "
+        f"<b>{len(saved)}</b> {_ru_plural_words(len(saved))} "
+        f"в стоп-листе.",
         parse_mode="HTML",
     )
     await _show_blacklist_screen(message, int(sub_id))
