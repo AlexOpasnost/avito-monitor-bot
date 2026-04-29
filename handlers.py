@@ -71,6 +71,12 @@ class RenameStates(StatesGroup):
     waiting_for_name = State()
 
 
+class BlacklistStates(StatesGroup):
+    """FSM: user clicked ➕ on the stop-words screen, the next text
+    message contains comma- or newline-separated words to add."""
+    waiting_for_words = State()
+
+
 class BuyStates(StatesGroup):
     """FSM: user clicked a paid tariff button, we asked for their
     email (required for the YooKassa receipt under Мой налог), the
@@ -1042,7 +1048,7 @@ async def _show_subscription_list(target):
         return
 
     lines = ["📋 <b>Активные поиски:</b>\n"]
-    rename_buttons = []
+    sub_buttons = []
     for i, sub in enumerate(active, 1):
         checked = sub["last_checked_at"]
         checked_str = (
@@ -1052,6 +1058,16 @@ async def _show_subscription_list(target):
             f" ⚠️ ошибок: {sub['error_count']}" if sub["error_count"] > 0 else ""
         )
         name = _sub_display_name(sub)
+        # Stop-word badge: number of active blacklist entries. JSONB
+        # comes back as either str or list; both are handled.
+        bl_raw = sub.get("filter_blacklist")
+        if isinstance(bl_raw, str):
+            try:
+                bl_raw = json.loads(bl_raw)
+            except Exception:
+                bl_raw = []
+        bl_count = len(bl_raw) if isinstance(bl_raw, list) else 0
+        bl_label = f"🚫 {bl_count}" if bl_count else "🚫"
         # Names + URLs come from the user / marketplace, escape before
         # inlining into HTML mode. Inline-button text is plain (Telegram
         # doesn't parse HTML there) so the name in callback button is
@@ -1062,13 +1078,20 @@ async def _show_subscription_list(target):
             f"<b>{i}.</b> <a href=\"{safe_url}\">{safe_name}</a>\n"
             f"   Последняя проверка: {checked_str}{errors}"
         )
-        rename_buttons.append([InlineKeyboardButton(
-            text=f"✏️ Назвать «{name[:18]}»",
-            callback_data=f"rename:{sub['id']}",
-        )])
+        # Two-button row per subscription: rename + stop-words.
+        sub_buttons.append([
+            InlineKeyboardButton(
+                text=f"✏️ {name[:16]}",
+                callback_data=f"rename:{sub['id']}",
+            ),
+            InlineKeyboardButton(
+                text=bl_label,
+                callback_data=f"bl:{sub['id']}",
+            ),
+        ])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        *rename_buttons,
+        *sub_buttons,
         [InlineKeyboardButton(text="❌ Удалить поиск", callback_data="cmd:delete")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu:home")],
     ])
@@ -1718,6 +1741,250 @@ async def handle_rename_input(message: Message, state: FSMContext):
         parse_mode="HTML",
     )
     await _show_subscription_list(message)
+
+
+# ---------------------------------------------------------------------------
+# Stop-words / blacklist (per-subscription) — UX flow
+# ---------------------------------------------------------------------------
+#
+#   /list  →  [✏️ Sub1]  [🚫 N]   ← click 🚫
+#                         ↓
+#   ┌────────────────────────────────┐
+#   │ 🚫 Стоп-слова для «Sub1»       │
+#   │                                │
+#   │ • женский                      │
+#   │ • детский                      │
+#   │ • унисекс                      │
+#   │                                │
+#   │ [ ➕ Добавить ]                │
+#   │ [ ❌ женский ] [ ❌ детский ]  │
+#   │ [ ❌ унисекс ]                 │
+#   │ [ 🧹 Очистить всё ]            │
+#   │ [ ⬅️ К поискам ]               │
+#   └────────────────────────────────┘
+#
+# ➕ Добавить → BlacklistStates FSM → user sends "слово1, слово2"
+# ❌ <word>   → drops just that one word
+# 🧹 Очистить → wipes the list
+#
+# Filter is substring (not word-boundary) so `женск` catches
+# `женский / женское / женская`. Applied in scheduler._process_items
+# on raw item title+description (pre-translation), so stop-words
+# should be in the marketplace's native language (RU for Avito,
+# PL for OLX-PL, etc.).
+
+
+_BLACKLIST_SCREEN_NOTE = (
+    "🚫 <b>Стоп-слова</b> для поиска <b>{name}</b>\n\n"
+    "Объявления, в заголовке или описании которых встречается "
+    "хотя бы одно из этих слов, не будут приходить.\n\n"
+    "Сейчас в списке: <b>{count}</b> {plural}.\n"
+)
+
+
+def _ru_plural_words(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "слово"
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return "слова"
+    return "слов"
+
+
+async def _show_blacklist_screen(target, sub_id: int):
+    user_id = await db.get_or_create_user(
+        target.from_user.id, target.from_user.username,
+    )
+    sub = await db.get_subscription_owned_by(sub_id, user_id)
+    if sub is None:
+        if isinstance(target, CallbackQuery):
+            await target.answer("Поиск не найден", show_alert=True)
+        return
+    words = await db.get_subscription_blacklist(sub_id, user_id) or []
+
+    name = _sub_display_name(dict(sub))
+    text = _BLACKLIST_SCREEN_NOTE.format(
+        name=_html.escape(name),
+        count=len(words),
+        plural=_ru_plural_words(len(words)),
+    )
+    if words:
+        text += "\n" + "\n".join(f"• {_html.escape(w)}" for w in words)
+    else:
+        text += (
+            "\n<i>Список пуст. Нажми «Добавить» и пришли слова через "
+            "запятую — например, «женский, детский, фейк».</i>"
+        )
+
+    rows: list[list[InlineKeyboardButton]] = [[
+        InlineKeyboardButton(
+            text="➕ Добавить",
+            callback_data=f"bl_add:{sub_id}",
+        ),
+    ]]
+    # Show ❌ buttons in pairs to keep the keyboard compact.
+    for i in range(0, len(words), 2):
+        chunk = words[i:i + 2]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"❌ {w[:18]}",
+                callback_data=f"bl_del:{sub_id}:{i + j}",
+            )
+            for j, w in enumerate(chunk)
+        ])
+    if words:
+        rows.append([InlineKeyboardButton(
+            text="🧹 Очистить всё",
+            callback_data=f"bl_clear:{sub_id}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К поискам", callback_data="menu:list",
+    )])
+
+    await _present(target, text, keyboard=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("bl:"))
+async def callback_show_blacklist(callback: CallbackQuery):
+    try:
+        sub_id = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Неверный ID")
+        return
+    await _show_blacklist_screen(callback, sub_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bl_add:"))
+async def callback_blacklist_add(callback: CallbackQuery, state: FSMContext):
+    try:
+        sub_id = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Неверный ID")
+        return
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    # Ownership pre-check before opening FSM — saves user from typing
+    # words for a sub they don't own.
+    sub = await db.get_subscription_owned_by(sub_id, user_id)
+    if sub is None:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
+    await state.set_state(BlacklistStates.waiting_for_words)
+    await state.update_data(blacklist_sub_id=sub_id)
+    await callback.message.answer(
+        "Пришли слова через запятую или с новой строки. Например:\n"
+        "<code>женский, детский, фейк</code>\n\n"
+        "Регистр не важен. Поиск идёт по подстроке — «женск» "
+        "поймает все варианты («женский», «женское»…).\n\n"
+        "Ограничения: 2–30 символов на слово, до 50 слов.\n"
+        "<code>/cancel</code> — отмена.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bl_del:"))
+async def callback_blacklist_del(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    try:
+        sub_id = int(parts[1])
+        idx = int(parts[2])
+    except (ValueError, IndexError):
+        await callback.answer("Неверный ID")
+        return
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    words = await db.get_subscription_blacklist(sub_id, user_id)
+    if words is None:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
+    if 0 <= idx < len(words):
+        removed = words.pop(idx)
+        await db.set_subscription_blacklist(sub_id, user_id, words)
+        await callback.answer(f"Снято: {removed[:30]}")
+    else:
+        await callback.answer("Слово уже снято")
+    await _show_blacklist_screen(callback, sub_id)
+
+
+@router.callback_query(F.data.startswith("bl_clear:"))
+async def callback_blacklist_clear(callback: CallbackQuery):
+    try:
+        sub_id = int(callback.data.split(":")[1])
+    except (ValueError, IndexError):
+        await callback.answer("Неверный ID")
+        return
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    ok = await db.set_subscription_blacklist(sub_id, user_id, [])
+    if not ok:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
+    await callback.answer("Список очищен")
+    await _show_blacklist_screen(callback, sub_id)
+
+
+@router.message(Command("cancel"), StateFilter(BlacklistStates.waiting_for_words))
+async def cmd_cancel_blacklist(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("✅ Отменено.", reply_markup=back_to_menu_keyboard())
+
+
+@router.message(StateFilter(BlacklistStates.waiting_for_words), F.text)
+async def handle_blacklist_input(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    data = await state.get_data()
+    sub_id = data.get("blacklist_sub_id")
+    await state.clear()
+    if sub_id is None:
+        await message.answer(
+            "Что-то пошло не так — открой 🚫 у поиска заново.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📋 Мои поиски", callback_data="menu:list"),
+            ]]),
+        )
+        return
+    user_id = await db.get_or_create_user(
+        message.from_user.id, message.from_user.username,
+    )
+    existing = await db.get_subscription_blacklist(int(sub_id), user_id)
+    if existing is None:
+        await message.answer(
+            "Поиск не найден или удалён.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+
+    # Normalize the user's text into stop-words and union with existing.
+    # The DB-side _normalize_blacklist will dedup + truncate to 50.
+    new_words = db._normalize_blacklist(raw)
+    if not new_words:
+        await message.answer(
+            "Не нашёл подходящих слов (нужно 2–30 символов на слово). "
+            "Открой 🚫 у поиска заново.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📋 Мои поиски", callback_data="menu:list"),
+            ]]),
+        )
+        return
+    merged = list(dict.fromkeys(existing + new_words))  # preserve order, dedup
+    ok = await db.set_subscription_blacklist(int(sub_id), user_id, merged)
+    if not ok:
+        await message.answer(
+            "Не удалось сохранить — поиск, видимо, удалён.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        return
+    saved = await db.get_subscription_blacklist(int(sub_id), user_id) or []
+    added = len(saved) - len(existing)
+    await message.answer(
+        f"✅ Добавлено: <b>{added}</b>. Всего в списке: <b>{len(saved)}</b>.",
+        parse_mode="HTML",
+    )
+    await _show_blacklist_screen(message, int(sub_id))
 
 
 # ---------------------------------------------------------------------------

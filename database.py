@@ -1,7 +1,10 @@
 import asyncio
 import asyncpg
 import logging
+import re
 from datetime import datetime, timedelta, timezone
+
+import orjson
 
 from config import config
 
@@ -200,6 +203,15 @@ class Database:
             # button on the «Мои поиски» screen.
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS name TEXT"
+            )
+            # Per-subscription stop-words. Items whose title or description
+            # contains any of these substrings (case-insensitive) get
+            # filtered before notification. Stored as a JSONB array of
+            # lowercase strings — e.g. ["женский", "детский", "fake"].
+            # Empty/missing = no filtering.
+            await conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS "
+                "filter_blacklist JSONB DEFAULT '[]'::jsonb"
             )
             # Customer email — required by YooKassa to issue a fiscal
             # receipt under Мой налог (самозанятый). Asked once per
@@ -921,7 +933,8 @@ class Database:
             return await conn.fetch(
                 "SELECT id, url, is_active, created_at, last_checked_at, "
                 "       error_count, "
-                "       COALESCE(source, 'avito') AS source, name "
+                "       COALESCE(source, 'avito') AS source, name, "
+                "       COALESCE(filter_blacklist, '[]'::jsonb) AS filter_blacklist "
                 "FROM subscriptions WHERE user_id = $1 AND deleted = FALSE "
                 "ORDER BY created_at DESC",
                 user_id,
@@ -963,7 +976,8 @@ class Database:
         async def _op(conn):
             return await conn.fetch(
                 "SELECT s.id, s.url, s.user_id, s.last_checked_at, "
-                "       COALESCE(s.source, 'avito') AS source, u.telegram_id "
+                "       COALESCE(s.source, 'avito') AS source, u.telegram_id, "
+                "       COALESCE(s.filter_blacklist, '[]'::jsonb) AS filter_blacklist "
                 "FROM subscriptions s "
                 "JOIN users u ON u.id = s.user_id "
                 "WHERE s.is_active = TRUE AND s.deleted = FALSE"
@@ -977,12 +991,94 @@ class Database:
         async def _op(conn):
             return await conn.fetchrow(
                 "SELECT s.id, s.url, s.user_id, s.last_checked_at, "
-                "       COALESCE(s.source, 'avito') AS source, u.telegram_id "
+                "       COALESCE(s.source, 'avito') AS source, u.telegram_id, "
+                "       COALESCE(s.filter_blacklist, '[]'::jsonb) AS filter_blacklist "
                 "FROM subscriptions s "
                 "JOIN users u ON u.id = s.user_id "
                 "WHERE s.id = $1 AND s.is_active = TRUE AND s.deleted = FALSE",
                 sub_id,
             )
+        return await self._execute(_op)
+
+    # --- Stop-words (per-subscription blacklist) ---
+
+    # Limits for user-supplied stop-words. 50/30 are generous for any
+    # realistic use; without caps a single subscription could swallow
+    # arbitrary memory in get_active_subscriptions cycles.
+    MAX_BLACKLIST_WORDS = 50
+    MAX_BLACKLIST_WORD_LEN = 30
+    MIN_BLACKLIST_WORD_LEN = 2
+
+    @staticmethod
+    def _normalize_blacklist(words) -> list[str]:
+        """Lowercase + trim + dedup + bounds-check input. Tolerates either
+        a list or a single comma/newline-separated string from the user."""
+        if isinstance(words, str):
+            tokens = re.split(r"[,\n;]+", words)
+        else:
+            tokens = list(words or [])
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in tokens:
+            if not isinstance(raw, str):
+                continue
+            w = raw.strip().lower()
+            if not (Database.MIN_BLACKLIST_WORD_LEN
+                    <= len(w) <= Database.MAX_BLACKLIST_WORD_LEN):
+                continue
+            if w in seen:
+                continue
+            seen.add(w)
+            out.append(w)
+            if len(out) >= Database.MAX_BLACKLIST_WORDS:
+                break
+        return out
+
+    async def get_subscription_blacklist(
+        self, sub_id: int, user_id: int,
+    ) -> list[str] | None:
+        """Return the stop-word list for a subscription, with ownership
+        check. Returns None if the sub doesn't exist or isn't owned."""
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT COALESCE(filter_blacklist, '[]'::jsonb) AS bl "
+                "FROM subscriptions "
+                "WHERE id = $1 AND user_id = $2 AND deleted = FALSE",
+                sub_id, user_id,
+            )
+            if row is None:
+                return None
+            raw = row["bl"]
+            # asyncpg returns JSONB as str when no codec is registered;
+            # parse defensively for either str or list.
+            if isinstance(raw, str):
+                try:
+                    parsed = orjson.loads(raw)
+                except Exception:
+                    return []
+            else:
+                parsed = raw
+            if not isinstance(parsed, list):
+                return []
+            return [w for w in parsed if isinstance(w, str)]
+        return await self._execute(_op)
+
+    async def set_subscription_blacklist(
+        self, sub_id: int, user_id: int, words,
+    ) -> bool:
+        """Replace the entire blacklist with the normalized input.
+        Ownership-checked. Returns True on a real write, False if the
+        sub doesn't belong to the user / is deleted."""
+        normalized = self._normalize_blacklist(words)
+        payload = orjson.dumps(normalized).decode("utf-8")
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "UPDATE subscriptions SET filter_blacklist = $3::jsonb "
+                "WHERE id = $1 AND user_id = $2 AND deleted = FALSE "
+                "RETURNING id",
+                sub_id, user_id, payload,
+            )
+            return row is not None
         return await self._execute(_op)
 
     async def deactivate_subscription(self, sub_id: int, user_id: int) -> bool:

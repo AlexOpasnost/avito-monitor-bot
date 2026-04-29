@@ -4,6 +4,8 @@ import logging
 import time
 from datetime import datetime, timezone, timedelta
 
+import orjson
+
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -30,6 +32,38 @@ logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 MAX_ITEMS_PER_CYCLE = 10
 MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
+
+
+def _parse_blacklist(raw) -> list[str]:
+    """Normalize the `filter_blacklist` value coming back from asyncpg.
+    JSONB columns may surface as either a Python list (when a codec
+    is registered) or as a JSON-encoded str. Either way we want a
+    plain list[str] of lowercased tokens for matching."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = orjson.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [w for w in raw if isinstance(w, str) and w]
+
+
+def _matches_blacklist(item: SearchItem, blacklist: list[str]) -> bool:
+    """True if any stop-word appears as a substring in the item's
+    title or description (case-insensitive). Substring (not word-
+    boundary) matches let `женск` catch the whole declension family
+    (`женский / женское / женская`) — saves the user from listing
+    every form."""
+    haystack = " ".join([
+        item.title or "",
+        item.description or "",
+    ]).lower()
+    if not haystack.strip():
+        return False
+    return any(word in haystack for word in blacklist)
 
 
 async def _sent_items_pruner(stop_event: asyncio.Event):
@@ -211,6 +245,22 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
 
 async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
     is_first_scan = sub.get("last_checked_at") is None
+
+    # Per-subscription stop-words filter. Skipped on first scan so that
+    # the initial backlog gets fully marked as "seen" — otherwise, if
+    # the user later edits the blacklist, all the previously-filtered
+    # items would suddenly burst-deliver as "new". On steady-state
+    # cycles we drop matches before they reach the dedup table at all.
+    blacklist = _parse_blacklist(sub.get("filter_blacklist"))
+    if blacklist and not is_first_scan:
+        before = len(items)
+        items = [i for i in items if not _matches_blacklist(i, blacklist)]
+        dropped = before - len(items)
+        if dropped:
+            logger.info(
+                "Sub #%d: blacklist dropped %d/%d items",
+                sub["id"], dropped, before,
+            )
 
     # Group by source so a single batch insert can be made even if a
     # subscription accidentally returns items from more than one site

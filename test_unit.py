@@ -1757,6 +1757,57 @@ def test_vinted_location_fallback():
     print("OK: vinted _extract_location_from_html (with fallback)")
 
 
+def test_blacklist_normalize():
+    from database import Database
+    n = Database._normalize_blacklist
+    # Comma + newline + semicolon separators
+    assert n("женский, детский\nфейк; мусор") == [
+        "женский", "детский", "фейк", "мусор",
+    ]
+    # Lowercased, dedup, ordered
+    assert n(["WOMAN", "  woman  ", "kid"]) == ["woman", "kid"]
+    # Length bounds (2..30)
+    assert n("a") == []
+    assert n("x" * 31) == []
+    # Empty / None tolerated
+    assert n("") == []
+    assert n(None) == []
+    # 50-word cap
+    big = n(",".join(f"word{i}" for i in range(60)))
+    assert len(big) == 50
+    print("OK: Database._normalize_blacklist")
+
+
+def test_blacklist_filter():
+    from scheduler import _matches_blacklist, _parse_blacklist
+    from parser import SearchItem
+
+    item = SearchItem(
+        source="avito", external_id="1",
+        title="Женский свитер Stone Island",
+        price="", price_value=None, url="", image_url=None,
+        location=None, description="Размер M, новый",
+        seller_name=None, published_timestamp=None,
+    )
+    # Substring match catches all declensions
+    assert _matches_blacklist(item, ["женск"]) is True
+    assert _matches_blacklist(item, ["мужск"]) is False
+    # Multiple words — any match wins
+    assert _matches_blacklist(item, ["мужск", "женск"]) is True
+    # Empty list matches nothing
+    assert _matches_blacklist(item, []) is False
+    # Case-insensitive (blacklist is normalized to lowercase before this)
+    assert _matches_blacklist(item, ["stone island"]) is True
+
+    # JSONB normalization — asyncpg may surface JSONB as either str or list
+    assert _parse_blacklist(None) == []
+    assert _parse_blacklist('["женск","детск"]') == ["женск", "детск"]
+    assert _parse_blacklist(["a", "b"]) == ["a", "b"]
+    assert _parse_blacklist("not json") == []
+    assert _parse_blacklist([1, "ok", None, "good"]) == ["ok", "good"]
+    print("OK: scheduler blacklist filter + parser")
+
+
 if __name__ == "__main__":
     test_proxy_for_source()
     test_dispatcher_matches_avito()
@@ -1824,4 +1875,6 @@ if __name__ == "__main__":
     test_admin_ids_env_parsing()
     test_admin_user_tariff_short_circuit()
     test_html_injection_safe_in_sub_list()
+    test_blacklist_normalize()
+    test_blacklist_filter()
     print("\nALL UNIT TESTS PASSED")
