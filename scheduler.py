@@ -258,7 +258,16 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
     # the user later edits the blacklist, all the previously-filtered
     # items would suddenly burst-deliver as "new". On steady-state
     # cycles we drop matches before they reach the dedup table at all.
-    blacklist = _parse_blacklist(sub.get("filter_blacklist"))
+    raw_bl = sub.get("filter_blacklist")
+    blacklist = _parse_blacklist(raw_bl)
+    # Visibility line — surfaces both the parsed-word count and the raw
+    # repr so we can tell apart "no blacklist on this sub" from "raw is
+    # non-empty but didn't parse" (asyncpg codec mismatch etc.).
+    logger.info(
+        "Sub #%d: blacklist parsed=%d raw_type=%s raw_head=%r",
+        sub["id"], len(blacklist), type(raw_bl).__name__,
+        (str(raw_bl)[:80] if raw_bl else ""),
+    )
     if blacklist and not is_first_scan:
         before = len(items)
         items = [i for i in items if not _matches_blacklist(i, blacklist)]
