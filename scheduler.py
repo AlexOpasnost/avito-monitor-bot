@@ -157,9 +157,10 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
 
     while not stop_event.is_set():
         try:
-            # Always re-read URL from DB — never trust the snapshot we got
-            # at task spawn time. User may have edited / re-added the
-            # subscription with a longer/cleaner URL.
+            # Always re-read DB-backed fields — never trust the snapshot
+            # we got at task spawn time. User may have edited the URL,
+            # added stop-words, or paused/renamed the sub since the
+            # task started.
             fresh = await db.get_subscription(sub["id"])
             if fresh is None:
                 logger.info("Sub #%d deleted/deactivated — exiting loop", sub["id"])
@@ -167,6 +168,12 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             sub["url"] = fresh["url"]
             sub["last_checked_at"] = fresh["last_checked_at"]
             sub["telegram_id"] = fresh["telegram_id"]
+            # Stop-words: edits via the bot's blacklist screen need to
+            # take effect on the NEXT cycle, not "after a redeploy".
+            # Forgetting this kept the field frozen at task-spawn time
+            # and is exactly why a user with 12 stop-words still saw
+            # listings with those words appearing.
+            sub["filter_blacklist"] = fresh.get("filter_blacklist")
 
             async with sem:
                 _url = sub["url"]
