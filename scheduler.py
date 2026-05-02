@@ -24,9 +24,6 @@ from parsers import is_source_disabled, source_display_name
 from parsers.common import proxy_for_source
 from parsers.currency import format_with_estimate
 
-# Back-compat alias used in this module
-AvitoItem = SearchItem
-
 logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
@@ -628,7 +625,7 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
 # uses the seller's native language. We feed source="auto" to Google so
 # it detects each item separately rather than guessing per source.
 _TRANSLATED_SOURCES: frozenset[str] = frozenset(
-    {"olx", "vinted", "mercari", "avito", "kufar", "goofish",
+    {"olx", "vinted", "mercari", "avito", "kufar",
      "youla", "fruitsfamily", "grailed"}
 )
 
@@ -813,7 +810,6 @@ _SOURCE_IMAGE_REFERER = {
     "youla":        "https://youla.ru/",
     "fruitsfamily": "https://fruitsfamily.com/",
     "grailed":      "https://www.grailed.com/",
-    "goofish":      "https://www.goofish.com/",
 }
 
 
@@ -877,7 +873,7 @@ async def _send_notification(
 
 
 def _format_notification(
-    item: AvitoItem, *,
+    item: SearchItem, *,
     title: str | None = None,
     description: str | None = None,
     condition: str | None = None,
@@ -958,7 +954,7 @@ def _format_notification(
     return "\n".join(lines)
 
 
-def _format_price(item: AvitoItem, user_currency: str) -> str:
+def _format_price(item: SearchItem, user_currency: str) -> str:
     """Render the price with a user-currency estimate when conversion is
     possible. Falls back to the parser's raw `item.price` string when
     we don't have the numeric value to convert."""

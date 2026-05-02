@@ -226,12 +226,6 @@ def timezone_short(code: str | None, lang: str | None = "ru") -> str:
     return code.split("/")[-1].replace("_", " ")
 
 
-# Back-compat alias for any callers that still imported the dict
-# directly. Keeping it pointed at the RU table preserves behaviour
-# from before the lang-aware split.
-_TIMEZONE_SHORT = _TIMEZONE_SHORT_RU
-
-
 # Date-line phrasing per language. Three patterns each:
 #   "today"     — used when the listing was published earlier today
 #   "yesterday" — published the previous calendar day

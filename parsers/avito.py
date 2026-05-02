@@ -13,7 +13,6 @@ from config import config
 from .base import SearchItem
 from .common import (
     MAX_JSON_BYTES,
-    download_image_bytes,
     get_cloudscraper,
     host_request_lock,
     host_in_allowlist,
@@ -503,11 +502,3 @@ def _extract_location(val: dict) -> str | None:
     return _city_from_url_path(val.get("urlPath") or "")
 
 
-# ---------------------------------------------------------------------------
-# Image download with Avito referer (for Telegram photo upload)
-# ---------------------------------------------------------------------------
-
-async def avito_download_image(url: str, proxy: str | None = None) -> bytes | None:
-    return await download_image_bytes(
-        url, host=_HOST, referer="https://www.avito.ru/", proxy=proxy,
-    )

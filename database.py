@@ -149,8 +149,7 @@ class Database:
             error_count INT DEFAULT 0,
             last_error TEXT,
             last_checked_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            filter_whitelist TEXT
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )""")
         await conn.execute("""CREATE TABLE IF NOT EXISTS sent_items (
             id SERIAL PRIMARY KEY,
@@ -173,9 +172,6 @@ class Database:
         try:
             await conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT FALSE"
-            )
-            await conn.execute(
-                "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS filter_whitelist TEXT"
             )
             await conn.execute(
                 "ALTER TABLE subscriptions ALTER COLUMN url TYPE TEXT"
@@ -685,15 +681,6 @@ class Database:
         # gets the exception and surfaces "ошибка, попробуй ещё раз".
         return await self._execute(_op, idempotent=False)
 
-    async def count_active_subs(self, user_id: int) -> int:
-        async def _op(conn):
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions "
-                "WHERE user_id = $1 AND is_active = TRUE AND deleted = FALSE",
-                user_id,
-            ) or 0
-        return await self._execute(_op)
-
     async def find_subscription_by_url(
         self, user_id: int, url: str,
     ) -> dict | None:
@@ -1176,40 +1163,6 @@ class Database:
                 "SELECT user_id FROM payments WHERE telegram_charge_id = $1",
                 payment_id,
             )
-        return await self._execute(_op)
-
-    async def record_payment(
-        self, telegram_charge_id: str, provider_charge_id: str | None,
-        user_id: int, tariff_id: str,
-        amount_minor: int, currency: str,
-    ) -> bool:
-        """Record a Telegram-Payments charge for idempotency.
-
-        Returns True if this is a new charge (caller should activate the
-        tariff), False if the same telegram_charge_id was already
-        recorded (Telegram is retrying the delivery; skip activation).
-
-        NB: for the YooKassa webhook path, prefer
-        `record_and_activate_payment` — it folds the INSERT and the
-        tariff UPDATE into one transaction so the user can never end up
-        with a recorded payment but no activation (which is what would
-        happen here if the caller crashes between record_payment and
-        activate_tariff, or if `_execute`'s retry-on-network-error path
-        triggers after the INSERT committed but before the client got
-        the ack).
-        """
-        async def _op(conn):
-            row = await conn.fetchrow(
-                "INSERT INTO payments "
-                "(telegram_charge_id, provider_charge_id, user_id, "
-                " tariff_id, amount_minor, currency) "
-                "VALUES ($1, $2, $3, $4, $5, $6) "
-                "ON CONFLICT (telegram_charge_id) DO NOTHING "
-                "RETURNING telegram_charge_id",
-                telegram_charge_id, provider_charge_id, user_id,
-                tariff_id, amount_minor, currency,
-            )
-            return row is not None
         return await self._execute(_op)
 
     async def record_and_activate_payment(

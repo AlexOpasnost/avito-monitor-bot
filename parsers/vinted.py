@@ -32,7 +32,6 @@ import orjson
 from .base import SearchItem
 from .common import (
     MAX_JSON_BYTES,
-    download_image_bytes,
     get_cloudscraper,
     host_request_lock,
     host_matches_pattern,
@@ -745,11 +744,3 @@ def _extract_timestamp(entry: dict) -> int | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Image download with Vinted referer
-# ---------------------------------------------------------------------------
-
-async def vinted_download_image(url: str, proxy: str | None = None) -> bytes | None:
-    return await download_image_bytes(
-        url, host=_HOST, referer="https://www.vinted.com/", proxy=proxy,
-    )

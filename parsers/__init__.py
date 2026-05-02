@@ -69,7 +69,6 @@ SOURCE_DISPLAY_NAMES: dict[str, str] = {
     "youla":        "Юла",
     "fruitsfamily": "Fruitsfamily",
     "grailed":      "Grailed",
-    "goofish":      "Goofish",
 }
 
 

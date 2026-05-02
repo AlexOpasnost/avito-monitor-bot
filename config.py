@@ -10,7 +10,6 @@ class Config:
     bot_token: str = ""
     database_url: str = ""
     proxy_list: list[str] = field(default_factory=list)
-    parse_interval: int = 60
     max_subscriptions: int = 5
     max_errors_before_deactivate: int = 10
     telegram_api_url: str = "https://api.telegram.org"
@@ -30,8 +29,7 @@ class Config:
         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     )
-    # Branding + paywall
-    brand_name: str = "AutoSearch"
+    # Paywall
     basic_price_rub: int = 990
     pro_price_rub: int = 2490
     payment_url_basic: str = ""     # real payment link (YooMoney / Robokassa / …)
@@ -131,7 +129,6 @@ class Config:
             bot_token=os.getenv("BOT_TOKEN", ""),
             database_url=os.getenv("DATABASE_URL", "postgresql://localhost/avito_monitor"),
             proxy_list=proxies,
-            parse_interval=int(os.getenv("PARSE_INTERVAL", "60")),
             max_subscriptions=int(os.getenv("MAX_SUBSCRIPTIONS", "5")),
             telegram_api_url=os.getenv("TELEGRAM_API_URL", "https://api.telegram.org"),
             proxy_rotate_url=os.getenv("PROXY_ROTATE_URL", ""),
@@ -139,7 +136,6 @@ class Config:
             admin_ids=admin_ids,
             max_concurrent_requests=int(os.getenv("MAX_CONCURRENT_REQUESTS", "3")),
             headless=os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes"),
-            brand_name=os.getenv("BRAND_NAME", "AutoSearch"),
             basic_price_rub=int(os.getenv("BASIC_PRICE_RUB", "990")),
             pro_price_rub=int(os.getenv("PRO_PRICE_RUB", "2490")),
             payment_url_basic=os.getenv("PAYMENT_URL_BASIC", ""),

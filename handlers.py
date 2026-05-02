@@ -208,12 +208,6 @@ def _extract_marketplace_url(message_or_text) -> tuple[str, str] | None:
     return source.name, url
 
 
-def _extract_avito_url(message_or_text) -> str | None:
-    """Back-compat shim — older callers expected just the URL string."""
-    result = _extract_marketplace_url(message_or_text)
-    return result[1] if result else None
-
-
 async def _warn_if_url_during_fsm(
     message: Message, expected: str,
 ) -> bool:

@@ -34,7 +34,6 @@ import orjson
 from .base import SearchItem
 from .common import (
     MAX_JSON_BYTES,
-    download_image_bytes,
     get_cloudscraper,
     host_request_lock,
     host_matches_pattern,
@@ -657,12 +656,3 @@ def _clean_description(raw: str) -> str:
     return txt.strip()
 
 
-# ---------------------------------------------------------------------------
-# Image download with OLX referer
-# ---------------------------------------------------------------------------
-
-async def olx_download_image(url: str, proxy: str | None = None) -> bytes | None:
-    # olxcdn accepts any olx.* as Referer; .pl hard-coded is safe.
-    return await download_image_bytes(
-        url, host=_HOST, referer="https://www.olx.pl/", proxy=proxy,
-    )

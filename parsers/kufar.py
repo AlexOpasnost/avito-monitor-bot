@@ -18,7 +18,6 @@ import orjson
 from .base import SearchItem
 from .common import (
     MAX_JSON_BYTES,
-    download_image_bytes,
     get_cloudscraper,
     host_request_lock,
     host_in_allowlist,
@@ -341,11 +340,3 @@ def _parse_list_time(raw) -> int | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Image download with Kufar referer (for Telegram photo upload)
-# ---------------------------------------------------------------------------
-
-async def kufar_download_image(url: str, proxy: str | None = None) -> bytes | None:
-    return await download_image_bytes(
-        url, host=_HOST, referer="https://www.kufar.by/", proxy=proxy,
-    )
