@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # Python deps — pinned in requirements.txt, so dependabot opens a PR
+  # whenever a pinned lib gets a CVE patch or a minor release.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/Moscow"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    # Minor and patch only by default; major bumps require manual review
+    # because they can break aiogram / aiohttp / asyncpg APIs.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions — pin the runners and action versions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # Docker base image — flag a new python:3.13-slim digest weekly
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 2
+    labels:
+      - "dependencies"
+      - "docker"

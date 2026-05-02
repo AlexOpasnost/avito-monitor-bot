@@ -1,0 +1,45 @@
+# Secrets — must NEVER end up in a built image. Even though Railway
+# injects env vars at runtime, a stray .env in the build context would
+# get baked into a layer and leak via `docker save | tar`.
+.env
+.env.*
+*.pem
+*.key
+
+# VCS / CI — not needed in the runtime image and bloats every layer
+.git
+.github
+.gitignore
+.gitattributes
+
+# Local dev artifacts
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Local state and dev screenshots — these accumulate during scraping
+# experiments and are not part of the runtime
+test_page*.png
+*.sqlite
+*.db
+*.log
+
+# Documentation — readable on GitHub, no need to copy into the image
+docs/
+README.md
+LICENSE
+CHANGELOG.md
+
+# Tests — run in CI, not at runtime
+test_*.py
+tests/
