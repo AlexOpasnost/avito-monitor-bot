@@ -50,9 +50,19 @@ class Database:
     async def _create_pool(self) -> asyncpg.Pool:
         return await asyncpg.create_pool(
             config.database_url,
-            min_size=0,
-            max_size=5,
-            command_timeout=120,
+            # Bumped from 0/5/120 because under bursty load (multiple
+            # webhooks + scheduler + admin queries) a 5-slot pool with
+            # 120s command timeout meant one slow query held 1/5 of
+            # the pool for 2 minutes — a single transient blip cascaded
+            # into pool recreation. New profile:
+            #   min_size=2: keep warm so cold-restart doesn't start at 0
+            #   max_size=10: covers steady-state at ~50 active subs
+            #   command_timeout=20: a hung query no longer wedges 1/10
+            #     of the pool for 2 minutes; admin/pruner paths that
+            #     legitimately need longer use a separate timeout
+            min_size=2,
+            max_size=10,
+            command_timeout=20,
             timeout=60,
             max_inactive_connection_lifetime=30,
         )
@@ -359,6 +369,20 @@ class Database:
             """)
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sent_items_source ON sent_items(source)"
+            )
+            # The sent_items pruner deletes WHERE sent_at < NOW() - X days.
+            # Without this index that's a full scan over millions of rows
+            # holding row locks for minutes against the scheduler INSERTs.
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sent_items_sent_at "
+                "ON sent_items(sent_at)"
+            )
+            # Hot read paths (callbacks, list, blacklist screen) all
+            # filter `WHERE user_id = $1 AND deleted = FALSE`. Partial
+            # index keeps lookups O(log N) per user even at scale.
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_active "
+                "ON subscriptions(user_id) WHERE deleted = FALSE"
             )
 
             await self._apply_once(conn, "cleanup_2026_04_19",
@@ -1532,6 +1556,35 @@ class Database:
                 sub_id, source, external_id,
             )
         await self._execute(_op)
+
+    async def filter_unsent_items(
+        self, sub_id: int, items: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Given (source, external_id) pairs, return only those NOT
+        yet recorded in sent_items for this subscription.
+
+        Replaces the per-item is_item_sent loop in the scheduler hot
+        path (was N round-trips × ~30ms = 1.5s overhead per cycle).
+        Single query with `WHERE (source, avito_id) IN (...)` covers
+        the same dedup with one round-trip; uses the existing
+        idx_sent_items_lookup composite index.
+        """
+        if not items:
+            return []
+        async def _op(conn):
+            sources = [s for s, _ in items]
+            ids = [eid for _, eid in items]
+            rows = await conn.fetch(
+                "SELECT source, avito_id FROM sent_items "
+                "WHERE subscription_id = $1 "
+                "  AND (source, avito_id) IN ("
+                "    SELECT * FROM unnest($2::text[], $3::text[])"
+                "  )",
+                sub_id, sources, ids,
+            )
+            seen = {(r["source"], r["avito_id"]) for r in rows}
+            return [pair for pair in items if pair not in seen]
+        return await self._execute(_op)
 
     async def mark_items_sent_batch(self, sub_id: int,
                                      external_ids: list[str],

@@ -354,12 +354,32 @@ def looks_like_image_url(u: object, extra_hosts: tuple[str, ...] = ()) -> bool:
 
 # ---------------------------------------------------------------------------
 # Global Avito-lock (legacy) — exported for parser.py compatibility.
-# Serializes all marketplace requests process-wide so two subs never fire at
-# the same time regardless of who calls fetch_search_items.
+# Per-host locks. Originally one process-wide lock, which created a
+# hard 7-subscription throughput ceiling regardless of source mix
+# (verified via performance audit). Now keyed by host string so e.g.
+# Avito and OLX can run in parallel; only same-host fetches serialize
+# (matters for proxy/cookie state on the cloudscraper sessions).
+#
+# `global_request_lock()` is kept as a no-arg shim for parsers that
+# haven't migrated yet — returns a process-wide singleton which still
+# behaves like the old lock. Prefer `host_request_lock(host)` going
+# forward.
 # ---------------------------------------------------------------------------
 
 _global_lock = asyncio.Lock()
+_host_locks: dict[str, asyncio.Lock] = {}
 
 
 def global_request_lock() -> asyncio.Lock:
     return _global_lock
+
+
+def host_request_lock(host: str) -> asyncio.Lock:
+    """Return the lock for a given marketplace host. Lazily-created;
+    one Lock per host string for the lifetime of the process. Replaces
+    the old single global lock to allow cross-source parallelism."""
+    lock = _host_locks.get(host)
+    if lock is None:
+        lock = asyncio.Lock()
+        _host_locks[host] = lock
+    return lock

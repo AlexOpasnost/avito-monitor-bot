@@ -235,10 +235,32 @@ async def _sent_items_pruner(stop_event: asyncio.Event):
 
 
 async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
-    # Hard-coded sem=1: never fire two subscriptions simultaneously.
-    # parser.py also holds its own lock, so this is belt-and-suspenders.
-    logger.info("Scheduler started (per-sub interval=60s, sem=1, no stagger)")
-    sem = asyncio.Semaphore(1)
+    # Per-source semaphores: previously a single Semaphore(1) for ALL
+    # parsers, which meant Avito + OLX + Vinted serialised through one
+    # gate and the bot couldn't sustain SLA past ~7 active subs. Each
+    # source now gets its own gate. Avito/Kufar/Youla stay at 1 (proxy
+    # cookies + anti-bot warmup are per-host stateful); the rest can
+    # do 2 in parallel without crossing per-IP rate limits.
+    logger.info(
+        "Scheduler started (per-sub interval=60s, per-source semaphores, jittered start)"
+    )
+    sems: dict[str, asyncio.Semaphore] = {
+        "avito":        asyncio.Semaphore(1),
+        "kufar":        asyncio.Semaphore(1),
+        "youla":        asyncio.Semaphore(1),
+        "olx":          asyncio.Semaphore(2),
+        "vinted":       asyncio.Semaphore(2),
+        "mercari":      asyncio.Semaphore(2),
+        "fruitsfamily": asyncio.Semaphore(2),
+        "grailed":      asyncio.Semaphore(2),
+    }
+    # Fallback for any source not in the map — keeps unknown future
+    # parsers safe-by-default at 1 concurrent fetch.
+    fallback_sem = asyncio.Semaphore(1)
+
+    def sem_for(source_name: str) -> asyncio.Semaphore:
+        return sems.get(source_name) or fallback_sem
+
     tasks: dict[int, asyncio.Task] = {}
     pruner_task = asyncio.create_task(_sent_items_pruner(stop_event))
     funnel_task = asyncio.create_task(_tariff_renewal_funnel(bot, stop_event))
@@ -263,7 +285,7 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
         for sub in subs:
             if sub["id"] not in tasks:
                 tasks[sub["id"]] = asyncio.create_task(
-                    _sub_loop(dict(sub), bot, sem, stop_event)
+                    _sub_loop(dict(sub), bot, sem_for, stop_event)
                 )
 
         try:
@@ -290,11 +312,30 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
     logger.info("Scheduler stopped")
 
 
-async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asyncio.Event):
-    """One loop per subscription. Uses a global semaphore (1) so only one
-    subscription fetches at a time. No startup or inter-request stagger —
-    60-s cycle spacing is all we need."""
+async def _sub_loop(
+    sub: dict, bot: Bot,
+    sem_for, stop_event: asyncio.Event,
+):
+    """One loop per subscription. Resolves the per-source semaphore
+    at fetch time (not at spawn) so a sub whose URL is later edited
+    to a different source uses the correct gate. Adds startup jitter
+    to avoid the thundering-herd-at-restart pattern where N tasks all
+    hit the lock at the same minute mark."""
     logger.info("Sub #%d loop started", sub["id"])
+
+    # Startup jitter — uniform 0..30s. Without this, every sub
+    # re-synchronises at the same wall-clock minute after a restart
+    # and they all queue on the lock together. Distributes the load
+    # over the first cycle.
+    import random as _random
+    try:
+        await asyncio.wait_for(
+            stop_event.wait(),
+            timeout=_random.uniform(0, 30),
+        )
+        return
+    except asyncio.TimeoutError:
+        pass
 
     consecutive_failures = 0
 
@@ -318,10 +359,14 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             # listings with those words appearing.
             sub["filter_blacklist"] = fresh.get("filter_blacklist")
 
-            async with sem:
-                _url = sub["url"]
-                src = detect_source(_url)
-                source_name = src.name if src else ""
+            # Resolve URL+source FIRST so we know which per-source sem
+            # to wait on. Detect on the fresh URL — a renamed/edited
+            # sub might have moved between sources.
+            _url = sub["url"]
+            src = detect_source(_url)
+            source_name = src.name if src else ""
+
+            async with sem_for(source_name):
                 # Compliance kill-switch: skip the cycle entirely if
                 # this source is in DISABLED_SOURCES. last_checked_at
                 # is updated so the «Last check» moves and the sub
@@ -429,13 +474,13 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
     # cycles we drop matches before they reach the dedup table at all.
     raw_bl = sub.get("filter_blacklist")
     blacklist = _parse_blacklist(raw_bl)
-    # Visibility line — surfaces both the parsed-word count and the raw
-    # repr so we can tell apart "no blacklist on this sub" from "raw is
-    # non-empty but didn't parse" (asyncpg codec mismatch etc.).
-    logger.info(
-        "Sub #%d: blacklist parsed=%d raw_type=%s raw_head=%r",
+    # Diagnostic — was INFO during the blacklist-stale-snapshot
+    # debugging session, now DEBUG to keep production logs sane. The
+    # actual "dropped K items" line below stays INFO so operators
+    # still see when stop-words actually fire.
+    logger.debug(
+        "Sub #%d: blacklist parsed=%d raw_type=%s",
         sub["id"], len(blacklist), type(raw_bl).__name__,
-        (str(raw_bl)[:80] if raw_bl else ""),
     )
     if blacklist and not is_first_scan:
         before = len(items)
@@ -461,13 +506,18 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
         logger.info("Sub #%d first scan: marked %d items as seen", sub["id"], total)
         return
 
-    # Find new items (not yet in sent_items)
-    new_items: list[SearchItem] = []
-    for item in items:
-        if not item.external_id:
-            continue
-        if not await db.is_item_sent(sub["id"], item.external_id, source=item.source):
-            new_items.append(item)
+    # Find new items via a single batch query — was N round-trips per
+    # cycle (50 items × ~30ms = 1.5s extra latency that ate into the
+    # 60-s SLA budget). Now one query covers the whole batch via the
+    # existing (subscription_id, source, avito_id) composite index.
+    candidates = [
+        (item.source, item.external_id) for item in items if item.external_id
+    ]
+    unsent_set = set(await db.filter_unsent_items(sub["id"], candidates))
+    new_items: list[SearchItem] = [
+        item for item in items
+        if item.external_id and (item.source, item.external_id) in unsent_set
+    ]
 
     if not new_items:
         return

@@ -15,7 +15,7 @@ from .common import (
     MAX_JSON_BYTES,
     download_image_bytes,
     get_cloudscraper,
-    global_request_lock,
+    host_request_lock,
     host_in_allowlist,
     invalidate_session,
     looks_like_image_url,
@@ -44,7 +44,7 @@ class AvitoSource:
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
     ) -> list[SearchItem] | None:
-        async with global_request_lock():
+        async with host_request_lock(_HOST):
             try:
                 return await _fetch_inner(url, proxy, max_retries)
             finally:
