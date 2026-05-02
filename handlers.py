@@ -193,6 +193,14 @@ async def _present(
 
     Falls back to a fresh send if the edit fails (old message, photo
     caption, "message is not modified", etc.)
+
+    Wraps the outermost send in try/except that surfaces failures into
+    the Railway log via `logger.exception`. Without this, a broken
+    Telegram-API endpoint / forbidden / parse-mode error from the
+    underlying `target.answer` is invisible: aiogram's dispatcher
+    still prints `Update id=… is handled. Duration N ms` even when
+    the handler raised — making "handler ran, user sees nothing"
+    bugs un-debuggable. See ROUND 14 incident.
     """
     if isinstance(target, CallbackQuery):
         try:
@@ -202,15 +210,26 @@ async def _present(
             )
             return
         except TelegramBadRequest:
-            await target.message.answer(
-                text, parse_mode="HTML", reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
+            try:
+                await target.message.answer(
+                    text, parse_mode="HTML", reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                logger.exception(
+                    "[_present] cb-fallback answer failed (text head=%r)",
+                    text[:80],
+                )
             return
-    await target.answer(
-        text, parse_mode="HTML", reply_markup=keyboard,
-        disable_web_page_preview=True,
-    )
+    try:
+        await target.answer(
+            text, parse_mode="HTML", reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception(
+            "[_present] answer failed (text head=%r)", text[:80],
+        )
 
 
 def _user_from(target) -> tuple[int, str | None]:
@@ -511,10 +530,18 @@ async def _show_reconsent(target):
 
 
 async def _reconsent_passes(target, prefs: dict) -> bool:
-    """Return True when the user is good (new user, OR consent matches
-    current version). Return False AND show the re-consent screen for
-    existing onboarded users on a stale policy version. Caller should
-    bail without rendering its own UI."""
+    """Return True when the user is good (admin, OR new user, OR
+    consent matches current version). Return False AND show the
+    re-consent screen for existing onboarded users on a stale policy
+    version. Caller should bail without rendering its own UI."""
+    tg_id = getattr(getattr(target, "from_user", None), "id", None)
+    if tg_id and is_admin(tg_id):
+        # Admins bypass re-consent: they're internal operators, not
+        # end-users whose consent the operator needs to record. Without
+        # this bypass the admin gets stuck on the re-consent screen on
+        # every /start during version bumps and can't smoke-test the
+        # rest of the flow.
+        return True
     if not prefs.get("onboarded"):
         # New user — onboarding will stamp the current version when
         # they finish (set_user_onboarded with policy_version=…).
@@ -528,6 +555,10 @@ async def _reconsent_passes(target, prefs: dict) -> bool:
     stored = (prefs.get("consent_policy_version") or "").strip()
     if stored == current:
         return True
+    logger.info(
+        "[reconsent] showing screen to tg_id=%s (stored=%r current=%r)",
+        tg_id, stored, current,
+    )
     await _show_reconsent(target)
     return False
 
