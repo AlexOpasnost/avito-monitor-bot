@@ -1,4 +1,4 @@
-FROM python:3.13-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # Install dependencies as root (apt access required), then drop down
 # to a dedicated non-root user before running the bot. The previous
