@@ -63,12 +63,23 @@ def _client_ip(request: web.Request) -> str | None:
 
 def _is_yookassa_ip(ip_str: str | None) -> bool:
     """Match `ip_str` against the configured YooKassa CIDR allowlist.
-    Empty allowlist = bypass (we still verify each event by re-fetching
-    the payment from YooKassa with our secret, so the IP gate is
-    defense-in-depth, not the only line of defense)."""
+
+    Fails CLOSED on an empty allowlist: an operator who clears
+    YOOKASSA_ALLOWED_IPS by accident (typo, sed mistake, blank value
+    pushed by mistake) gets every webhook 403'd until they fix it,
+    which is loud and obvious. The previous behaviour was fail-OPEN —
+    empty list returned True and silently disabled the entire IP
+    gate. The GET-back verification with our shop secret is still in
+    place as the second line of defence, but the IP gate must remain
+    a hard gate: if it isn't actually filtering, we'd want to know.
+    """
     allow = config.yookassa_allowed_ips or []
     if not allow:
-        return True
+        logger.error(
+            "[yookassa-wh] YOOKASSA_ALLOWED_IPS is empty — failing closed. "
+            "Set the env var to YooKassa's published IP list."
+        )
+        return False
     if not ip_str:
         return False
     try:

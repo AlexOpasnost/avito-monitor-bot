@@ -116,6 +116,22 @@ async def on_user_tombstoned(event: ErrorEvent):
 
 _GENERIC_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
+
+def _word_hash(word: str) -> str:
+    """8-hex-char content hash of a stop-word, for callback_data keying.
+
+    Index-based callback keys (`bl_del:&lt;sub_id&gt;:&lt;idx&gt;`) race with rapid
+    double-tap: tap 1 pops idx=2, the list shifts, tap 2 (still the
+    OLD idx=3) now hits a different word. Content hashing decouples
+    button identity from list position.
+
+    md5 truncated to 8 chars: 32 bits of space, low collision risk
+    inside a sub's stop-list (capped at 50 words). Not a security
+    primitive — just a stable identifier for callback routing.
+    """
+    import hashlib
+    return hashlib.md5(word.encode("utf-8")).hexdigest()[:8]
+
 # Max length of a user-set subscription label. Telegram caption /
 # inline-button width get unhappy with anything much longer.
 _MAX_NAME_LEN = 30
@@ -261,15 +277,22 @@ async def _warn_if_url_during_fsm(
     """Detect a URL pasted while waiting for FSM input and bail.
 
     A user who's mid-flow (e.g. on the «введи email для чека» step) and
-    pastes a marketplace URL almost certainly meant to add a new search,
-    not to set the URL as their email or sub name. Without this guard we
+    pastes ANY URL almost certainly meant to add a new search, not to
+    set the URL as their email or sub name. Without this guard we
     silently store «https://avito.ru/...» as the user's email and the
     next YooKassa create-payment fails with "invalid email".
+
+    Catches BOTH supported-marketplace URLs (the obvious case) AND
+    generic http(s) URLs — a user who pastes `https://evil.tld/...` on
+    the email step would otherwise have it stored verbatim and rendered
+    as a clickable label later.
 
     Returns True if a warning was sent — the caller should return
     immediately and leave the FSM state untouched so /cancel still works.
     """
-    if _extract_marketplace_url(message) is None:
+    text = (message.text or message.caption or "").strip()
+    if (_extract_marketplace_url(message) is None
+            and not _GENERIC_URL_RE.search(text)):
         return False
     await message.answer(
         f"Сейчас я жду {expected}, а ты прислал ссылку. Если хочешь "
@@ -2005,11 +2028,14 @@ async def _show_blacklist_screen(target, sub_id: int):
     ]]
     # One ❌ button per line so the action ("Удалить стоп-слово ‹word›")
     # is unambiguous. Telegram inline buttons clip at ~30 chars, so we
-    # truncate the word but keep the verb.
-    for i, w in enumerate(words):
+    # truncate the word but keep the verb. Callback key is a content
+    # hash of the word, NOT the list index — index-based keys race with
+    # rapid double-tap (Telegram retries callbacks on weak connectivity)
+    # and end up deleting the wrong word after a list-shift.
+    for w in words:
         rows.append([InlineKeyboardButton(
             text=f"❌ Удалить стоп-слово «{w[:14]}»",
-            callback_data=f"bl_del:{sub_id}:{i}",
+            callback_data=f"bl_del:{sub_id}:{_word_hash(w)}",
         )])
     if words:
         rows.append([InlineKeyboardButton(
@@ -2069,13 +2095,16 @@ async def callback_blacklist_add(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("bl_del:"))
 async def callback_blacklist_del(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    try:
-        sub_id = int(parts[1])
-        idx = int(parts[2])
-    except (ValueError, IndexError):
+    parts = callback.data.split(":", 2)
+    if len(parts) < 3:
         await callback.answer("Неверный ID")
         return
+    try:
+        sub_id = int(parts[1])
+    except ValueError:
+        await callback.answer("Неверный ID")
+        return
+    target_hash = parts[2]
     user_id = await db.get_or_create_user(
         callback.from_user.id, callback.from_user.username,
     )
@@ -2083,12 +2112,19 @@ async def callback_blacklist_del(callback: CallbackQuery):
     if words is None:
         await callback.answer("Поиск не найден", show_alert=True)
         return
-    if 0 <= idx < len(words):
-        removed = words.pop(idx)
-        await db.set_subscription_blacklist(sub_id, user_id, words)
-        await callback.answer(f"Снято: {removed[:30]}")
-    else:
+    # Content-hash lookup — immune to list shifts under rapid taps.
+    # If two taps for different words land within ms, each removes its
+    # own word; if two taps for the SAME word land, the second sees
+    # "already snipped" and the user gets a clear toast instead of
+    # silently deleting a different word.
+    new_words = [w for w in words if _word_hash(w) != target_hash]
+    if len(new_words) == len(words):
         await callback.answer("Слово уже снято")
+    else:
+        removed_words = [w for w in words if _word_hash(w) == target_hash]
+        await db.set_subscription_blacklist(sub_id, user_id, new_words)
+        removed_label = removed_words[0][:30] if removed_words else "слово"
+        await callback.answer(f"Снято: {removed_label}")
     await _show_blacklist_screen(callback, sub_id)
 
 

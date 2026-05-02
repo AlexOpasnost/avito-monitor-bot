@@ -1,10 +1,17 @@
 """Per-subscription async scheduler."""
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 import orjson
+
+# Private RNG instance for startup-jitter. Uses its own state so a test
+# fixture or third-party lib calling random.seed() can't collapse our
+# thundering-herd defence to a deterministic value at runtime.
+_jitter_rng = random.Random()
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -91,19 +98,20 @@ async def _notify_user_sub_deactivated(bot: Bot, sub: dict) -> None:
             parse_mode="HTML",
         )
     except TelegramForbiddenError:
-        # User blocked the bot — pause everything for them so we
-        # stop hammering an unreachable chat (per-call overhead is
-        # small but the per-cycle log noise is real).
-        try:
-            from database import db as _db
-            user_id_int = sub.get("user_id")
-            if user_id_int:
-                await _db.deactivate_user_tariff(user_id_int)
-        except Exception:
-            logger.exception(
-                "[scheduler] cleanup-on-block failed for user_id=%r",
-                sub.get("user_id"),
-            )
+        # User blocked the bot. Don't deactivate the tariff here —
+        # the send-loop's own TelegramForbidden handler does that
+        # cleanly when an actual delivery is attempted, and that's
+        # the right blast radius. Killing the tariff from inside a
+        # parse-fail-notification path would mean "10 parse errors
+        # in a row + bot blocked → all your paid subs gone forever",
+        # which would have refunded a paying customer prematurely.
+        # The next send-loop attempt will catch the same exception
+        # and pause subs the right way.
+        logger.info(
+            "[scheduler] notify-deactivated DM blocked for tg=%s; "
+            "send-loop will handle pause on next active sub",
+            tg_id,
+        )
     except Exception as e:
         logger.warning(
             "[scheduler] notify-deactivated DM failed for tg=%s: %s",
@@ -323,13 +331,17 @@ async def _sub_loop(
     # Startup jitter — uniform 0..30s. Without this, every sub
     # re-synchronises at the same wall-clock minute after a restart
     # and they all queue on the lock together. Distributes the load
-    # over the first cycle.
-    import random as _random
+    # over the first cycle. Use a private Random instance so a
+    # downstream `random.seed()` (e.g. in a test fixture) cannot
+    # collapse jitter to a deterministic value at runtime.
     try:
         await asyncio.wait_for(
             stop_event.wait(),
-            timeout=_random.uniform(0, 30),
+            timeout=_jitter_rng.uniform(0, 30),
         )
+        # stop_event fired during jitter — clean shutdown, exit
+        # without doing a cycle.
+        logger.info("Sub #%d: stop during jitter — exiting", sub["id"])
         return
     except asyncio.TimeoutError:
         pass
@@ -412,6 +424,19 @@ async def _sub_loop(
                         "Sub #%d: increment_error raised — letting next cycle retry",
                         sub["id"],
                     )
+                    # If this happens 3+ cycles in a row the sub is in
+                    # zombie state (parsing forever, never tripping the
+                    # deactivation threshold because the counter can't
+                    # be persisted). Surface to Sentry so the operator
+                    # gets paged, not just a buried log line.
+                    try:
+                        import sentry_sdk
+                        sentry_sdk.capture_message(
+                            f"increment_error persistent failure sub_id={sub['id']}",
+                            level="error",
+                        )
+                    except Exception:
+                        pass
                     deactivated = False
                 if deactivated:
                     await _notify_user_sub_deactivated(bot, sub)
@@ -429,6 +454,21 @@ async def _sub_loop(
                         continue  # 10 min passed — start fresh cycle
             else:
                 consecutive_failures = 0
+                # Re-check the sub still exists. fetch_search_items can
+                # take 30+ seconds (proxy warmup, slow upstreams); during
+                # that window the user may have run /delete_my_account
+                # or hit ❌ on this specific sub. Without this check,
+                # _process_items / mark_item_sent below would write to a
+                # deleted (cascade-deleted) row and raise a FK violation
+                # that bubbles up as a parse-fail, burning the error
+                # budget for a sub that no longer exists.
+                fresh2 = await db.get_subscription(sub["id"])
+                if fresh2 is None:
+                    logger.info(
+                        "Sub #%d deleted during fetch — skipping send",
+                        sub["id"],
+                    )
+                    return
                 await _process_items(sub, items, bot)
                 await db.update_last_checked(sub["id"])
                 sub["last_checked_at"] = datetime.now(timezone.utc)
@@ -595,14 +635,33 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
                         sub.get("user_id"),
                     )
             except TelegramRetryAfter as e:
-                # Rate-limited. Sleep the requested duration; the
-                # next item will likely also hit the limit, but
-                # we'll have spent the time productively.
+                # Rate-limited. Sleep the duration Telegram asked for
+                # (capped at 120s to avoid an indefinite stall) and
+                # then retry THE SAME item once. The previous code
+                # capped at 30s and silently dropped the item, which
+                # produced an infinite 429-loop the next cycle: a 60s
+                # retry-after got slept 30s, the retry tripped the
+                # same limiter, and the item was never delivered.
                 wait = float(getattr(e, "retry_after", 1.0))
                 logger.warning(
-                    "[scheduler] Telegram rate-limit, sleeping %.1fs", wait,
+                    "[scheduler] Telegram rate-limit, sleeping %.1fs (cap 120s)",
+                    wait,
                 )
-                await asyncio.sleep(min(wait, 30.0))
+                await asyncio.sleep(min(wait, 120.0))
+                try:
+                    await _send_notification(bot, sub, item, prefs)
+                    sent_keys.add((item.source, item.external_id))
+                    await db.mark_item_sent(
+                        sub["id"], item.external_id, source=item.source,
+                    )
+                except Exception as e2:
+                    # Second failure — log and move on. Item stays in
+                    # leftover_by_source below so the next cycle won't
+                    # re-spam it; user just doesn't get THIS one.
+                    logger.warning(
+                        "[scheduler] retry-after item still failed: %s",
+                        str(e2)[:120],
+                    )
             except Exception as e:
                 logger.warning(
                     "Send failed for %s/%s: %s",
@@ -812,6 +871,63 @@ _SOURCE_IMAGE_REFERER = {
     "grailed":      "https://www.grailed.com/",
 }
 
+# Per-source allowlist of acceptable item-URL hosts. The URL stamped on
+# `SearchItem.url` flows straight into InlineKeyboardButton(url=…),
+# which is a separate Telegram trust boundary from HTML parse_mode —
+# it accepts `tg://resolve?...` deep-links and any http(s) host. A
+# compromised upstream API field (Avito `urlPath` concat'd onto base,
+# Vinted/Kufar/OLX `entry.url` returned verbatim) could otherwise hand
+# users a phishing button with the bot's own visual trust.
+_ITEM_URL_HOST_ALLOW: dict[str, frozenset[str]] = {
+    "avito":        frozenset({"avito.ru", "www.avito.ru", "m.avito.ru"}),
+    "kufar":        frozenset({"kufar.by", "www.kufar.by"}),
+    "olx":          frozenset(),  # OLX runs on 30+ TLDs — handled by suffix below
+    "vinted":       frozenset(),  # vinted.* — handled by suffix below
+    "mercari":      frozenset({"jp.mercari.com", "mercari.com", "www.mercari.com"}),
+    "youla":        frozenset({"youla.ru", "www.youla.ru", "m.youla.ru"}),
+    "fruitsfamily": frozenset({"fruitsfamily.com", "www.fruitsfamily.com",
+                               "m.fruitsfamily.com"}),
+    "grailed":      frozenset({"grailed.com", "www.grailed.com", "m.grailed.com"}),
+}
+_ITEM_URL_HOST_SUFFIX: dict[str, tuple[str, ...]] = {
+    "olx":     (".olx.pl", ".olx.ua", ".olx.bg", ".olx.ro", ".olx.ba",
+                ".olx.kz", ".olx.uz", ".olx.com.br", ".olx.com"),
+    "vinted":  (".vinted.com", ".vinted.de", ".vinted.fr", ".vinted.it",
+                ".vinted.es", ".vinted.nl", ".vinted.pl", ".vinted.cz",
+                ".vinted.lt", ".vinted.lu", ".vinted.at", ".vinted.be",
+                ".vinted.pt", ".vinted.sk", ".vinted.co.uk", ".vinted.fi",
+                ".vinted.se", ".vinted.dk", ".vinted.hu", ".vinted.ie"),
+}
+
+
+def _is_safe_item_url(source: str | None, url: str | None) -> bool:
+    """True iff `url` is http(s) and its host belongs to `source`.
+
+    Defends the inline-button trust boundary: Telegram does NOT apply
+    HTML escaping to InlineKeyboardButton.url, and accepts arbitrary
+    schemes including `tg://`. A bad URL coming from a compromised
+    upstream field (or a future scraper bug) can phish the user from
+    inside the bot's own message. Drop those silently — better no
+    button than a malicious one.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    src = (source or "").lower()
+    allow = _ITEM_URL_HOST_ALLOW.get(src, frozenset())
+    if host in allow:
+        return True
+    suffixes = _ITEM_URL_HOST_SUFFIX.get(src, ())
+    return any(host.endswith(s) for s in suffixes)
+
 
 async def _send_notification(
     bot: Bot, sub: dict, item: SearchItem, prefs: dict,
@@ -830,9 +946,20 @@ async def _send_notification(
         user_tz=tz, user_lang=lang,
     )
     button_text = _source_button_text(item.source)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=button_text, url=item.url)],
-    ])
+    if _is_safe_item_url(item.source, item.url):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=button_text, url=item.url)],
+        ])
+    else:
+        # URL didn't pass the per-source allowlist — drop the button
+        # entirely rather than hand the user a clickable phishing link.
+        # The price/title/image still renders; user can copy the search
+        # URL from /list to navigate manually.
+        logger.warning(
+            "[notify] dropping button: source=%s url=%r failed allowlist",
+            item.source, (item.url or "")[:120],
+        )
+        keyboard = None
 
     if item.image_url:
         caption = text if len(text) <= 1024 else text[:1020] + "…"

@@ -65,13 +65,61 @@ def _init_sentry() -> None:
             "skipping Sentry init. Add sentry-sdk to requirements.txt."
         )
         return
+
+    # PII scrubbing for outbound events. Sentry's HTTP integrations
+    # capture request/response breadcrumbs at the transport layer,
+    # BEFORE our application-level _sanitize_error_body runs. Without
+    # the scrubber below, every YooKassa POST whose body contains
+    # `metadata.telegram_id` or `receipt.customer.email`, every
+    # outbound Telegram API call carrying chat IDs and message text,
+    # and every httpx Authorization header (Basic shop_id:secret_key)
+    # lands in Sentry events verbatim. This is a 152-ФЗ §6 violation
+    # waiting to happen.
+    def _scrub_event(event, hint):
+        # Drop request bodies entirely — we never need them for
+        # debugging, and they almost always contain PII (Telegram
+        # message text, YooKassa metadata, customer email).
+        request = event.get("request") or {}
+        if "data" in request:
+            request["data"] = "[scrubbed]"
+        if "headers" in request:
+            headers = request["headers"] or {}
+            for k in list(headers):
+                if k.lower() in ("authorization", "x-yookassa-signature",
+                                 "cookie", "set-cookie"):
+                    headers[k] = "[scrubbed]"
+            request["headers"] = headers
+        # Same scrub on breadcrumbs — httpx integration emits one
+        # breadcrumb per request and pre-fills `data` with the body
+        # for non-2xx responses.
+        for crumb in event.get("breadcrumbs", {}).get("values", []) or []:
+            if crumb.get("category") in ("httplib", "httpx", "aiohttp"):
+                data = crumb.get("data") or {}
+                for k in ("body", "request_body", "response_body",
+                          "Authorization"):
+                    if k in data:
+                        data[k] = "[scrubbed]"
+                crumb["data"] = data
+        return event
+
     sentry_sdk.init(
         dsn=config.sentry_dsn,
         environment=config.sentry_environment,
         traces_sample_rate=0.0,
         integrations=[AsyncioIntegration(), AioHttpIntegration()],
-        # Drop non-actionable noise.
-        ignore_errors=["asyncio.CancelledError"],
+        # Default in 2.x is False, but be explicit — flipping the
+        # default by accident in a future SDK upgrade would silently
+        # start exfiltrating PII.
+        send_default_pii=False,
+        before_send=_scrub_event,
+        before_breadcrumb=lambda crumb, hint: crumb,
+        # Tag the deploy so rollbacks can correlate to error spikes.
+        # Railway injects RAILWAY_GIT_COMMIT_SHA; falls back to "dev"
+        # locally, which is fine — Sentry shows it in the UI.
+        release=os.getenv("RAILWAY_GIT_COMMIT_SHA", "dev"),
+        # Drop non-actionable noise. Use the class itself, not the
+        # string name — string matching missed concurrent.futures.
+        ignore_errors=[asyncio.CancelledError],
     )
     logger.info("[sentry] enabled (env=%s)", config.sentry_environment)
 
