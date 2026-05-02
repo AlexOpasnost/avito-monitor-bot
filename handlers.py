@@ -360,6 +360,178 @@ async def _show_hero(target):
     )
 
 
+# ---------------------------------------------------------------------------
+# Channel-subscribe gate
+# ---------------------------------------------------------------------------
+# Gate shown on /start when REQUIRED_CHANNEL env var is set. The bot
+# must be an admin in the channel for getChatMember to succeed for
+# every user — otherwise Telegram replies "member list is inaccessible"
+# and we fail open (let the user through with a logged warning) so a
+# misconfigured channel doesn't lock the entire userbase out of the bot.
+
+_GATE_TEXT = (
+    "📢 <b>Подпишись на канал</b>\n\n"
+    "Для пользования ботом подпишись на наш канал: {handle}\n"
+    "👉 Все новости про проект будут там."
+)
+
+
+def _channel_public_url(handle: str) -> str | None:
+    """`@autosearch` → `https://t.me/autosearch`. Numeric `-100…` ids
+    have no public URL — return None and the gate will only render the
+    «Я подписался» button."""
+    h = (handle or "").strip()
+    if not h:
+        return None
+    if h.startswith("@"):
+        slug = h[1:]
+        return f"https://t.me/{slug}" if slug else None
+    if h.startswith(("https://t.me/", "http://t.me/")):
+        return h
+    if h.startswith("t.me/"):
+        return f"https://{h}"
+    return None
+
+
+async def _is_subscribed_to_required_channel(bot, telegram_id: int) -> bool:
+    """True if user joined config.required_channel, OR the gate is
+    disabled, OR Telegram couldn't tell us (fail-open).
+
+    Status semantics: "creator" | "administrator" | "member" pass;
+    "left" | "kicked" | "restricted" fail. Any TelegramBadRequest /
+    TelegramForbiddenError (channel not found, bot not admin, member
+    list inaccessible) fails open with a warning — locking everyone
+    out because of a misconfigured channel is worse than letting a
+    handful of users skip the gate."""
+    channel = (config.required_channel or "").strip()
+    if not channel:
+        return True
+    if is_admin(telegram_id):
+        return True
+    try:
+        member = await bot.get_chat_member(channel, telegram_id)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.warning(
+            "[channel-gate] get_chat_member failed for %s in %s: %s",
+            telegram_id, channel, e,
+        )
+        return True
+    status = getattr(member, "status", None)
+    return status in ("creator", "administrator", "member")
+
+
+async def _show_channel_gate(target):
+    handle = (config.required_channel or "").strip()
+    text = _GATE_TEXT.format(handle=_html.escape(handle))
+    rows = []
+    url = _channel_public_url(handle)
+    if url:
+        rows.append([InlineKeyboardButton(text="📢 Открыть канал", url=url)])
+    rows.append([InlineKeyboardButton(
+        text="✅ Я подписался", callback_data="gate:check",
+    )])
+    await _present(
+        target, text,
+        keyboard=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _channel_gate_passes(target) -> bool:
+    """Return True if the user passed the gate (or the gate is off /
+    failed open). Return False AND show the gate screen otherwise —
+    caller should bail without rendering its own UI."""
+    bot = getattr(target, "bot", None)
+    if bot is None:
+        # No bot reference — typically only happens in unit tests with
+        # synthetic targets. Don't gate.
+        return True
+    if await _is_subscribed_to_required_channel(bot, target.from_user.id):
+        return True
+    await _show_channel_gate(target)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Re-consent on policy version bump
+# ---------------------------------------------------------------------------
+# When PRIVACY/OFFER are changed substantively (new processing purpose,
+# new third party, materially different commercial terms), 152-ФЗ Art. 9
+# ч.4 requires a fresh affirmative consent from EXISTING users. New users
+# coming through onboarding stamp themselves with the current version
+# automatically (set_user_onboarded). Existing users need this screen.
+#
+# Trigger: prefs.onboarded == True AND prefs.consent_policy_version
+# differs from config.consent_policy_version. NULL counts as different
+# (legacy users registered before consent-capture was wired up).
+
+_RECONSENT_TEXT = (
+    "⚠️ <b>Условия использования обновлены</b>\n\n"
+    "С твоего последнего захода мы обновили публичную оферту и политику "
+    "обработки персональных данных до версии <b>v3 (02.05.2026)</b>.\n\n"
+    "<b>Что изменилось:</b>\n\n"
+    "1. <b>Подписка на канал @autosearch</b> — теперь условие доступа "
+    "к боту. Бот проверяет факт подписки через Telegram API при /start.\n\n"
+    "2. <b>Цены тарифов</b> — Базовый 1 290 ₽, Продвинутый 1 990 ₽, "
+    "Профессиональный 2 990 ₽. Уже оплаченные подписки изменения "
+    "не затрагивают.\n\n"
+    "3. <b>Условия возврата переписаны</b> — пропорциональный возврат "
+    "по ст. 32 ЗоЗПП. Теперь возврат можно получить и после первого "
+    "уведомления, пропорционально неиспользованным дням срока тарифа.\n\n"
+    "Для продолжения использования бота необходимо подтвердить согласие "
+    "с новой редакцией. Если не согласен — ты в любой момент можешь "
+    "выгрузить свои данные (/export_my_data) и удалить аккаунт "
+    "(/delete_my_account)."
+)
+
+
+def _reconsent_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    legal = []
+    if config.offer_url:
+        legal.append(InlineKeyboardButton(
+            text="📄 Оферта", url=config.offer_url,
+        ))
+    if config.privacy_url:
+        legal.append(InlineKeyboardButton(
+            text="🔒 Политика", url=config.privacy_url,
+        ))
+    if legal:
+        rows.append(legal)
+    rows.append([InlineKeyboardButton(
+        text="✅ Принимаю новую редакцию", callback_data="reconsent:accept",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="❌ Не принимаю", callback_data="reconsent:decline",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_reconsent(target):
+    await _present(target, _RECONSENT_TEXT, keyboard=_reconsent_keyboard())
+
+
+async def _reconsent_passes(target, prefs: dict) -> bool:
+    """Return True when the user is good (new user, OR consent matches
+    current version). Return False AND show the re-consent screen for
+    existing onboarded users on a stale policy version. Caller should
+    bail without rendering its own UI."""
+    if not prefs.get("onboarded"):
+        # New user — onboarding will stamp the current version when
+        # they finish (set_user_onboarded with policy_version=…).
+        return True
+    current = (config.consent_policy_version or "").strip()
+    if not current:
+        # Operator hasn't set a version — don't force re-consent on
+        # an unconfigured policy_version. Belt-and-suspenders for
+        # local dev where the env var might be empty.
+        return True
+    stored = (prefs.get("consent_policy_version") or "").strip()
+    if stored == current:
+        return True
+    await _show_reconsent(target)
+    return False
+
+
 async def _show_lang_picker(target, *, back: str | None):
     """Show the language picker. `back` is the callback to return to
     when the user clicks «⬅️ Назад» — None during onboarding (no escape)
@@ -393,6 +565,20 @@ async def cmd_start(message: Message):
     user_id = await db.get_or_create_user(
         message.from_user.id, message.from_user.username,
     )
+    prefs = await db.get_user_prefs(user_id)
+
+    # Re-consent gate: existing users on an older policy version must
+    # explicitly accept the current one before continuing. New users
+    # (onboarded=False) skip this — the onboarding wizard stamps them
+    # with the current version on completion. Runs BEFORE both
+    # reactivate_all and the channel gate: a user who hasn't accepted
+    # the new ToS shouldn't have their searches reactivated (would
+    # keep delivering notifications without a fresh consent) and
+    # shouldn't be funnelled into the channel-subscribe condition
+    # (which is itself one of the new ToS items).
+    if not await _reconsent_passes(message, prefs):
+        return
+
     # Reactivate paused subs ONLY if the user still has the tariff to
     # back them. Admins also bypass — they always have access.
     # Previously /start blanket-reactivated subs even after a refund,
@@ -402,11 +588,89 @@ async def cmd_start(message: Message):
     if is_admin(message.from_user.id) or await db.has_active_tariff(message.from_user.id):
         await db.reactivate_all(user_id)
 
-    prefs = await db.get_user_prefs(user_id)
+    # Channel-subscribe gate (REQUIRED_CHANNEL env var). No-op when
+    # disabled or when the bot can't introspect the channel.
+    if not await _channel_gate_passes(message):
+        return
+
     if prefs.get("onboarded"):
         await _show_main_menu(message, prefs)
     else:
         await _show_hero(message)
+
+
+@router.callback_query(F.data == "reconsent:accept")
+async def callback_reconsent_accept(callback: CallbackQuery):
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    await db.record_reconsent(user_id, config.consent_policy_version)
+    await callback.answer("✅ Спасибо! Согласие записано.")
+    # Continue forward into the channel gate (or hero/menu if disabled
+    # or already passed) using the same flow as /start.
+    if not await _channel_gate_passes(callback):
+        return
+    prefs = await db.get_user_prefs(user_id)
+    if prefs.get("onboarded"):
+        await _show_main_menu(callback, prefs)
+    else:
+        await _show_hero(callback)
+
+
+@router.callback_query(F.data == "reconsent:decline")
+async def callback_reconsent_decline(callback: CallbackQuery):
+    text = (
+        "🚫 <b>Согласие не получено</b>\n\n"
+        "Без согласия с новой редакцией оферты и политики обработки "
+        "персональных данных продолжение работы с ботом невозможно. "
+        "Твои данные пока остаются на месте — ты можешь:\n\n"
+        "• <b>/export_my_data</b> — выгрузить копию своих данных в JSON\n"
+        "• <b>/delete_my_account</b> — удалить аккаунт и все данные "
+        "(152-ФЗ ст. 14)\n"
+        "• <b>/start</b> — пересмотреть условия и принять, если передумаешь"
+    )
+    if config.support_handle:
+        text += f"\n\n💬 Вопросы по новым условиям: {config.support_handle}"
+    # No «Главное меню» button — that would let them bypass re-consent.
+    # Only path forward is to re-read the terms (and accept) or
+    # /delete_my_account.
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🔄 Пересмотреть условия", callback_data="reconsent:show",
+        ),
+    ]])
+    await _present(callback, text, keyboard=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "reconsent:show")
+async def callback_reconsent_show(callback: CallbackQuery):
+    """Re-display the re-consent screen (entry from the decline-confirmation
+    screen, in case the user changes their mind without doing /start)."""
+    await _show_reconsent(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "gate:check")
+async def callback_gate_check(callback: CallbackQuery):
+    if not await _is_subscribed_to_required_channel(
+        callback.bot, callback.from_user.id,
+    ):
+        await callback.answer(
+            "Подписка не найдена — открой канал, нажми «Подписаться» "
+            "и вернись сюда.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("✅ Спасибо! Доступ открыт.")
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    prefs = await db.get_user_prefs(user_id)
+    if prefs.get("onboarded"):
+        await _show_main_menu(callback, prefs)
+    else:
+        await _show_hero(callback)
 
 
 @router.callback_query(F.data == "onboard:lang")
@@ -548,9 +812,9 @@ async def callback_set_timezone(callback: CallbackQuery):
 # the machine-readable price/duration/sub-limit triplet.
 _TARIFFS = [
     ("trial",    "🎁 Пробный",          "Бесплатно",     "1 ссылка-поиск, 6 часов",     "(только один раз)"),
-    ("basic",    "💎 Базовый",          "890 ₽/мес",     "1 ссылка-поиск, 30 дней",     None),
-    ("advanced", "⚡ Продвинутый",       "1 790 ₽/мес",   "3 ссылки-поиска, 30 дней",    None),
-    ("pro",      "👑 Профессиональный", "2 590 ₽/мес",   "5 ссылок-поисков, 30 дней",   None),
+    ("basic",    "💎 Базовый",          "1 290 ₽/мес",   "1 ссылка-поиск, 30 дней",     None),
+    ("advanced", "⚡ Продвинутый",       "1 990 ₽/мес",   "3 ссылки-поиска, 30 дней",    None),
+    ("pro",      "👑 Профессиональный", "2 990 ₽/мес",   "5 ссылок-поисков, 30 дней",   None),
 ]
 
 # tariff_id → (max_subs, hours, price_kopeks). `legacy` is the
@@ -559,9 +823,9 @@ _TARIFFS = [
 # subs — user has to activate Trial or buy a tier.
 _TARIFF_RULES: dict[str, dict] = {
     "trial":    {"max_subs": 1,   "hours": 6,        "kopeks": 0},
-    "basic":    {"max_subs": 1,   "hours": 30 * 24,  "kopeks": 89000},
-    "advanced": {"max_subs": 3,   "hours": 30 * 24,  "kopeks": 179000},
-    "pro":      {"max_subs": 5,   "hours": 30 * 24,  "kopeks": 259000},
+    "basic":    {"max_subs": 1,   "hours": 30 * 24,  "kopeks": 129000},
+    "advanced": {"max_subs": 3,   "hours": 30 * 24,  "kopeks": 199000},
+    "pro":      {"max_subs": 5,   "hours": 30 * 24,  "kopeks": 299000},
     # No expiry, max 5 — preserves behaviour for users who joined
     # before the paywall was introduced.
     "legacy":   {"max_subs": 5,   "hours": 0,        "kopeks": 0},
@@ -1677,9 +1941,9 @@ async def cmd_testbuy(message: Message):
             "Использование: <code>/testbuy &lt;tariff_id&gt;</code>\n\n"
             "<b>Доступные:</b>\n"
             "• <code>/testbuy trial</code> — 0 ₽ (один раз на юзера)\n"
-            "• <code>/testbuy basic</code> — 890 ₽\n"
-            "• <code>/testbuy advanced</code> — 1 790 ₽\n"
-            "• <code>/testbuy pro</code> — 2 590 ₽\n\n"
+            "• <code>/testbuy basic</code> — 1 290 ₽\n"
+            "• <code>/testbuy advanced</code> — 1 990 ₽\n"
+            "• <code>/testbuy pro</code> — 2 990 ₽\n\n"
             "<i>Реальная оплата (или возврат через YooKassa-дашборд "
             "после теста). Админ-статус не меняется — у тебя останется "
             "безлимит независимо от платежа.</i>",

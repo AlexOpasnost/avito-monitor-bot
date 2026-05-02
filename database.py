@@ -555,16 +555,20 @@ class Database:
         return await self._execute(_op)
 
     async def get_user_prefs(self, user_id: int) -> dict:
-        """Return {lang, currency, onboarded, tz}. `tz` is the user's
-        explicit pick or None — callers resolve None to a language-
-        derived default. Defaults applied for old rows where columns
-        are NULL after migration."""
+        """Return {lang, currency, onboarded, tz, consent_policy_version}.
+        `tz` is the user's explicit pick or None — callers resolve None
+        to a language-derived default. `consent_policy_version` is the
+        last policy version the user agreed to (NULL for legacy users
+        registered before consent capture, or for not-yet-onboarded
+        users). Defaults applied for old rows where columns are NULL
+        after migration."""
         async def _op(conn):
             row = await conn.fetchrow(
                 "SELECT COALESCE(lang, 'ru') AS lang, "
                 "       COALESCE(currency, 'rub') AS currency, "
                 "       COALESCE(onboarded, FALSE) AS onboarded, "
-                "       timezone AS tz "
+                "       timezone AS tz, "
+                "       consent_policy_version "
                 "FROM users WHERE id = $1",
                 user_id,
             )
@@ -572,14 +576,41 @@ class Database:
                 return {
                     "lang": "ru", "currency": "rub",
                     "onboarded": False, "tz": None,
+                    "consent_policy_version": None,
                 }
             return {
                 "lang": row["lang"],
                 "currency": row["currency"],
                 "onboarded": row["onboarded"],
                 "tz": row["tz"],
+                "consent_policy_version": row["consent_policy_version"],
             }
         return await self._execute(_op)
+
+    async def record_reconsent(
+        self, user_id: int, policy_version: str,
+    ) -> None:
+        """Record that an *existing* user explicitly accepted a new
+        version of the public offer + privacy policy. Unconditionally
+        overwrites both `consent_at` and `consent_policy_version` —
+        unlike `set_user_onboarded`, which COALESCEs them to preserve
+        the original first-onboarding stamp.
+
+        152-ФЗ Art. 9 ч.4: when the operator changes purposes of
+        processing (here: channel-membership check + new tariffs +
+        proportional refund), they need a fresh affirmative consent
+        from existing users. Stamping a new timestamp + version is the
+        audit trail РКН would ask for.
+        """
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET "
+                "  consent_at = NOW(), "
+                "  consent_policy_version = $2 "
+                "WHERE id = $1",
+                user_id, policy_version,
+            )
+        await self._execute(_op)
 
     async def has_active_tariff(self, telegram_id: int) -> bool:
         """True when the user owns either:

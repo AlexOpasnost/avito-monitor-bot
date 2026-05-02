@@ -86,7 +86,11 @@ class Config:
     # user finishes onboarding. Bump on substantive PRIVACY/OFFER
     # changes — gives the operator an audit trail of which version
     # each user agreed to.
-    consent_policy_version: str = "v2-2026-04-28"
+    #
+    # v3-2026-05-02 — added channel-subscribe gate (PRIVACY §2/§3/§4.2
+    # mention getChatMember and channel-membership processing) + new
+    # tariff prices in OFFER §3 (1290/1990/2990 ₽).
+    consent_policy_version: str = "v3-2026-05-02"
     # Self-employed (НПД) annual income limit in rubles. The admin
     # dashboard alerts at 90% and new sales are soft-blocked at 100%
     # so the operator never accidentally crosses the cap (which would
@@ -100,6 +104,13 @@ class Config:
     # (production / staging / dev). Defaults to "production" because
     # that's where bugs that matter actually fire.
     sentry_environment: str = "production"
+    # Channel-subscribe gate shown on /start. Either a public username
+    # ("@autosearch") or a numeric chat id ("-100…"). Empty = gate
+    # disabled. The bot MUST be an administrator in the channel —
+    # otherwise getChatMember fails and the gate fails open (lets the
+    # user through with a logged warning, so a misconfigured admin
+    # doesn't lock the entire userbase out).
+    required_channel: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -177,13 +188,14 @@ class Config:
                 or "https://alexopasnost.github.io/avito-monitor-bot/OFFER"
             ),
             consent_policy_version=os.getenv(
-                "CONSENT_POLICY_VERSION", "v2-2026-04-28",
+                "CONSENT_POLICY_VERSION", "v3-2026-05-02",
             ).strip(),
             npd_annual_limit_rub=int(
                 os.getenv("NPD_ANNUAL_LIMIT_RUB", "2400000")
             ),
             sentry_dsn=os.getenv("SENTRY_DSN", "").strip(),
             sentry_environment=os.getenv("SENTRY_ENVIRONMENT", "production").strip(),
+            required_channel=os.getenv("REQUIRED_CHANNEL", "").strip(),
         )
 
 

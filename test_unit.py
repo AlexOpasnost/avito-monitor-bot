@@ -1695,9 +1695,9 @@ def test_yookassa_receipt_item_shape():
     """
     from services.yookassa import build_receipt_item
 
-    item = build_receipt_item("Базовый", 890.0)
+    item = build_receipt_item("Базовый", 1290.0)
     assert item["description"] == "Базовый"
-    assert item["amount"]["value"] == "890.00"
+    assert item["amount"]["value"] == "1290.00"
     assert item["amount"]["currency"] == "RUB"
     assert item["quantity"] == "1.00"
     # vat_code=1 = «Без НДС» — required for НПД (самозанятый)
@@ -1710,8 +1710,8 @@ def test_yookassa_receipt_item_shape():
     assert len(long_item["description"]) == 128
 
     # Decimal handling — kopeks-precise prices render correctly
-    item2 = build_receipt_item("Pro", 2590.50)
-    assert item2["amount"]["value"] == "2590.50"
+    item2 = build_receipt_item("Pro", 2990.50)
+    assert item2["amount"]["value"] == "2990.50"
     print("OK: yookassa build_receipt_item shape + RUB units")
 
 

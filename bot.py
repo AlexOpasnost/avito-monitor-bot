@@ -198,15 +198,21 @@ async def main():
     # Start button. Telegram caps this at 512 chars; what's set in
     # BotFather is overwritten the next time we boot.
     bot_description = (
-        "🔍 AutoSearch — лучший инструмент для пользователей торговых "
+        "🔎 AutoSearch — лучший инструмент для пользователей торговых "
         "площадок. Моментально присылает все новые объявления.\n\n"
-        "🎁 Бесплатный пробный период\n"
-        "📋 До 5 одновременных ссылок-поисков\n"
+        "🎁 Бесплатный пробный период\n\n"
+        "📋 До 5 одновременных ссылок-поисков\n\n"
         "🛒 Огромный выбор площадок\n"
-        "(Avito, Юла, Kufar, Olx, Vinted, Mercari, Grailed, Fruitsfamily)\n"
+        "- Avito\n"
+        "- Vinted\n"
+        "- Kufar\n"
+        "- OLX\n"
+        "- Юла\n"
+        "- Mercari\n"
+        "- Grailed\n"
+        "- Fruitsfamily\n\n"
         "💵 Лучшая цена на рынке. Одна находка позволяет полностью "
-        "окупить подписку в несколько раз.\n\n"
-        "💬 Поддержка: @Autosearch_support\n\n"
+        "окупить подписку в несколько раз\n\n"
         "👇 Нажми «Старт» чтобы начать 👇"
     )
     short_description = (
