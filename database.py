@@ -825,29 +825,33 @@ class Database:
                 )
                 return row["tariff_expires_at"] if row else None
 
+            # One atomic UPDATE that handles renewal + upgrade + first
+            # activation in a single statement, with no SELECT-then-
+            # UPDATE race. GREATEST(NOW(), COALESCE(tariff_expires_at,
+            # NOW())) is the same idiom used in record_and_activate_payment
+            # — concurrent extends stack instead of clobbering each other.
+            #
+            # Was a real bug pre-R11: the previous SELECT-then-UPDATE had
+            # no row lock, so two concurrent activations for the same
+            # user (admin /testbuy + a real webhook landing within ms;
+            # double /grant from the admin panel; admin click + auto-
+            # renewal funnel both firing) both read the same `current_exp`,
+            # both computed `current_exp + hours`, second UPDATE
+            # overwrote the first → user lost a paid month silently.
             row = await conn.fetchrow(
-                "SELECT tariff, tariff_expires_at FROM users WHERE id = $1",
-                user_id,
+                "UPDATE users SET tariff = $2, "
+                "  tariff_expires_at = "
+                "    GREATEST(NOW(), COALESCE(tariff_expires_at, NOW())) "
+                "    + ($3::int || ' hours')::interval "
+                "WHERE id = $1 "
+                "RETURNING tariff_expires_at",
+                user_id, tariff_id, hours,
             )
-            current_id = row["tariff"] if row else None
-            current_exp = row["tariff_expires_at"] if row else None
-
-            # Both renewal AND upgrade should preserve remaining time.
-            # The only case where we reset to `now` is when there's no
-            # current expiry or it's already in the past.
-            if current_exp and current_exp > now:
-                base = current_exp
-            else:
-                base = now
-            new_exp = base + timedelta(hours=hours)
-
-            await conn.execute(
-                "UPDATE users SET tariff = $2, tariff_expires_at = $3 "
-                "WHERE id = $1",
-                user_id, tariff_id, new_exp,
-            )
-            return new_exp
-        return await self._execute(_op)
+            return row["tariff_expires_at"] if row else None
+        # idempotent=False: this is on the money path (admin /grant,
+        # /testbuy, _tariff_renewal_funnel). A retry on a network blip
+        # after a successful commit would double-extend.
+        return await self._execute(_op, idempotent=False)
 
     async def record_refund(
         self, *, refund_id: str, payment_id: str,
@@ -917,6 +921,26 @@ class Database:
 
         async def _op(conn):
             async with conn.transaction():
+                # Lock the user row at the top of the transaction.
+                # Without this, a concurrent payment webhook (legitimate:
+                # user paid + refunded within milliseconds, or two
+                # webhooks racing) and a refund webhook for the same
+                # user can interleave their reads/writes — payment tx
+                # holds row lock and runs INSERT+UPDATE; refund tx (no
+                # lock) reads the not-yet-committed payment, INSERTs
+                # refund, runs UPDATE tariff=NULL — whichever commits
+                # last wins. User ends up paid OR refunded depending on
+                # commit order. The FOR UPDATE serialises the two paths.
+                user_present = await conn.fetchval(
+                    "SELECT 1 FROM users WHERE id = $1 FOR UPDATE",
+                    user_id,
+                )
+                if user_present is None:
+                    # User row vanished (race with /delete_my_account
+                    # mid-refund). Nothing to deactivate; nothing was
+                    # recorded. Caller acks 200 since the erasure path
+                    # is the one that owns the books from this point.
+                    return False
                 row = await conn.fetchrow(
                     "INSERT INTO refunds "
                     "(refund_id, payment_id, user_id, amount_minor, currency) "
@@ -1349,7 +1373,18 @@ class Database:
                     user_id, tariff_id, hours,
                 )
                 return True, (row["tariff_expires_at"] if row else None)
-        return await self._execute(_op)
+        # idempotent=False: the money path. Yes, the inner transaction is
+        # safe to re-run on a real network blip (ON CONFLICT DO NOTHING +
+        # GREATEST() handle the duplicate-INSERT case correctly), but the
+        # outer _execute retry envelope can fire AFTER a successful commit
+        # whose ack got lost — and at that point we no longer hold any DB
+        # state that distinguishes "first run, retry needed" from "first
+        # run committed, retry would double-extend". The webhook caller
+        # is the right place to retry: YooKassa will redeliver on its own
+        # cadence, and our INSERT's ON CONFLICT guarantees idempotency
+        # across redeliveries. So we hand the failure straight to the
+        # webhook, return 500, and let YooKassa retry — never silently.
+        return await self._execute(_op, idempotent=False)
 
     async def get_user_subscriptions(self, user_id: int):
         async def _op(conn):
