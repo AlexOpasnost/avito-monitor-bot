@@ -27,13 +27,17 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 from .base import SearchItem
-from .common import host_in_allowlist
+from .common import host_in_allowlist, host_request_lock
 
 logger = logging.getLogger(__name__)
 
+_HOST = "mercari"
+
 # Hostname allowlist (see common.host_in_allowlist for SSRF rationale).
+# We accept jp-only hosts; the .com prefix-mercari is a different US
+# marketplace whose categories don't map onto our keyword search and
+# would silently produce wrong results.
 _MERCARI_HOSTS = frozenset({
-    "mercari.com", "www.mercari.com",
     "mercari.jp", "www.mercari.jp", "jp.mercari.com",
 })
 
@@ -72,14 +76,18 @@ class MercariSource:
         # don't share cloudscraper, don't rotate IPs — if DataDome
         # blocks Railway's outbound IP, errors will surface here and
         # the scheduler will pause the sub after 3 consecutive fails.
-        try:
-            return await asyncio.wait_for(_fetch_inner(url), timeout=30)
-        except asyncio.TimeoutError:
-            logger.warning("[mercari] overall timeout for %s", url[:100])
-            return None
-        except Exception:
-            logger.exception("[mercari] unexpected error")
-            return None
+        # host_request_lock serialises concurrent same-source fetches
+        # so DataDome's per-IP rate limit isn't tripped by a thundering
+        # herd of N parallel subs all hitting the same minute mark.
+        async with host_request_lock(_HOST):
+            try:
+                return await asyncio.wait_for(_fetch_inner(url), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("[mercari] overall timeout for %s", url[:100])
+                return None
+            except Exception:
+                logger.exception("[mercari] unexpected error")
+                return None
 
 
 async def _fetch_inner(url: str) -> list[SearchItem] | None:

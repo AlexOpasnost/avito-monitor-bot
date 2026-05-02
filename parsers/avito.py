@@ -255,10 +255,21 @@ def _parse_item(val: dict) -> SearchItem:
         price_str = f"{price_value:,} ₽".replace(",", " ")
 
     url_path = val.get("urlPath") or val.get("url") or ""
-    if url_path and not url_path.startswith("http"):
+    if url_path.startswith("/") and not url_path.startswith("//"):
+        # Relative path — the common, expected case.
         item_url = f"https://www.avito.ru{url_path}"
+    elif url_path.startswith("http"):
+        # API returned an absolute URL. Make sure it points back at
+        # Avito — a hostile/compromised upstream `urlPath` of
+        # https://evil.com/x or //evil.com/x would otherwise be passed
+        # to the user as a clickable button.
+        if not host_in_allowlist(url_path, _AVITO_HOSTS):
+            logger.warning("[avito] dropping item with off-site url=%r", url_path[:120])
+            return None
+        item_url = url_path
     else:
-        item_url = url_path or "https://www.avito.ru"
+        # Empty or `//evil.com/...` (protocol-relative) — refuse.
+        return None
 
     image_url = _extract_image_url(val)
     location = _extract_location(val)

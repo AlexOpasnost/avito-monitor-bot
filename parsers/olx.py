@@ -495,9 +495,16 @@ def _parse_api_response(data: dict, user_url: str) -> list[SearchItem] | None:
 def _parse_api_item(entry: dict) -> SearchItem:
     ext_id = str(entry.get("id") or "")
     title = (entry.get("title") or "").strip()
-    item_url = (entry.get("url") or "").strip()
-    if not item_url:
-        # Fall back to a canonical-ish URL if api omitted it
+    raw_url = (entry.get("url") or "").strip()
+    # Validate API-supplied url against the OLX TLD pattern (the API
+    # has been observed to return cross-region urls; a compromised
+    # listing entry would otherwise reach the user as a button).
+    if raw_url and host_matches_pattern(raw_url, _OLX_HOST_RE):
+        item_url = raw_url
+    else:
+        # Fall back to a canonical-ish URL — the bot won't know which
+        # TLD the listing belongs to, but olx.pl resolves to a redirect
+        # that lands on the right region for live listings.
         item_url = f"https://www.olx.pl/d/oferta/-ID{ext_id}.html"
 
     # Strip HTML from description, decode entities, trim whitespace.

@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from .base import SearchItem
-from .common import MAX_JSON_BYTES, host_in_allowlist
+from .common import MAX_JSON_BYTES, host_in_allowlist, host_request_lock
 
 logger = logging.getLogger(__name__)
 
@@ -90,20 +90,22 @@ class FruitsfamilySource:
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
     ) -> list[SearchItem] | None:
-        # No global lock, no warmup — Fruitsfamily's GraphQL endpoint is
-        # an open POST that consistently answers in <1s. Costing per
-        # request is similar to OLX's REST API.
-        for attempt in range(max_retries):
-            try:
-                items = await _fetch_inner(url, proxy)
-                if items is not None:
-                    return items
-            except Exception as e:
-                logger.warning(
-                    "[fruitsfamily] attempt %d/%d failed: %s",
-                    attempt + 1, max_retries, str(e)[:120],
-                )
-            await asyncio.sleep(2 + attempt * 2)
+        # Per-host lock so N concurrent subs on Fruitsfamily don't
+        # turn into N parallel POSTs at the same minute mark.
+        # GraphQL endpoint answers in <1s normally, but the hosting
+        # provider has been observed rate-limiting bursts.
+        async with host_request_lock(_HOST):
+            for attempt in range(max_retries):
+                try:
+                    items = await _fetch_inner(url, proxy)
+                    if items is not None:
+                        return items
+                except Exception as e:
+                    logger.warning(
+                        "[fruitsfamily] attempt %d/%d failed: %s",
+                        attempt + 1, max_retries, str(e)[:120],
+                    )
+                await asyncio.sleep(2 + attempt * 2)
         return None
 
 

@@ -205,7 +205,15 @@ def _parse_item(val: dict) -> SearchItem:
     title = val.get("subject") or ""
 
     price_str, price_value = _extract_price(val)
-    item_url = val.get("ad_link") or f"https://www.kufar.by/item/{ext_id}"
+    # Validate API-supplied ad_link before trusting it: a
+    # compromised/misconfigured upstream could ship a phishing URL
+    # that ends up as the user's "Open ad" button. Fall back to the
+    # canonical /item/<id> path when ad_link is missing or off-site.
+    raw_link = (val.get("ad_link") or "").strip()
+    if raw_link and host_in_allowlist(raw_link, _KUFAR_HOSTS):
+        item_url = raw_link
+    else:
+        item_url = f"https://www.kufar.by/item/{ext_id}"
 
     image_url = _extract_image_url(val)
     location = _extract_location(val)

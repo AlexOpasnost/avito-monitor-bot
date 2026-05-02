@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from .base import SearchItem
-from .common import MAX_JSON_BYTES, host_in_allowlist
+from .common import MAX_JSON_BYTES, host_in_allowlist, host_request_lock
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +83,22 @@ class GrailedSource:
     async def fetch(
         self, url: str, proxy: str | None, max_retries: int = 3,
     ) -> list[SearchItem] | None:
-        for attempt in range(max_retries):
-            try:
-                items = await asyncio.get_running_loop().run_in_executor(
-                    None, _fetch_sync, url, proxy,
-                )
-                if items is not None:
-                    return items
-            except Exception as e:
-                logger.warning(
-                    "[grailed] attempt %d/%d failed: %s",
-                    attempt + 1, max_retries, str(e)[:120],
-                )
-            await asyncio.sleep(2 + attempt * 2)
+        # Serialise concurrent same-source fetches so Algolia / CF
+        # rate-limit isn't tripped by N parallel subs at the same tick.
+        async with host_request_lock(_HOST):
+            for attempt in range(max_retries):
+                try:
+                    items = await asyncio.get_running_loop().run_in_executor(
+                        None, _fetch_sync, url, proxy,
+                    )
+                    if items is not None:
+                        return items
+                except Exception as e:
+                    logger.warning(
+                        "[grailed] attempt %d/%d failed: %s",
+                        attempt + 1, max_retries, str(e)[:120],
+                    )
+                await asyncio.sleep(2 + attempt * 2)
         return None
 
 

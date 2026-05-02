@@ -646,11 +646,18 @@ def _parse_item(entry: dict) -> SearchItem:
     if status and status.lower() in base_title.lower():
         status = None
 
-    item_url = (entry.get("url") or "").strip()
-    if not item_url:
+    raw_url = (entry.get("url") or "").strip()
+    if raw_url and host_matches_pattern(raw_url, _VINTED_HOST_RE):
+        item_url = raw_url
+    else:
+        # Fall back to building from `path` against the canonical host.
+        # Off-site `url` values are dropped silently — better no link
+        # than an off-site phishing button.
         path = (entry.get("path") or "").strip()
-        if path:
+        if path.startswith("/") and not path.startswith("//"):
             item_url = "https://www.vinted.com" + path
+        else:
+            item_url = ""
 
     price_str, price_value, price_currency = _parse_price(entry.get("price"))
 
