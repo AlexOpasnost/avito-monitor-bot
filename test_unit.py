@@ -120,11 +120,15 @@ def test_dispatcher_matches_vinted():
 
 
 def test_dispatcher_matches_mercari():
+    # JP-only host: the mercapi pipeline searches JP categories. US
+    # Mercari (mercari.com) is intentionally NOT matched — accepting
+    # it silently produced wrong / empty results because keywords
+    # don't map across the two storefronts.
     s = detect_source("https://jp.mercari.com/search?keyword=iphone")
     assert s is not None and s.name == "mercari"
     s = detect_source("https://www.mercari.com/search?q=camera")
-    assert s is not None and s.name == "mercari"
-    print("OK: dispatcher matches mercari")
+    assert s is None
+    print("OK: dispatcher matches mercari (JP only)")
 
 
 def test_dispatcher_matches_olx():
@@ -843,10 +847,13 @@ def test_vinted_parse_response_filters_promoted():
 def test_mercari_source_matches():
     src = MercariSource()
     assert src.matches("https://jp.mercari.com/search?keyword=iphone")
-    assert src.matches("https://www.mercari.com/")
+    assert src.matches("https://www.mercari.jp/")
+    # US Mercari (mercari.com) is intentionally rejected — see
+    # test_dispatcher_matches_mercari for rationale.
+    assert not src.matches("https://www.mercari.com/")
     assert not src.matches("https://www.avito.ru/x")
     assert not src.matches("")
-    print("OK: MercariSource.matches")
+    print("OK: MercariSource.matches (JP only)")
 
 
 def test_mercari_extract_keyword():
