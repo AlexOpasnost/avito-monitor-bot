@@ -77,15 +77,31 @@ class Config:
     # to those sources are also rejected.
     disabled_sources: list[str] = field(default_factory=list)
     # Public URLs for the legal documents shown in /start and /help.
-    # Empty = the link is hidden (still legal until you publish them
-    # somewhere, but a recommended pre-launch step).
-    privacy_url: str = ""
-    offer_url: str = ""
+    # Defaults point at the canonical GitHub Pages publication so the
+    # legal footer ALWAYS renders (was previously hidden when env vars
+    # were empty — meaning the bot collected PII without a visible
+    # consent text, a 152-ФЗ Art. 9 issue we fixed in May 2026).
+    # Override via env if the operator publishes elsewhere.
+    privacy_url: str = "https://alexopasnost.github.io/avito-monitor-bot/PRIVACY"
+    offer_url: str = "https://alexopasnost.github.io/avito-monitor-bot/OFFER"
+    # Stamp recorded against `users.consent_policy_version` when a
+    # user finishes onboarding. Bump on substantive PRIVACY/OFFER
+    # changes — gives the operator an audit trail of which version
+    # each user agreed to.
+    consent_policy_version: str = "v2-2026-04-28"
     # Self-employed (НПД) annual income limit in rubles. The admin
     # dashboard alerts at 90% and new sales are soft-blocked at 100%
     # so the operator never accidentally crosses the cap (which would
     # force a switch to ИП and back-tax penalties).
     npd_annual_limit_rub: int = 2_400_000
+    # Sentry DSN for crash + error reporting. Empty string = Sentry
+    # disabled (we ship a `sentry_sdk.init` only when this is set so
+    # the dependency stays optional and dev installs don't need it).
+    sentry_dsn: str = ""
+    # Optional environment label propagated to Sentry events
+    # (production / staging / dev). Defaults to "production" because
+    # that's where bugs that matter actually fire.
+    sentry_environment: str = "production"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -153,11 +169,25 @@ class Config:
                 for s in os.getenv("DISABLED_SOURCES", "").split(",")
                 if s.strip()
             ],
-            privacy_url=os.getenv("PRIVACY_URL", "").strip(),
-            offer_url=os.getenv("OFFER_URL", "").strip(),
+            # Empty env values fall through to the dataclass defaults
+            # so the legal footer always renders even when the operator
+            # forgot to copy these into Railway.
+            privacy_url=(
+                os.getenv("PRIVACY_URL", "").strip()
+                or "https://alexopasnost.github.io/avito-monitor-bot/PRIVACY"
+            ),
+            offer_url=(
+                os.getenv("OFFER_URL", "").strip()
+                or "https://alexopasnost.github.io/avito-monitor-bot/OFFER"
+            ),
+            consent_policy_version=os.getenv(
+                "CONSENT_POLICY_VERSION", "v2-2026-04-28",
+            ).strip(),
             npd_annual_limit_rub=int(
                 os.getenv("NPD_ANNUAL_LIMIT_RUB", "2400000")
             ),
+            sentry_dsn=os.getenv("SENTRY_DSN", "").strip(),
+            sentry_environment=os.getenv("SENTRY_ENVIRONMENT", "production").strip(),
         )
 
 

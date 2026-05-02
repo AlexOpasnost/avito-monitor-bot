@@ -40,6 +40,45 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _init_sentry() -> None:
+    """Wire Sentry crash + error reporting if SENTRY_DSN is set.
+
+    Free tier (5k events/mo) is enough for low-volume bots. Without
+    this, exceptions land in Railway logs only — when a customer
+    reports a problem, the operator has to grep by timestamp. With
+    Sentry, the operator gets a Telegram/email alert seconds after
+    the failure with the full traceback and request context.
+
+    `traces_sample_rate=0` keeps performance traces off (errors only,
+    which is the highest-value low-cost signal). The kwargs avoid
+    asyncio CancelledError + aiogram retry-after noise.
+    """
+    if not config.sentry_dsn:
+        return
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.asyncio import AsyncioIntegration
+        from sentry_sdk.integrations.aiohttp import AioHttpIntegration
+    except ImportError:
+        logger.warning(
+            "[sentry] SENTRY_DSN set but sentry-sdk not installed — "
+            "skipping Sentry init. Add sentry-sdk to requirements.txt."
+        )
+        return
+    sentry_sdk.init(
+        dsn=config.sentry_dsn,
+        environment=config.sentry_environment,
+        traces_sample_rate=0.0,
+        integrations=[AsyncioIntegration(), AioHttpIntegration()],
+        # Drop non-actionable noise.
+        ignore_errors=["asyncio.CancelledError"],
+    )
+    logger.info("[sentry] enabled (env=%s)", config.sentry_environment)
+
+
+_init_sentry()
+
+
 async def main():
     if not config.bot_token:
         logger.error("BOT_TOKEN not set in .env")

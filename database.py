@@ -232,6 +232,55 @@ class Database:
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used "
                 "BOOLEAN DEFAULT FALSE"
             )
+            # Tombstones for users who exercised /delete_my_account
+            # (152-ФЗ Art. 14 erasure). When a late YooKassa webhook
+            # arrives for a deleted user, we must NOT recreate the
+            # users row — that would resurrect their PII against the
+            # explicit erasure request and silently re-activate a
+            # tariff for someone we promised to forget. The webhook
+            # checks this table before calling get_or_create_user.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tombstoned_users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    deleted_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            # Compliance audit trail (152-ФЗ Art. 18.1) — track every
+            # subject-access / erasure request so РКН can be answered
+            # under inspection. Append-only; retained ≥1 year.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS data_subject_requests (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT NOT NULL,
+                    request_type TEXT NOT NULL,
+                    requested_at TIMESTAMPTZ DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    outcome JSONB
+                )
+            """)
+            # Admin-action audit (152-ФЗ Art. 18.1 §1.5) — every
+            # /admin user view that surfaces customer PII (email,
+            # payments) is logged with which admin saw what.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS admin_access_log (
+                    id SERIAL PRIMARY KEY,
+                    admin_telegram_id BIGINT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_telegram_id BIGINT,
+                    accessed_at TIMESTAMPTZ DEFAULT NOW(),
+                    details JSONB
+                )
+            """)
+            # Consent capture: timestamp + policy version per user.
+            # Empty for legacy rows; backfilled when user re-onboards.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "consent_at TIMESTAMPTZ"
+            )
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "consent_policy_version TEXT"
+            )
             # `_migrations` MUST exist before the first _apply_once
             # call — _apply_once reads/writes this table to track
             # one-shot migrations. Previously placed below the first
@@ -312,19 +361,36 @@ class Database:
             raise
 
     async def _apply_once(self, conn, name: str, op):
-        """Run a one-shot migration exactly once, tracked in _migrations."""
-        already = await conn.fetchval(
-            "SELECT 1 FROM _migrations WHERE name = $1", name,
-        )
-        if already:
-            return
-        logger.info("Applying one-shot migration: %s", name)
-        await op(conn)
-        await conn.execute(
-            "INSERT INTO _migrations (name) VALUES ($1) ON CONFLICT DO NOTHING",
-            name,
-        )
-        logger.info("One-shot migration %s done", name)
+        """Run a one-shot migration exactly once, tracked in _migrations.
+
+        Race protection: two bots starting simultaneously (Railway
+        redeploy + lingering old container) both pass the `SELECT 1`
+        check, both run the destructive op, both INSERT — the
+        migration runs TWICE, the second time against post-cleanup
+        state. For destructive ops (cleanup_2026_04_19) this can
+        wipe live re-added user data. Fix: take a Postgres advisory
+        lock keyed off the migration name; recheck under the lock.
+        Anyone serializes on this lock; only the first one through
+        runs the op."""
+        # `hashtext` is a Postgres-internal stable hash → fits in int8
+        # which pg_advisory_xact_lock expects.
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))", f"migration:{name}",
+            )
+            already = await conn.fetchval(
+                "SELECT 1 FROM _migrations WHERE name = $1", name,
+            )
+            if already:
+                return
+            logger.info("Applying one-shot migration: %s", name)
+            await op(conn)
+            await conn.execute(
+                "INSERT INTO _migrations (name) VALUES ($1) "
+                "ON CONFLICT DO NOTHING",
+                name,
+            )
+            logger.info("One-shot migration %s done", name)
 
     async def _grandfather_legacy_users(self, conn):
         """One-shot: anyone with a historic subscription gets
@@ -343,7 +409,28 @@ class Database:
 
         Reason: URLs saved by older bot versions are truncated (invisible
         unicode / VARCHAR column / old regex). Users will re-add their
-        subscriptions and the new code saves the full URL."""
+        subscriptions and the new code saves the full URL.
+
+        Sunset guard: after the cutoff date this op refuses to run
+        regardless of `_migrations` state. If an operator accidentally
+        deletes the `_migrations` row while debugging, this prevents
+        a second run from wiping live data months later. The op is
+        already idempotent in `_apply_once` — this is belt-and-suspenders
+        for the worst-case "operator forgot it was destructive"
+        scenario."""
+        from datetime import datetime, timezone
+        # Cutoff: ~2 weeks past the original migration date. Anyone
+        # restoring state past this point should review the code, not
+        # blindly let it re-run.
+        sunset = datetime(2026, 5, 5, tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > sunset:
+            logger.warning(
+                "cleanup_2026_04_19: refusing to run past sunset %s — "
+                "delete this method or extend the date if you really "
+                "need to wipe live data",
+                sunset.isoformat(),
+            )
+            return
         sent_deleted = await conn.fetchval(
             "WITH d AS (DELETE FROM sent_items RETURNING 1) SELECT COUNT(*) FROM d"
         )
@@ -485,11 +572,33 @@ class Database:
             )
         await self._execute(_op)
 
-    async def set_user_onboarded(self, user_id: int, value: bool = True):
+    async def set_user_onboarded(
+        self, user_id: int, value: bool = True,
+        policy_version: str | None = None,
+    ):
+        """Mark onboarding complete. When `value=True` and a
+        `policy_version` is supplied, also stamp consent_at = NOW() and
+        consent_policy_version = <version>. This is the 152-ФЗ Art. 9
+        consent timestamp the operator can show to РКН during an audit.
+
+        For back-compat callers that don't pass policy_version, only
+        `onboarded` flips — consent fields remain whatever they were
+        (NULL for users who pre-date this change)."""
         async def _op(conn):
-            await conn.execute(
-                "UPDATE users SET onboarded = $2 WHERE id = $1", user_id, value,
-            )
+            if value and policy_version:
+                await conn.execute(
+                    "UPDATE users SET onboarded = $2, "
+                    "  consent_at = COALESCE(consent_at, NOW()), "
+                    "  consent_policy_version = "
+                    "    COALESCE(consent_policy_version, $3) "
+                    "WHERE id = $1",
+                    user_id, value, policy_version,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET onboarded = $2 WHERE id = $1",
+                    user_id, value,
+                )
         await self._execute(_op)
 
     # --- Subscriptions ---
@@ -729,6 +838,15 @@ class Database:
         """
         async def _op(conn):
             async with conn.transaction():
+                # Capture telegram_id BEFORE the DELETE so we can
+                # tombstone it. Without the tombstone, a late YooKassa
+                # webhook for a charge made before deletion would
+                # reincarnate the user via get_or_create_user (152-ФЗ
+                # Art. 14 erasure breach).
+                tg_id = await conn.fetchval(
+                    "SELECT telegram_id FROM users WHERE id = $1",
+                    user_id,
+                )
                 payments_count = await conn.fetchval(
                     "SELECT COUNT(*) FROM payments WHERE user_id = $1",
                     user_id,
@@ -751,12 +869,64 @@ class Database:
                 # ON DELETE CASCADE on subscriptions and sent_items wipes
                 # them when the user row is removed.
                 await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+                if tg_id is not None:
+                    await conn.execute(
+                        "INSERT INTO tombstoned_users (telegram_id) "
+                        "VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING",
+                        tg_id,
+                    )
                 return {
                     "payments_anonymized": int(payments_count),
                     "subscriptions_deleted": int(subs_count),
                     "sent_items_deleted": int(sent_count),
+                    "telegram_id_tombstoned": tg_id,
                 }
         return await self._execute(_op, idempotent=False)
+
+    async def is_telegram_id_tombstoned(self, telegram_id: int) -> bool:
+        """True iff this telegram_id has previously requested erasure.
+        Late webhooks / incoming messages for tombstoned ids must NOT
+        recreate the user row (152-ФЗ Art. 14)."""
+        async def _op(conn):
+            row = await conn.fetchval(
+                "SELECT 1 FROM tombstoned_users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            return row is not None
+        return await self._execute(_op)
+
+    async def log_subject_request(
+        self, telegram_id: int, request_type: str,
+        outcome: dict | None = None,
+    ) -> None:
+        """Append-only audit row for 152-ФЗ Art. 18.1 access-request
+        register. Called from /export_my_data and /delete_my_account."""
+        payload = orjson.dumps(outcome or {}).decode("utf-8")
+        async def _op(conn):
+            await conn.execute(
+                "INSERT INTO data_subject_requests "
+                "(telegram_id, request_type, completed_at, outcome) "
+                "VALUES ($1, $2, NOW(), $3::jsonb)",
+                telegram_id, request_type, payload,
+            )
+        await self._execute(_op, idempotent=False)
+
+    async def log_admin_access(
+        self, admin_telegram_id: int, action: str,
+        target_telegram_id: int | None = None,
+        details: dict | None = None,
+    ) -> None:
+        """Append-only audit row for admin actions that surface
+        customer PII. Called from /admin user, /admin users, /admin."""
+        payload = orjson.dumps(details or {}).decode("utf-8")
+        async def _op(conn):
+            await conn.execute(
+                "INSERT INTO admin_access_log "
+                "(admin_telegram_id, action, target_telegram_id, details) "
+                "VALUES ($1, $2, $3, $4::jsonb)",
+                admin_telegram_id, action, target_telegram_id, payload,
+            )
+        await self._execute(_op, idempotent=False)
 
     async def deactivate_user_tariff(self, user_id: int) -> None:
         """Force the user's tariff back to free state. Used by the
@@ -869,6 +1039,12 @@ class Database:
                           in a *previous* call, so we MUST NOT extend
                           again. new_expiry is None — the caller should
                           treat this as "ack and move on".
+        - was_new=None  → user row missing (raced with /delete_my_account
+                          or never existed). NO payment recorded. The
+                          webhook translates this to HTTP 500 so YooKassa
+                          retries; if the user re-registers in the
+                          meantime, the retry succeeds. Otherwise the
+                          operator must reconcile manually.
 
         Why this exists (was a real bug before this method):
         - The previous flow was `record_payment()` then a separate
@@ -898,6 +1074,24 @@ class Database:
         """
         async def _op(conn):
             async with conn.transaction():
+                # Lock the user row at the top of the transaction. If
+                # the user has been erased between webhook arrival and
+                # this transaction (race with /delete_my_account), the
+                # FOR UPDATE on a missing row returns no result and we
+                # bail BEFORE recording the payment. Without this gate,
+                # the previous code path INSERTed the payment, then
+                # UPDATE matched zero rows, returned (True, None), and
+                # the customer's money sat in the books with no tariff.
+                user_present = await conn.fetchval(
+                    "SELECT 1 FROM users WHERE id = $1 FOR UPDATE",
+                    user_id,
+                )
+                if user_present is None:
+                    # Caller (webhook) translates this to a 500 so
+                    # YooKassa retries. Either the user is recreated
+                    # before then, or the operator manually reconciles.
+                    return None, None
+
                 ins = await conn.fetchrow(
                     "INSERT INTO payments "
                     "(telegram_charge_id, provider_charge_id, user_id, "
@@ -913,9 +1107,9 @@ class Database:
                     return False, None
 
                 # Atomic extend: GREATEST guards against two concurrent
-                # extends collapsing into one (each goes through ON CONFLICT
-                # serialization, but defense-in-depth — and it correctly
-                # handles the case where current expiry is in the past).
+                # extends collapsing into one. The user row lock above
+                # also serialises concurrent activations for the same
+                # user — second tx sees the first's committed expiry.
                 row = await conn.fetchrow(
                     "UPDATE users SET tariff = $2, "
                     "  tariff_expires_at = "

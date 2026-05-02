@@ -182,6 +182,22 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
         )
         return web.Response(status=200, text="ok")
 
+    # 152-ФЗ Art. 14 erasure honoring: if the user invoked
+    # /delete_my_account at any point, never recreate their row.
+    # The late YooKassa webhook still needs to be acknowledged (we
+    # can't refund automatically — that's an operator action), but
+    # we MUST NOT resurrect the deleted user's PII.
+    if await db.is_telegram_id_tombstoned(telegram_id):
+        logger.error(
+            "[yookassa-wh] payment %s for tombstoned telegram_id=%d — "
+            "refusing to recreate user; manual reconciliation required",
+            payment_id, telegram_id,
+        )
+        # Ack 200 so YooKassa stops retrying; revenue is on the books
+        # via the (un-recorded here) charge — operator must refund
+        # manually via YooKassa dashboard.
+        return web.Response(status=200, text="ok")
+
     user_id = await db.get_or_create_user(telegram_id, None)
 
     amount = payment.get("amount") or {}
@@ -219,19 +235,22 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
         # either succeed cleanly or hit the same error for triage.
         return web.Response(status=500, text="retry")
 
+    # Sentinel: user row vanished between get_or_create_user and the
+    # FOR UPDATE inside record_and_activate (race with delete). NO
+    # payment was recorded — the transaction returned None,None before
+    # the INSERT. Ask YooKassa to retry; if the user re-registers in
+    # the meantime, the retry succeeds. If they never come back,
+    # operator must reconcile via YooKassa refund dashboard.
+    if is_new is None:
+        logger.error(
+            "[yookassa-wh] payment %s — user_id=%d vanished mid-tx; "
+            "returning 500 so YooKassa retries",
+            payment_id, user_id,
+        )
+        return web.Response(status=500, text="retry")
+
     if not is_new:
         logger.info("[yookassa-wh] duplicate %s — already activated", payment_id)
-        return web.Response(status=200, text="ok")
-
-    if new_exp is None:
-        # Should never happen — INSERT succeeded but UPDATE returned no
-        # row, which means user_id was deleted between get_or_create_user
-        # and the UPDATE. Log loudly; ack 200 because re-delivery won't
-        # help (the conflicting payment row is already in the table).
-        logger.error(
-            "[yookassa-wh] new payment %s recorded but UPDATE returned no row "
-            "(user=%d gone?)", payment_id, user_id,
-        )
         return web.Response(status=200, text="ok")
 
     bot: Bot = request.app["bot"]

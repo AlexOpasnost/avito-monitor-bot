@@ -12,3 +12,7 @@ beautifulsoup4==4.12.3
 tzdata==2026.2
 deep-translator==1.11.4
 mercapi==0.4.2
+# Sentry: optional but enabled if SENTRY_DSN env var is set. Free
+# tier (5k events/mo) covers a low-volume bot — without this, errors
+# only surface in Railway logs.
+sentry-sdk[aiohttp]==2.18.0

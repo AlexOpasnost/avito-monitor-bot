@@ -356,7 +356,12 @@ async def callback_set_currency(callback: CallbackQuery):
         await _show_profile(callback, prefs=prefs)
     else:
         # End of onboarding — flag and drop into the main menu.
-        await db.set_user_onboarded(user_id, True)
+        # Stamping the policy version here is the 152-ФЗ Art. 9 consent
+        # capture: from this moment we can prove which version of the
+        # public offer + privacy policy the user agreed to.
+        await db.set_user_onboarded(
+            user_id, True, policy_version=config.consent_policy_version,
+        )
         prefs["onboarded"] = True
         await _show_main_menu(callback, prefs)
 
@@ -1219,6 +1224,19 @@ async def cmd_export_my_data(message: Message):
             "/delete_my_account."
         ),
     )
+    # 152-ФЗ Art. 18.1 audit trail — log the access request so РКН
+    # can verify subject-rights handling under inspection. Best-effort:
+    # if the audit write fails, the export itself is already done; we
+    # don't want to undo the legitimate response.
+    try:
+        await db.log_subject_request(
+            telegram_id=message.from_user.id,
+            request_type="export",
+            outcome={"bytes": len(blob), "subs": len(data.get("subscriptions") or []),
+                     "payments": len(data.get("payments") or [])},
+        )
+    except Exception:
+        logger.exception("[gdpr] log_subject_request(export) failed")
 
 
 @router.message(Command("delete_my_account"))
@@ -1255,6 +1273,9 @@ async def cmd_delete_my_account(message: Message):
 
 @router.callback_query(F.data == "gdpr:confirm_delete")
 async def callback_gdpr_confirm_delete(callback: CallbackQuery):
+    # Capture the telegram_id BEFORE delete_user_data wipes the user
+    # row — we need it for the audit-trail INSERT below.
+    erasing_tg_id = callback.from_user.id
     user_id = await db.get_or_create_user(
         callback.from_user.id, callback.from_user.username,
     )
@@ -1271,6 +1292,17 @@ async def callback_gdpr_confirm_delete(callback: CallbackQuery):
         "[gdpr] erasure executed: user_id=%d stats=%s",
         user_id, stats,
     )
+    # 152-ФЗ Art. 18.1 audit row — written AFTER the user's data is
+    # gone (the row references telegram_id, not user_id, so it
+    # survives the cascade).
+    try:
+        await db.log_subject_request(
+            telegram_id=erasing_tg_id,
+            request_type="erasure",
+            outcome={k: v for k, v in stats.items() if v is not None},
+        )
+    except Exception:
+        logger.exception("[gdpr] log_subject_request(erasure) failed")
     await callback.message.edit_text(
         "✅ Аккаунт удалён.\n\n"
         f"Удалено поисков: {stats['subscriptions_deleted']}\n"
@@ -1310,7 +1342,24 @@ async def cmd_admin(message: Message):
         return
 
     raw = (message.text or "").strip().split()
+    admin_tg = message.from_user.id
+
+    # Audit every admin invocation — 152-ФЗ Art. 18.1 internal
+    # access record. Best-effort: audit-log failures must NEVER
+    # block the admin path (that's how operators get locked out
+    # of triage). The action+target are logged before serving so
+    # РКН can reconstruct who saw what when.
+    async def _audit(action: str, target: int | None) -> None:
+        try:
+            await db.log_admin_access(admin_tg, action, target)
+        except Exception:
+            logger.exception(
+                "[admin] audit-log failed admin=%d action=%s target=%r",
+                admin_tg, action, target,
+            )
+
     if len(raw) >= 2 and raw[1] == "users":
+        await _audit("admin:users", None)
         await _admin_users_list(message)
         return
     if len(raw) >= 3 and raw[1] == "user":
@@ -1319,9 +1368,10 @@ async def cmd_admin(message: Message):
         except ValueError:
             await message.answer("Использование: /admin user &lt;telegram_id&gt;")
             return
+        await _audit("admin:user", target_tg)
         await _admin_user_detail(message, target_tg)
         return
-
+    await _audit("admin:dashboard", None)
     await _admin_dashboard(message)
 
 
