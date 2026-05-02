@@ -7,7 +7,7 @@ httpx[http2]==0.27.2
 orjson==3.11.8
 python-dotenv==1.0.1
 cloudscraper==1.2.71
-curl_cffi==0.14.0
+curl_cffi==0.15.0
 beautifulsoup4==4.12.3
 tzdata==2026.2
 deep-translator==1.11.4
