@@ -694,6 +694,30 @@ class Database:
             ) or 0
         return await self._execute(_op)
 
+    async def find_subscription_by_url(
+        self, user_id: int, url: str,
+    ) -> dict | None:
+        """Return existing non-deleted sub with the same URL, or None.
+
+        Used by the add-flow to short-circuit when the user pastes a URL
+        they already have. We compare the URL verbatim — Avito and the
+        other sources canonicalise URLs into "https://...?param=value"
+        before they reach the DB, so a textual match is good enough for
+        the common case of the same link being copy-pasted twice.
+        Returns the row dict (id, is_active) so the caller can give a
+        contextual hint ("уже есть, и активен" vs "есть, но на паузе —
+        включи").
+        """
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "SELECT id, is_active FROM subscriptions "
+                "WHERE user_id = $1 AND url = $2 AND deleted = FALSE "
+                "LIMIT 1",
+                user_id, url,
+            )
+            return dict(row) if row else None
+        return await self._execute(_op)
+
     async def get_user_tariff(self, user_id: int) -> dict:
         """Returns {tariff, expires_at, trial_used}.
 

@@ -58,6 +58,15 @@ from parsers.common import proxy_for_source
 logger = logging.getLogger(__name__)
 router = Router()
 
+# DM-only enforcement. Without this, a user can add the bot to a group
+# chat and run /export_my_data, /list, or paste a URL in front of every
+# group member — the bot has no group features and the privacy
+# implications of leaking subscription/email/JSON dumps into a shared
+# room are real. Centralising the check here covers ALL message handlers
+# (commands, FSM input, free-text URL paste) in one line; the previous
+# inline `if chat.type != "private": return` blocks become redundant.
+router.message.filter(F.chat.type == "private")
+
 _GENERIC_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # Max length of a user-set subscription label. Telegram caption /
@@ -203,6 +212,29 @@ def _extract_avito_url(message_or_text) -> str | None:
     """Back-compat shim — older callers expected just the URL string."""
     result = _extract_marketplace_url(message_or_text)
     return result[1] if result else None
+
+
+async def _warn_if_url_during_fsm(
+    message: Message, expected: str,
+) -> bool:
+    """Detect a URL pasted while waiting for FSM input and bail.
+
+    A user who's mid-flow (e.g. on the «введи email для чека» step) and
+    pastes a marketplace URL almost certainly meant to add a new search,
+    not to set the URL as their email or sub name. Without this guard we
+    silently store «https://avito.ru/...» as the user's email and the
+    next YooKassa create-payment fails with "invalid email".
+
+    Returns True if a warning was sent — the caller should return
+    immediately and leave the FSM state untouched so /cancel still works.
+    """
+    if _extract_marketplace_url(message) is None:
+        return False
+    await message.answer(
+        f"Сейчас я жду {expected}, а ты прислал ссылку. Если хочешь "
+        f"добавить новый поиск — отправь /cancel и пришли ссылку ещё раз.",
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +929,8 @@ async def cmd_cancel_buy(message: Message, state: FSMContext):
 
 @router.message(StateFilter(BuyStates.waiting_for_email), F.text)
 async def handle_email_input(message: Message, state: FSMContext):
+    if await _warn_if_url_during_fsm(message, "email для чека"):
+        return
     raw = (message.text or "").strip()
     if not _EMAIL_RE.match(raw):
         await message.answer(
@@ -953,10 +987,15 @@ async def _show_help(target):
         "сюда — с фото, ценой в твоей валюте, локацией и описанием.\n\n"
         "<b>Команды:</b>\n"
         "/start — главное меню\n"
-        "/list — мои поиски\n"
-        "/profile — профиль и настройки\n"
-        "/stop — приостановить все поиски\n"
-        "/help — эта справка"
+        "/list — мои поиски (▶️/⏸ ставить на паузу, ✏️ переименовать, "
+        "🚫 стоп-слова, ❌ удалить)\n"
+        "/profile — язык, валюта, часовой пояс\n"
+        "/stop — приостановить все поиски одной командой\n"
+        "/cancel — отменить текущий ввод (имя, стоп-слова, email)\n"
+        "/help — эта справка\n\n"
+        "<b>Данные и приватность:</b>\n"
+        "/export_my_data — выгрузка всех твоих данных в JSON\n"
+        "/delete_my_account — удалить аккаунт и все подписки"
     )
     if config.support_handle:
         body += f"\n\n💬 <b>Поддержка:</b> {config.support_handle}"
@@ -1795,6 +1834,8 @@ async def cmd_cancel_rename(message: Message, state: FSMContext):
 
 @router.message(StateFilter(RenameStates.waiting_for_name), F.text)
 async def handle_rename_input(message: Message, state: FSMContext):
+    if await _warn_if_url_during_fsm(message, "название поиска"):
+        return
     raw = (message.text or "").strip()
     if not raw:
         await message.answer(
@@ -2036,6 +2077,8 @@ async def cmd_cancel_blacklist(message: Message, state: FSMContext):
 
 @router.message(StateFilter(BlacklistStates.waiting_for_words), F.text)
 async def handle_blacklist_input(message: Message, state: FSMContext):
+    if await _warn_if_url_during_fsm(message, "стоп-слова"):
+        return
     raw = (message.text or "").strip()
     data = await state.get_data()
     sub_id = data.get("blacklist_sub_id")
@@ -2142,6 +2185,33 @@ async def handle_url(message: Message):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💎 Тарифы", callback_data="menu:tariffs")],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
+            ]),
+        )
+        return
+
+    # Reject pasting the same URL twice. Without this, a user who clicks
+    # «add» twice in a row pays the full add-flow cost both times (initial
+    # scrape, fetch_search_items round-trip) and then gets two parallel
+    # notification streams of the same listings. find_subscription_by_url
+    # ignores deleted=TRUE entries, so a previously-deleted URL can still
+    # be re-added.
+    existing = await db.find_subscription_by_url(user_id, url)
+    if existing is not None:
+        if existing["is_active"]:
+            hint = (
+                "ℹ️ Этот поиск у тебя уже есть и работает. Открой 📋 "
+                "«Мои поиски», чтобы посмотреть его."
+            )
+        else:
+            hint = (
+                "ℹ️ Этот поиск у тебя уже есть, но сейчас на паузе. Открой "
+                "📋 «Мои поиски» и включи его (▶️)."
+            )
+        await message.answer(
+            hint,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Мои поиски", callback_data="menu:list")],
                 [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:home")],
             ]),
         )
