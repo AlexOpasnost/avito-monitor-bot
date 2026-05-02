@@ -2,7 +2,7 @@
 # limit supply-chain risk. Bumps go through CI (pip-audit) before
 # landing — see .github/workflows/test.yml.
 aiogram==3.15.0
-asyncpg==0.30.0
+asyncpg==0.31.0
 httpx[http2]==0.27.2
 orjson==3.11.8
 python-dotenv==1.0.1
