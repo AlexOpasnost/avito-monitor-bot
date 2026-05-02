@@ -3,7 +3,7 @@
 # landing — see .github/workflows/test.yml.
 aiogram==3.15.0
 asyncpg==0.30.0
-httpx[http2]==0.27.2
+httpx[http2]==0.28.1
 orjson==3.11.8
 python-dotenv==1.0.1
 cloudscraper==1.2.71
