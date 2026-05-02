@@ -27,17 +27,19 @@ import re
 import time
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
+
 from datetime import datetime, timezone
 
 from services import yookassa as yk
@@ -50,7 +52,7 @@ from bot_i18n import (
     default_tz_for_lang,
 )
 from config import config
-from database import db
+from database import db, UserTombstonedError
 from parser import detect_source, fetch_search_items, supported_sources
 from parsers import is_source_disabled, source_display_name
 from parsers.common import proxy_for_source
@@ -66,6 +68,51 @@ router = Router()
 # (commands, FSM input, free-text URL paste) in one line; the previous
 # inline `if chat.type != "private": return` blocks become redundant.
 router.message.filter(F.chat.type == "private")
+
+
+# Erasure-correctness backstop. `db.get_or_create_user` raises
+# UserTombstonedError when the telegram_id has previously requested
+# /delete_my_account. Every command, callback, and FSM input step
+# touches that helper at some point, so registering one global
+# error-handler at the router level is cheaper and harder to drift
+# than wrapping every callsite individually. Without this, a
+# tombstoned user typing /start sees a 500 (asyncpg surfaces the
+# raise as a polling-loop traceback) instead of the polite
+# "account deleted" response the privacy policy promises.
+@router.errors()
+async def on_user_tombstoned(event: ErrorEvent):
+    if not isinstance(event.exception, UserTombstonedError):
+        return False
+    update = event.update
+    target = None
+    if getattr(update, "message", None) is not None:
+        target = update.message
+    elif getattr(update, "edited_message", None) is not None:
+        target = update.edited_message
+    elif getattr(update, "callback_query", None) is not None:
+        target = update.callback_query.message
+    if target is None:
+        # Nothing to reply to (rare update types). Still mark the
+        # error as handled so it doesn't propagate to the polling loop.
+        return True
+    text = (
+        "🗂 <b>Аккаунт удалён</b>\n\n"
+        "Ты использовал /delete_my_account, и твои данные стёрты "
+        "по твоему запросу (152-ФЗ Art. 14). Восстановить их нельзя.\n\n"
+        "Если ты передумал и хочешь начать заново с чистого листа — "
+        "напиши в поддержку, и мы снимем технический tombstone "
+        "(после этого можно будет /start)."
+    )
+    if config.support_handle:
+        text += f"\n\n💬 Поддержка: {config.support_handle}"
+    try:
+        await target.answer(text, parse_mode="HTML")
+    except (TelegramBadRequest, TelegramForbiddenError):
+        # User blocked the bot or the message is somehow malformed —
+        # nothing else we can do. Don't re-raise.
+        pass
+    return True
+
 
 _GENERIC_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 

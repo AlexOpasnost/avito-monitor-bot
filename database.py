@@ -11,6 +11,35 @@ from config import config
 logger = logging.getLogger(__name__)
 
 
+class UserTombstonedError(Exception):
+    """Raised when a tombstoned telegram_id tries to (re-)create a row.
+
+    A user previously exercised /delete_my_account; we keep a tombstone
+    forever so a late marketplace fetch, a buffered Telegram update, or
+    a YooKassa webhook retry cannot silently re-create the row for an
+    erased subject (152-ФЗ Art. 14). Callers must catch this and tell
+    the user the account is gone — never 500 / never re-INSERT.
+    """
+
+    def __init__(self, telegram_id: int):
+        super().__init__(f"telegram_id={telegram_id} is tombstoned")
+        self.telegram_id = telegram_id
+
+
+# Bigint-shaped advisory-lock key for telegram_id-scoped serialisation
+# between get_or_create_user and delete_user_data. Both take the same
+# advisory lock keyed on the telegram_id, so /delete_my_account on one
+# connection and a webhook resurrection attempt on another connection
+# can never interleave their tombstone-check / INSERT pair. The lock
+# is transaction-scoped, so it auto-releases on commit/rollback.
+def _tg_advisory_lock_key(telegram_id: int) -> int:
+    # Postgres bigint is signed; telegram_id fits comfortably. We use a
+    # single-arg pg_advisory_xact_lock(bigint) with a class-prefix so the
+    # value can't collide with a future bigint advisory lock used for an
+    # unrelated purpose (e.g. migrations). Top 16 bits = 0xCAFE marker.
+    return (0xCAFE << 48) | (telegram_id & ((1 << 48) - 1))
+
+
 class Database:
     def __init__(self):
         self.pool: asyncpg.Pool | None = None
@@ -479,17 +508,50 @@ class Database:
     # --- Users ---
 
     async def get_or_create_user(self, telegram_id: int, username: str | None = None) -> int:
+        """Resolve `telegram_id` to a user.id, creating the row on first
+        contact. Raises `UserTombstonedError` if the id was previously
+        erased — a 152-ФЗ Art. 14 promise that has to hold at every
+        entry point, not just the YooKassa webhook.
+
+        Single-connection transaction + telegram-id-scoped advisory
+        lock: a concurrent `/delete_my_account` for the same id holds
+        the same lock at the top of its own transaction, so the two
+        cannot interleave. Without the lock there is a microsecond
+        TOCTOU window where this fn reads "no tombstone" and the
+        delete commits a tombstone before our INSERT lands.
+        """
         async def _op(conn):
-            row = await conn.fetchrow(
-                "SELECT id FROM users WHERE telegram_id = $1", telegram_id
-            )
-            if row:
+            async with conn.transaction():
+                # Serialise against /delete_my_account on the same id.
+                # Transaction-scoped — auto-released on commit.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _tg_advisory_lock_key(telegram_id),
+                )
+                # Fast path: row exists. delete_user_data wipes the
+                # users row before tombstoning, so an existing hit
+                # implies "definitely not tombstoned".
+                row = await conn.fetchrow(
+                    "SELECT id FROM users WHERE telegram_id = $1",
+                    telegram_id,
+                )
+                if row:
+                    return row["id"]
+                # Slow path: must check tombstone before INSERT, both
+                # under the same advisory lock so a concurrent erasure
+                # cannot slip in between.
+                tomb = await conn.fetchval(
+                    "SELECT 1 FROM tombstoned_users WHERE telegram_id = $1",
+                    telegram_id,
+                )
+                if tomb:
+                    raise UserTombstonedError(telegram_id)
+                row = await conn.fetchrow(
+                    "INSERT INTO users (telegram_id, username) "
+                    "VALUES ($1, $2) RETURNING id",
+                    telegram_id, username,
+                )
                 return row["id"]
-            row = await conn.fetchrow(
-                "INSERT INTO users (telegram_id, username) VALUES ($1, $2) RETURNING id",
-                telegram_id, username,
-            )
-            return row["id"]
         return await self._execute(_op)
 
     async def get_user_prefs(self, user_id: int) -> dict:
@@ -842,6 +904,17 @@ class Database:
         delivery sees the refund row, returns False, caller skips
         DM (no spam) but doesn't try to re-deactivate (already done).
         """
+        # Anonymised payments carry user_id = -1 (delete_user_data
+        # rewires them to honour 4-year НК-РФ retention without
+        # holding live PII). A refund webhook for such a payment has
+        # nothing to deactivate — the user is gone — and trying to
+        # UPDATE WHERE id = -1 silently no-ops today, but only by
+        # accident: the day someone introduces a real id = -1 sentinel
+        # row (admin shadow user, test fixture), this becomes a cross-
+        # user disclosure. Hard short-circuit instead.
+        if user_id is None or user_id <= 0:
+            return False
+
         async def _op(conn):
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -854,7 +927,7 @@ class Database:
                 )
                 if row is None:
                     # Duplicate — deactivation already happened in a
-                    # prior call (or this user_id was -1, anonymized).
+                    # prior call.
                     return False
                 # Same SQL as deactivate_user_tariff but inline so the
                 # whole sequence is one transaction. Idempotent if
@@ -1026,6 +1099,17 @@ class Database:
                     "SELECT telegram_id FROM users WHERE id = $1",
                     user_id,
                 )
+                # Take the same telegram-id-scoped advisory lock that
+                # get_or_create_user takes, so a concurrent attempt to
+                # resurrect this user (a webhook that fired before our
+                # DELETE committed, a queued Telegram update) blocks
+                # behind us and reads the tombstone instead of
+                # creating a fresh row.
+                if tg_id is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock($1)",
+                        _tg_advisory_lock_key(tg_id),
+                    )
                 payments_count = await conn.fetchval(
                     "SELECT COUNT(*) FROM payments WHERE user_id = $1",
                     user_id,

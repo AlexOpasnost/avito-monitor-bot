@@ -24,7 +24,7 @@ from aiogram import Bot
 from aiohttp import web
 
 from config import config
-from database import db
+from database import db, UserTombstonedError
 from services.yookassa import YooKassaError, get_payment, get_refund
 
 logger = logging.getLogger(__name__)
@@ -198,7 +198,21 @@ async def handle_yookassa_webhook(request: web.Request) -> web.Response:
         # manually via YooKassa dashboard.
         return web.Response(status=200, text="ok")
 
-    user_id = await db.get_or_create_user(telegram_id, None)
+    # The pre-check above is a fast rejection. The TOCTOU window between
+    # that read and the get_or_create_user / record_and_activate path
+    # below is closed by the advisory lock inside both helpers — but if
+    # /delete_my_account commits during this window and we still try
+    # to recreate, get_or_create_user raises UserTombstonedError. Catch
+    # it the same way as the pre-check: 200 + manual reconciliation.
+    try:
+        user_id = await db.get_or_create_user(telegram_id, None)
+    except UserTombstonedError:
+        logger.error(
+            "[yookassa-wh] payment %s — telegram_id=%d tombstoned mid-tx; "
+            "refusing to recreate user; manual reconciliation required",
+            payment_id, telegram_id,
+        )
+        return web.Response(status=200, text="ok")
 
     amount = payment.get("amount") or {}
     currency = (amount.get("currency") or "RUB").upper()
