@@ -114,6 +114,99 @@ async def _notify_user_sub_deactivated(bot: Bot, sub: dict) -> None:
         )
 
 
+async def _tariff_renewal_funnel(bot: Bot, stop_event: asyncio.Event):
+    """Background task: DM users about expiring / expired paid tariffs.
+
+    Two notices per tariff cycle:
+    - 24 h before expiry: "your subscription ends tomorrow, renew?"
+    - On expiry: "your subscription has ended, renew to resume."
+
+    Both are gated by `users.expiry_warned_for` / `expired_notified_for`
+    matching the current `tariff_expires_at` — so renewals (which bump
+    expires_at) reset the gates automatically; re-runs in the same
+    window skip already-DM'd users.
+
+    Runs every 30 min. Without this, a paid user vanishes silently at
+    expiry — no funnel, no churn signal, no chance to recover the
+    revenue. The single highest-leverage UX fix in the audit.
+    """
+    interval = 30 * 60
+    # Short warmup so a fresh boot doesn't slam users right away with
+    # a possibly-stale-config DM blast.
+    initial_delay = 120
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=initial_delay)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    try:
+        from aiogram.exceptions import TelegramForbiddenError
+    except ImportError:
+        TelegramForbiddenError = Exception
+
+    while not stop_event.is_set():
+        try:
+            soon = await db.find_users_for_expiry_warning(hours_before=24)
+            for u in soon:
+                tg_id = u["telegram_id"]
+                user_id = u["id"]
+                exp = u["tariff_expires_at"]
+                try:
+                    await bot.send_message(
+                        tg_id,
+                        "⏳ <b>Тариф заканчивается завтра</b>\n\n"
+                        "Чтобы поиски не остановились, продли подписку — "
+                        "👉 /start → 💎 Тарифы.\n\n"
+                        f"<i>Заканчивается: {exp.strftime('%d.%m %H:%M UTC')}</i>",
+                        parse_mode="HTML",
+                    )
+                    await db.mark_expiry_warned(user_id, exp)
+                except TelegramForbiddenError:
+                    # Silent — user blocked the bot; nothing to do.
+                    await db.mark_expiry_warned(user_id, exp)
+                except Exception as e:
+                    logger.warning(
+                        "[funnel] expiry-warning DM failed tg=%s: %s",
+                        tg_id, str(e)[:120],
+                    )
+
+            done = await db.find_users_just_expired(lookback_hours=6)
+            for u in done:
+                tg_id = u["telegram_id"]
+                user_id = u["id"]
+                exp = u["tariff_expires_at"]
+                try:
+                    await bot.send_message(
+                        tg_id,
+                        "🔚 <b>Тариф закончился</b>\n\n"
+                        "Поиски сохранены, но новые объявления не приходят. "
+                        "Чтобы возобновить — продли подписку через "
+                        "/start → 💎 Тарифы.",
+                        parse_mode="HTML",
+                    )
+                    await db.mark_expired_notified(user_id, exp)
+                except TelegramForbiddenError:
+                    await db.mark_expired_notified(user_id, exp)
+                except Exception as e:
+                    logger.warning(
+                        "[funnel] expired DM failed tg=%s: %s",
+                        tg_id, str(e)[:120],
+                    )
+            if soon or done:
+                logger.info(
+                    "[funnel] cycle: %d expiring soon, %d just expired",
+                    len(soon), len(done),
+                )
+        except Exception:
+            logger.exception("[funnel] cycle failed")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _sent_items_pruner(stop_event: asyncio.Event):
     """Background task: prune sent_items rows older than 30 days every
     24 hours. Bounds DB growth and satisfies 152-ФЗ §5(4) data
@@ -148,6 +241,7 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
     sem = asyncio.Semaphore(1)
     tasks: dict[int, asyncio.Task] = {}
     pruner_task = asyncio.create_task(_sent_items_pruner(stop_event))
+    funnel_task = asyncio.create_task(_tariff_renewal_funnel(bot, stop_event))
 
     while not stop_event.is_set():
         try:
@@ -187,11 +281,12 @@ async def run_scheduler(bot: Bot, stop_event: asyncio.Event):
             await t
         except (asyncio.CancelledError, Exception):
             pass
-    pruner_task.cancel()
-    try:
-        await pruner_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    for bg in (pruner_task, funnel_task):
+        bg.cancel()
+        try:
+            await bg
+        except (asyncio.CancelledError, Exception):
+            pass
     logger.info("Scheduler stopped")
 
 

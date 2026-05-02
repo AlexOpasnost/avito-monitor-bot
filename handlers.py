@@ -1041,20 +1041,24 @@ async def _show_subscription_list(target):
     tg_id, username = _user_from(target)
     user_id = await db.get_or_create_user(tg_id, username)
     subs = await db.get_user_subscriptions(user_id)
-    active = [s for s in subs if s["is_active"]]
+    # Show BOTH active and paused (is_active=FALSE but not deleted)
+    # so the user can resume any sub they paused. Sort active first
+    # to keep the live ones at the top of the screen.
+    visible = [s for s in subs if not s.get("deleted")]
+    visible.sort(key=lambda s: (not s["is_active"], -(s["id"] or 0)))
 
-    if not active:
+    if not visible:
         text = (
-            "📋 <b>У тебя нет активных поисков.</b>\n\n"
+            "📋 <b>У тебя нет поисков.</b>\n\n"
             "Пришли ссылку на поиск с любого поддерживаемого маркетплейса — "
             "я начну мониторить."
         )
         await _present(target, text, keyboard=back_to_menu_keyboard())
         return
 
-    lines = ["📋 <b>Активные поиски:</b>\n"]
+    lines = ["📋 <b>Мои поиски:</b>\n"]
     sub_buttons = []
-    for i, sub in enumerate(active, 1):
+    for i, sub in enumerate(visible, 1):
         checked = sub["last_checked_at"]
         checked_str = (
             checked.strftime("%d.%m %H:%M") if checked else "ещё не проверялась"
@@ -1083,11 +1087,17 @@ async def _show_subscription_list(target):
         # left raw.
         safe_name = _html.escape(name)
         safe_url = _html.escape(sub["url"], quote=True)
+        is_paused = not sub.get("is_active", True)
+        status_prefix = "⏸ " if is_paused else ""
         lines.append(
-            f"<b>{i}.</b> <a href=\"{safe_url}\">{safe_name}</a>\n"
+            f"<b>{i}.</b> {status_prefix}<a href=\"{safe_url}\">{safe_name}</a>\n"
             f"   Последняя проверка: {checked_str}{errors}"
+            + ("\n   <i>На паузе</i>" if is_paused else "")
         )
-        # Two-button row per subscription: rename + stop-words.
+        # Per-sub controls: rename + stop-words on row 1; pause/resume
+        # toggle on row 2 (taking the full width so it's the obvious
+        # next thing to tap).
+        toggle_label = "▶️ Возобновить" if is_paused else "⏸ Пауза"
         sub_buttons.append([
             InlineKeyboardButton(
                 text=f"✏️ {name[:16]}",
@@ -1096,6 +1106,12 @@ async def _show_subscription_list(target):
             InlineKeyboardButton(
                 text=bl_label,
                 callback_data=f"bl:{sub['id']}",
+            ),
+        ])
+        sub_buttons.append([
+            InlineKeyboardButton(
+                text=f"{toggle_label} «{name[:18]}»",
+                callback_data=f"sub:toggle:{sub['id']}",
             ),
         ])
 
@@ -1680,6 +1696,29 @@ async def cmd_stop(message: Message):
 async def callback_cmd_delete(callback: CallbackQuery):
     await _show_delete_picker(callback)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sub:toggle:"))
+async def callback_sub_toggle(callback: CallbackQuery):
+    """Pause / resume a single subscription. Same ownership-check
+    pattern as `del:` — never trust the caller's id from callback_data,
+    always resolve the caller and let the DB enforce ownership."""
+    try:
+        sub_id = int(callback.data.split(":")[2])
+    except (ValueError, IndexError):
+        await callback.answer("Неверный ID")
+        return
+    user_id = await db.get_or_create_user(
+        callback.from_user.id, callback.from_user.username,
+    )
+    state = await db.toggle_subscription_active(sub_id, user_id)
+    if state is None:
+        await callback.answer("Поиск не найден", show_alert=True)
+        return
+    await callback.answer(
+        "▶️ Возобновлено" if state == "resumed" else "⏸ На паузе",
+    )
+    await _show_subscription_list(callback)
 
 
 @router.callback_query(F.data.startswith("del:"))

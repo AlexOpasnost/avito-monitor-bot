@@ -281,6 +281,20 @@ class Database:
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
                 "consent_policy_version TEXT"
             )
+            # Renewal-funnel flags: track which "expires soon" / "expired"
+            # DMs we've sent so a long-running scheduler doesn't spam
+            # the same user with the same notice every cycle. Each
+            # field stores the tariff_expires_at timestamp the notice
+            # was sent against — so a tariff renewal (which extends
+            # tariff_expires_at) makes the old flag stale automatically.
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "expiry_warned_for TIMESTAMPTZ"
+            )
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "expired_notified_for TIMESTAMPTZ"
+            )
             # `_migrations` MUST exist before the first _apply_once
             # call — _apply_once reads/writes this table to track
             # one-shot migrations. Previously placed below the first
@@ -825,6 +839,73 @@ class Database:
                 return True
         return await self._execute(_op, idempotent=False)
 
+    async def find_users_for_expiry_warning(
+        self, hours_before: int = 24,
+    ) -> list[dict]:
+        """Users whose paid tariff expires within `hours_before` and
+        whom we haven't already warned for THIS expiry timestamp.
+
+        The `expiry_warned_for` column stores the exact tariff_expires_at
+        we already DM'd against; comparing to the current value means
+        renewals (which bump expires_at) automatically reset the flag,
+        and re-runs of the cron skip already-DM'd users."""
+        async def _op(conn):
+            rows = await conn.fetch(
+                "SELECT id, telegram_id, tariff, tariff_expires_at "
+                "FROM users "
+                "WHERE tariff IS NOT NULL "
+                "  AND tariff NOT IN ('legacy', 'admin') "
+                "  AND tariff_expires_at IS NOT NULL "
+                "  AND tariff_expires_at > NOW() "
+                "  AND tariff_expires_at <= NOW() + ($1::int || ' hours')::interval "
+                "  AND (expiry_warned_for IS NULL "
+                "       OR expiry_warned_for <> tariff_expires_at)",
+                hours_before,
+            )
+            return [dict(r) for r in rows]
+        return await self._execute(_op)
+
+    async def find_users_just_expired(
+        self, lookback_hours: int = 6,
+    ) -> list[dict]:
+        """Users whose tariff expired within the last `lookback_hours`
+        and whom we haven't notified yet for THIS expiry timestamp."""
+        async def _op(conn):
+            rows = await conn.fetch(
+                "SELECT id, telegram_id, tariff, tariff_expires_at "
+                "FROM users "
+                "WHERE tariff IS NOT NULL "
+                "  AND tariff NOT IN ('legacy', 'admin') "
+                "  AND tariff_expires_at IS NOT NULL "
+                "  AND tariff_expires_at <= NOW() "
+                "  AND tariff_expires_at >= NOW() - ($1::int || ' hours')::interval "
+                "  AND (expired_notified_for IS NULL "
+                "       OR expired_notified_for <> tariff_expires_at)",
+                lookback_hours,
+            )
+            return [dict(r) for r in rows]
+        return await self._execute(_op)
+
+    async def mark_expiry_warned(
+        self, user_id: int, expires_at,
+    ) -> None:
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET expiry_warned_for = $2 WHERE id = $1",
+                user_id, expires_at,
+            )
+        await self._execute(_op, idempotent=False)
+
+    async def mark_expired_notified(
+        self, user_id: int, expires_at,
+    ) -> None:
+        async def _op(conn):
+            await conn.execute(
+                "UPDATE users SET expired_notified_for = $2 WHERE id = $1",
+                user_id, expires_at,
+            )
+        await self._execute(_op, idempotent=False)
+
     async def prune_sent_items(self, days: int = 30) -> int:
         """Delete sent_items rows older than `days`. Returns deleted count.
 
@@ -1354,6 +1435,33 @@ class Database:
             )
             return row is not None
         return await self._execute(_op)
+
+    async def toggle_subscription_active(
+        self, sub_id: int, user_id: int,
+    ) -> str | None:
+        """Flip is_active for one of the user's subs. Ownership-checked.
+
+        Returns "paused" if the sub is now is_active=FALSE,
+        "resumed" if is_active=TRUE, None if the sub doesn't belong to
+        the user / is soft-deleted.
+
+        On resume the error_count is reset and last_error cleared so
+        a sub that was paused due to errors gets a clean retry budget.
+        """
+        async def _op(conn):
+            row = await conn.fetchrow(
+                "UPDATE subscriptions "
+                "SET is_active = NOT is_active, "
+                "    error_count = CASE WHEN NOT is_active THEN 0 ELSE error_count END, "
+                "    last_error = CASE WHEN NOT is_active THEN NULL ELSE last_error END "
+                "WHERE id = $1 AND user_id = $2 AND deleted = FALSE "
+                "RETURNING is_active",
+                sub_id, user_id,
+            )
+            if row is None:
+                return None
+            return "resumed" if row["is_active"] else "paused"
+        return await self._execute(_op, idempotent=False)
 
     async def deactivate_all(self, user_id: int):
         async def _op(conn):
