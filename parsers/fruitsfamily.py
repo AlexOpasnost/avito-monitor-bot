@@ -35,7 +35,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from .base import SearchItem
-from .common import host_in_allowlist
+from .common import MAX_JSON_BYTES, host_in_allowlist
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,14 @@ async def _fetch_inner(url: str, proxy: str | None) -> list[SearchItem] | None:
         )
         return None
 
+    # Body-size cap — see common.MAX_JSON_BYTES rationale.
+    body_bytes = resp.content
+    if len(body_bytes) > MAX_JSON_BYTES:
+        logger.warning(
+            "[fruitsfamily] response oversized: %d bytes",
+            len(body_bytes),
+        )
+        return None
     try:
         data = resp.json()
     except Exception as e:

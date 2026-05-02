@@ -58,6 +58,20 @@ def _sanitize_error_body(text: str | None, max_len: int = 200) -> str:
     # PANs, but cancellation_details has been observed with last4 in
     # the past — still mask just in case.
     sample = re.sub(r"\b\d{13,19}\b", "<digits>", sample)
+    # Mask Russian phone numbers (+7/8 + 10 digits, with optional spaces,
+    # dashes, or parentheses). YooKassa errors that complain about a
+    # malformed phone in receipt.customer echo it back verbatim.
+    sample = re.sub(
+        r"(?:\+7|7|8)[\s\-()]*\d(?:[\s\-()]*\d){9}",
+        "<phone>", sample,
+    )
+    # Mask SNILS (XXX-XXX-XXX YY) — should never appear here, but if a
+    # caller ever wires it into description/metadata we don't want it
+    # in plain logs.
+    sample = re.sub(
+        r"\b\d{3}[\s\-]\d{3}[\s\-]\d{3}[\s\-]\d{2}\b",
+        "<snils>", sample,
+    )
     return sample
 
 

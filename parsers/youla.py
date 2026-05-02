@@ -62,7 +62,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from .base import SearchItem
-from .common import host_in_allowlist
+from .common import MAX_JSON_BYTES, host_in_allowlist
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,16 @@ async def _fetch_inner(url: str, proxy: str | None) -> list[SearchItem] | None:
         logger.warning("[youla] HTTP %d: %s", resp.status_code, resp.text[:200])
         return None
 
+    # Body-size cap before JSON parse — defense against a hostile or
+    # compromised upstream returning a 200 MB payload that OOMs the
+    # 512 MB Railway container. The legitimate response is &lt;100 KB.
+    body_bytes = resp.content
+    if len(body_bytes) > MAX_JSON_BYTES:
+        logger.warning(
+            "[youla] response oversized: %d bytes — refusing to parse",
+            len(body_bytes),
+        )
+        return None
     try:
         data = resp.json()
     except Exception as e:
@@ -318,9 +328,23 @@ def _parse_item(p: dict) -> SearchItem | None:
         image_url = first.get("url")
 
     rel_url = (p.get("url") or "").strip()
-    item_url = _BASE_URL + rel_url if rel_url.startswith("/") else (rel_url or None)
-    if not item_url:
+    if not rel_url:
         return None
+    if rel_url.startswith("/"):
+        item_url = _BASE_URL + rel_url
+    else:
+        # Absolute URLs from the API must point back at Youla. Anything
+        # else (a misrouted ad, a redirector, or an upstream bug) gets
+        # dropped — we don't want to hand the user a button that opens
+        # an arbitrary off-site URL inside their Telegram client.
+        try:
+            host = (urlparse(rel_url).hostname or "").lower()
+        except Exception:
+            return None
+        if host not in _YOULA_HOSTS:
+            logger.warning("[youla] dropping item with off-site url host=%r", host)
+            return None
+        item_url = rel_url
 
     location = None
     loc = p.get("location") or {}

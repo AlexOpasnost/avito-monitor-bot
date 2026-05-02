@@ -116,6 +116,10 @@ async def main():
     # user. Callback rate is a bit higher because real navigation
     # (rapid menu clicks) legitimately fires several events per second.
     dp.message.middleware(PerUserThrottle(rate_seconds=0.5, label="msg"))
+    # edited_message bypasses dp.message — without its own throttle a
+    # user can hold down the up-arrow to re-edit and replay each command
+    # at line rate. Same budget as fresh messages.
+    dp.edited_message.middleware(PerUserThrottle(rate_seconds=0.5, label="edit"))
     dp.callback_query.middleware(PerUserThrottle(rate_seconds=0.3, label="cb"))
     dp.include_router(router)
 

@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 from .base import SearchItem
-from .common import host_in_allowlist
+from .common import MAX_JSON_BYTES, host_in_allowlist
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,15 @@ def _fetch_sync(url: str, proxy: str | None) -> list[SearchItem] | None:
         logger.warning(
             "[grailed] HTTP %d body=%s",
             resp.status_code, resp.text[:300],
+        )
+        return None
+    # Body-size cap before JSON parse — see common.MAX_JSON_BYTES rationale.
+    # curl_cffi exposes raw bytes via .content the same way httpx does.
+    body_bytes = resp.content
+    if len(body_bytes) > MAX_JSON_BYTES:
+        logger.warning(
+            "[grailed] response oversized: %d bytes",
+            len(body_bytes),
         )
         return None
     try:
