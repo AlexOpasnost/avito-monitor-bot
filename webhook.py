@@ -356,9 +356,13 @@ async def _handle_refund_event(request: web.Request, refund_obj: dict) -> web.Re
     except (TypeError, ValueError):
         amount_minor = 0
 
-    # Idempotency gate — first delivery proceeds, dupes return early.
+    # Atomic record + deactivate. The previous split-step flow left
+    # a window where the refund was logged but the tariff stayed
+    # active — if `deactivate_user_tariff` failed transiently, the
+    # next webhook delivery saw is_new=False and the deactivation
+    # never re-ran. See database.record_and_deactivate_refund.
     try:
-        is_new = await db.record_refund(
+        is_new = await db.record_and_deactivate_refund(
             refund_id=refund_id,
             payment_id=payment_id,
             user_id=user_id,
@@ -367,22 +371,18 @@ async def _handle_refund_event(request: web.Request, refund_obj: dict) -> web.Re
         )
     except Exception:
         logger.exception(
-            "[yookassa-wh] record_refund failed: refund=%s payment=%s",
-            refund_id, payment_id,
+            "[yookassa-wh] record_and_deactivate_refund failed: "
+            "refund=%s payment=%s user=%d",
+            refund_id, payment_id, user_id,
         )
+        # 500 → YooKassa retries; the txn rolled back, so the refund
+        # row is NOT recorded yet — retry will hit the same INSERT
+        # path cleanly (or fail again for the same reason, which is
+        # the operator's signal to look at the logs).
         return web.Response(status=500, text="retry")
 
     if not is_new:
         logger.info("[yookassa-wh] duplicate refund %s — already processed", refund_id)
-        return web.Response(status=200, text="ok")
-
-    try:
-        await db.deactivate_user_tariff(user_id)
-    except Exception:
-        logger.exception(
-            "[yookassa-wh] deactivate_user_tariff failed: user=%d refund=%s",
-            user_id, refund_id,
-        )
         return web.Response(status=200, text="ok")
 
     logger.info(

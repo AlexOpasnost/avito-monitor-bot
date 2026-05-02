@@ -749,6 +749,13 @@ class Database:
         them once. Returns False on a duplicate delivery (replay,
         YooKassa retry, our own retry-on-network-error) — caller acks
         and moves on without re-deactivating or re-DMing.
+
+        DEPRECATED for the webhook path — use
+        `record_and_deactivate_refund` instead, which folds the
+        record + deactivate into a single transaction. The split-
+        step variant left a window where the refund was logged but
+        the user kept their tariff (deactivate_user_tariff failed
+        between the two steps).
         """
         async def _op(conn):
             row = await conn.fetchrow(
@@ -761,6 +768,62 @@ class Database:
             )
             return row is not None
         return await self._execute(_op)
+
+    async def record_and_deactivate_refund(
+        self, *, refund_id: str, payment_id: str,
+        user_id: int, amount_minor: int, currency: str,
+    ) -> bool:
+        """Atomically record a verified refund AND deactivate the
+        user's tariff (+ pause active subs).
+
+        Returns True iff this is the first time we see this refund_id
+        AND the deactivation actually applied. Caller (webhook) uses
+        this to gate the user-DM ("refund processed").
+
+        Why atomic: previously `record_refund` then a separate
+        `deactivate_user_tariff` call left a window — if the second
+        call failed (transient DB error, race), the refund row was
+        already in the table, so a webhook redelivery returned
+        is_new=False and the deactivation never re-ran. The customer
+        got their money back AND kept the service indefinitely.
+
+        Failure semantics: if deactivation raises, the entire txn
+        rolls back, refund row is NOT recorded, webhook returns 500
+        and YooKassa retries later. Idempotency-on-success: a second
+        delivery sees the refund row, returns False, caller skips
+        DM (no spam) but doesn't try to re-deactivate (already done).
+        """
+        async def _op(conn):
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "INSERT INTO refunds "
+                    "(refund_id, payment_id, user_id, amount_minor, currency) "
+                    "VALUES ($1, $2, $3, $4, $5) "
+                    "ON CONFLICT (refund_id) DO NOTHING "
+                    "RETURNING refund_id",
+                    refund_id, payment_id, user_id, amount_minor, currency,
+                )
+                if row is None:
+                    # Duplicate — deactivation already happened in a
+                    # prior call (or this user_id was -1, anonymized).
+                    return False
+                # Same SQL as deactivate_user_tariff but inline so the
+                # whole sequence is one transaction. Idempotent if
+                # somehow re-run on the same user (UPDATE to NULL is
+                # safe).
+                await conn.execute(
+                    "UPDATE users SET tariff = NULL, "
+                    "tariff_expires_at = NULL WHERE id = $1",
+                    user_id,
+                )
+                await conn.execute(
+                    "UPDATE subscriptions SET is_active = FALSE "
+                    "WHERE user_id = $1 AND is_active = TRUE "
+                    "AND deleted = FALSE",
+                    user_id,
+                )
+                return True
+        return await self._execute(_op, idempotent=False)
 
     async def prune_sent_items(self, days: int = 30) -> int:
         """Delete sent_items rows older than `days`. Returns deleted count.

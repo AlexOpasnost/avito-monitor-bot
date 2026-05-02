@@ -66,6 +66,54 @@ def _matches_blacklist(item: SearchItem, blacklist: list[str]) -> bool:
     return any(word in haystack for word in blacklist)
 
 
+async def _notify_user_sub_deactivated(bot: Bot, sub: dict) -> None:
+    """DM the owner of `sub` that their subscription was paused
+    automatically after too many parse errors. Without this notice
+    users discover by accident days later that notifications stopped
+    — the leading churn signal in support threads.
+
+    Best-effort: any exception (TelegramForbidden — user blocked the
+    bot, RetryAfter, etc.) is swallowed with a log. We don't loop
+    on retry; if the user blocked us, they'll re-subscribe via
+    /start when they want service back."""
+    tg_id = sub.get("telegram_id")
+    if not tg_id:
+        return
+    try:
+        from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+    except ImportError:
+        TelegramForbiddenError = TelegramRetryAfter = Exception
+    try:
+        await bot.send_message(
+            tg_id,
+            "⚠️ <b>Один из твоих поисков поставлен на паузу</b>\n\n"
+            "10 проверок подряд закончились ошибкой — обычно это значит, "
+            "что маркетплейс изменил формат страницы или ссылка устарела. "
+            "Открой <b>📋 Мои поиски</b>, проверь URL — если нужно, "
+            "удали и добавь заново.",
+            parse_mode="HTML",
+        )
+    except TelegramForbiddenError:
+        # User blocked the bot — pause everything for them so we
+        # stop hammering an unreachable chat (per-call overhead is
+        # small but the per-cycle log noise is real).
+        try:
+            from database import db as _db
+            user_id_int = sub.get("user_id")
+            if user_id_int:
+                await _db.deactivate_user_tariff(user_id_int)
+        except Exception:
+            logger.exception(
+                "[scheduler] cleanup-on-block failed for user_id=%r",
+                sub.get("user_id"),
+            )
+    except Exception as e:
+        logger.warning(
+            "[scheduler] notify-deactivated DM failed for tg=%s: %s",
+            tg_id, str(e)[:120],
+        )
+
+
 async def _sent_items_pruner(stop_event: asyncio.Event):
     """Background task: prune sent_items rows older than 30 days every
     24 hours. Bounds DB growth and satisfies 152-ФЗ §5(4) data
@@ -213,7 +261,23 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
                     "Sub #%d: parse failed (%d in a row)",
                     sub["id"], consecutive_failures,
                 )
-                await db.increment_error(sub["id"], "Parse failed")
+                # increment_error returns True when the sub crossed
+                # the auto-deactivate threshold (10 errors). Until
+                # this fix the deactivation was silent — user noticed
+                # days later that "notifications stopped". Now we DM
+                # them with what happened and how to recover.
+                try:
+                    deactivated = await db.increment_error(
+                        sub["id"], "Parse failed",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Sub #%d: increment_error raised — letting next cycle retry",
+                        sub["id"],
+                    )
+                    deactivated = False
+                if deactivated:
+                    await _notify_user_sub_deactivated(bot, sub)
 
                 if consecutive_failures >= 3:
                     logger.warning(
@@ -235,10 +299,20 @@ async def _sub_loop(sub: dict, bot: Bot, sem: asyncio.Semaphore, stop_event: asy
             raise
         except Exception as e:
             logger.exception("Sub #%d loop error", sub["id"])
+            # Log every failure inside the increment_error call too —
+            # previously a bare `except Exception: pass` swallowed
+            # secondary DB errors here, meaning the per-sub error
+            # counter could stop incrementing while the sub kept
+            # failing, never reaching the deactivation threshold.
             try:
-                await db.increment_error(sub["id"], str(e)[:200])
+                deactivated = await db.increment_error(sub["id"], str(e)[:200])
+                if deactivated:
+                    await _notify_user_sub_deactivated(bot, sub)
             except Exception:
-                pass
+                logger.exception(
+                    "Sub #%d: increment_error itself failed — error counter "
+                    "may not advance this cycle", sub["id"],
+                )
 
         # Fixed 60s between cycles — user requirement.
         try:
@@ -336,15 +410,62 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
             sub["id"], tg_id, len(to_send),
         )
 
+    # Telegram-specific exception types for cleaner classification.
+    # Imported lazily to avoid coupling tests to aiogram internals.
+    try:
+        from aiogram.exceptions import (
+            TelegramForbiddenError,
+            TelegramRetryAfter,
+        )
+    except ImportError:
+        TelegramForbiddenError = TelegramRetryAfter = Exception
+
     sent_keys: set[tuple[str, str]] = set()
+    user_blocked_us = False
     if allow_send:
         for item in to_send:
+            if user_blocked_us:
+                # Once we know the user blocked the bot, stop trying
+                # to deliver the rest of this batch — Telegram won't
+                # let any of them through, and each attempt logs an
+                # error.
+                break
             try:
                 await _send_notification(bot, sub, item, prefs)
                 sent_keys.add((item.source, item.external_id))
                 await db.mark_item_sent(sub["id"], item.external_id, source=item.source)
+            except TelegramForbiddenError:
+                # User blocked the bot. Pause all their subs so we
+                # stop hammering an unreachable chat — this is the
+                # only path that actually reduces ongoing load.
+                logger.info(
+                    "[scheduler] tg=%s blocked the bot — pausing their subs",
+                    sub.get("telegram_id"),
+                )
+                user_blocked_us = True
+                try:
+                    user_id_int = sub.get("user_id")
+                    if user_id_int:
+                        await db.deactivate_user_tariff(user_id_int)
+                except Exception:
+                    logger.exception(
+                        "[scheduler] cleanup-on-block failed user_id=%r",
+                        sub.get("user_id"),
+                    )
+            except TelegramRetryAfter as e:
+                # Rate-limited. Sleep the requested duration; the
+                # next item will likely also hit the limit, but
+                # we'll have spent the time productively.
+                wait = float(getattr(e, "retry_after", 1.0))
+                logger.warning(
+                    "[scheduler] Telegram rate-limit, sleeping %.1fs", wait,
+                )
+                await asyncio.sleep(min(wait, 30.0))
             except Exception as e:
-                logger.warning("Send failed for %s/%s: %s", item.source, item.external_id, e)
+                logger.warning(
+                    "Send failed for %s/%s: %s",
+                    item.source, item.external_id, str(e)[:120],
+                )
             await asyncio.sleep(0.5)
 
     # Mark leftovers as seen so we don't re-process them next cycle
