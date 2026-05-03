@@ -33,11 +33,18 @@ class UserTombstonedError(Exception):
 # can never interleave their tombstone-check / INSERT pair. The lock
 # is transaction-scoped, so it auto-releases on commit/rollback.
 def _tg_advisory_lock_key(telegram_id: int) -> int:
-    # Postgres bigint is signed; telegram_id fits comfortably. We use a
-    # single-arg pg_advisory_xact_lock(bigint) with a class-prefix so the
-    # value can't collide with a future bigint advisory lock used for an
-    # unrelated purpose (e.g. migrations). Top 16 bits = 0xCAFE marker.
-    return (0xCAFE << 48) | (telegram_id & ((1 << 48) - 1))
+    # pg_advisory_xact_lock(bigint) takes a SIGNED int64. Naive
+    # `(0xCAFE << 48) | ...` sets bit 63 → unsigned value 1.46e19 →
+    # overflows asyncpg's int8_encode (OverflowError, DataError) and
+    # /start dies before the handler can answer the user. We pick a
+    # 0xCAFE-shaped marker that fits inside the signed range, then
+    # XOR-fold the telegram_id into the lower 48 bits. Result is
+    # always in [0, 2^63), well inside signed int64.
+    #
+    # Top 16 bits = 0x0CAF (deliberately zero out bit 63 vs. the
+    # original 0xCAFE so the encoding remains uniquely identifiable
+    # in pg_locks dumps without crossing the sign threshold).
+    return (0x0CAF << 48) | (telegram_id & ((1 << 48) - 1))
 
 
 class Database:
