@@ -422,7 +422,7 @@ _GATE_TEXT = (
 
 
 def _channel_public_url(handle: str) -> str | None:
-    """`@autosearch` → `https://t.me/autosearch`. Numeric `-100…` ids
+    """`@autoserch` → `https://t.me/autoserch`. Numeric `-100…` ids
     have no public URL — return None and the gate will only render the
     «Я подписался» button."""
     h = (handle or "").strip()
@@ -514,7 +514,7 @@ _RECONSENT_TEXT = (
     "С твоего последнего захода мы обновили публичную оферту и политику "
     "обработки персональных данных до версии <b>v3 (02.05.2026)</b>.\n\n"
     "<b>Что изменилось:</b>\n\n"
-    "1. <b>Подписка на канал @autosearch</b> — теперь условие доступа "
+    "1. <b>Подписка на канал @autoserch</b> — теперь условие доступа "
     "к боту. Бот проверяет факт подписки через Telegram API при /start.\n\n"
     "2. <b>Цены тарифов</b> — Базовый 1 290 ₽, Продвинутый 1 990 ₽, "
     "Профессиональный 2 990 ₽. Уже оплаченные подписки изменения "

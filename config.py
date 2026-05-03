@@ -105,7 +105,7 @@ class Config:
     # that's where bugs that matter actually fire.
     sentry_environment: str = "production"
     # Channel-subscribe gate shown on /start. Either a public username
-    # ("@autosearch") or a numeric chat id ("-100…"). Empty = gate
+    # ("@autoserch") or a numeric chat id ("-100…"). Empty = gate
     # disabled. The bot MUST be an administrator in the channel —
     # otherwise getChatMember fails and the gate fails open (lets the
     # user through with a logged warning, so a misconfigured admin
