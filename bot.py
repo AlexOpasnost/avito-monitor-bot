@@ -194,38 +194,20 @@ async def main():
         BotCommand(command="help",    description="Как это работает"),
     ])
 
-    # Bot description: shown on the "Open bot" landing page above the
-    # Start button. Telegram caps this at 512 chars; what's set in
-    # BotFather is overwritten the next time we boot.
-    bot_description = (
-        "🔎 AutoSearch — лучший инструмент для пользователей торговых "
-        "площадок. Моментально присылает все новые объявления.\n\n"
-        "🎁 Бесплатный пробный период\n\n"
-        "📋 До 5 одновременных ссылок-поисков\n\n"
-        "🛒 Огромный выбор площадок\n"
-        "- Avito\n"
-        "- Vinted\n"
-        "- Kufar\n"
-        "- OLX\n"
-        "- Юла\n"
-        "- Mercari\n"
-        "- Grailed\n"
-        "- Fruitsfamily\n\n"
-        "💵 Лучшая цена на рынке. Одна находка позволяет полностью "
-        "окупить подписку в несколько раз\n\n"
-        "👇 Нажми «Старт» чтобы начать 👇"
-    )
-    short_description = (
-        "Мониторит Avito, Юла, OLX, Vinted, Kufar, Mercari, Grailed, "
-        "Fruitsfamily — присылает новые объявления в реальном времени."
-    )
-    try:
-        await bot.set_my_description(bot_description)
-        await bot.set_my_short_description(short_description)
-    except Exception as e:
-        # Don't block startup if Telegram rejects the description (e.g.
-        # rate-limited on rapid restarts). The previous value stays.
-        logger.warning("set_my_description failed: %s", e)
+    # NOTE: bot.set_my_description / set_my_short_description disabled.
+    #
+    # As of ROUND 14 the call started failing every boot with
+    # `BOT_SHARETEXT_INVALID` (Telegram anti-spam rejecting the new
+    # multi-line description). On top of being noise in the log,
+    # repeatedly calling setMyDescription with a rejected payload
+    # appears to put the bot into a soft-ban state where outgoing
+    # `sendMessage` returns 200 OK to us but Telegram silently does
+    # not deliver the message to users — we observed this exact
+    # symptom in production (handlers run, no errors, users see
+    # nothing). Keep description set manually via @BotFather instead
+    # until we figure out which character/emoji triggers the
+    # rejection. Operator can flip this back on with a config flag
+    # later.
 
     # Webhook server runs alongside polling on the same event loop.
     # Railway injects $PORT for the public-facing service — honour it.

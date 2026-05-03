@@ -591,6 +591,21 @@ async def _show_main_menu(target, prefs: dict | None = None):
     await _present(target, text, keyboard=main_menu_keyboard())
 
 
+@router.message(Command("ping"))
+async def cmd_ping(message: Message):
+    """Diagnostic-only handler. Replies «pong» with zero DB / API
+    dependencies — used to isolate whether `bot.send_message` works at
+    all, vs. `cmd_start` having a logic bug. If `/ping` answers but
+    `/start` doesn't → bug is in cmd_start. If `/ping` is also silent
+    → it's a Telegram-API / shadow-ban / token issue, not our code."""
+    logger.info("[ping] received from tg_id=%s", message.from_user.id)
+    try:
+        await message.answer("pong")
+        logger.info("[ping] reply sent ok to tg_id=%s", message.from_user.id)
+    except Exception:
+        logger.exception("[ping] reply failed to tg_id=%s", message.from_user.id)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = await db.get_or_create_user(
