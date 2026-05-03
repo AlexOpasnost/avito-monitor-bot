@@ -229,6 +229,17 @@ async def main():
 
     try:
         logger.info("Bot starting...")
+        # Drop any stale webhook from previous configurations (e.g. an
+        # old Cloudflare worker) AND drop any pending updates that
+        # accumulated while the previous container was dying. Without
+        # this, a webhook URL left behind makes getUpdates 409 forever
+        # ("terminated by other getUpdates request"), and the boot
+        # loop fights itself for ~30 s on every redeploy.
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook cleared, polling start")
+        except Exception:
+            logger.warning("delete_webhook on boot failed — continuing", exc_info=True)
         await dp.start_polling(
             bot,
             handle_signals=sys.platform == "win32",
@@ -241,6 +252,14 @@ async def main():
             await asyncio.wait_for(scheduler_task, timeout=10)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             scheduler_task.cancel()
+            # Re-await after cancel so the task actually drains its
+            # cancellation and releases the asyncpg / aiohttp resources
+            # it owns. Without this the task stays in CANCELLING and
+            # leaks the connection until process exit.
+            try:
+                await scheduler_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if webhook_runner is not None:
             try:
                 await webhook_runner.cleanup()

@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import re
 import secrets
+from decimal import Decimal, ROUND_HALF_UP
 
 import httpx
 
@@ -103,9 +104,20 @@ async def create_payment(
     our behalf, contrary to what the docs imply. Caller must pass
     `customer_email` (or `customer_phone`).
     """
+    # Format the amount through Decimal to dodge IEEE-754 rounding.
+    # f"{0.1+0.2:.2f}" happens to print 0.30, but for any amount
+    # whose binary repr can't be exactly halved (kopeks/100.0 of a
+    # fractional ruble), the float→string conversion can produce
+    # 99999.98 vs the expected 99999.99 — YooKassa rejects with
+    # "amount.value invalid". Decimal(str(...)) then quantize is the
+    # asyncpg-recommended pattern for currency strings.
+    amount_str = format(
+        Decimal(str(amount_rub)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "f",
+    )
     body = {
         "amount": {
-            "value": f"{amount_rub:.2f}",
+            "value": amount_str,
             "currency": "RUB",
         },
         # Auto-capture: charge immediately, no two-stage hold.
@@ -238,11 +250,19 @@ def build_receipt_item(
       - payment_subject='service' → digital subscription is closest to FFD
         1.2's «service» category (no «subscription» enum value exists)
     """
+    # Same Decimal-formatting reasoning as create_payment. The receipt
+    # amount in Мой налог is the legally binding fiscal record — even
+    # a 1-kopek mismatch with create_payment.amount triggers ОФД
+    # rejection.
+    amount_str = format(
+        Decimal(str(amount_rub)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "f",
+    )
     return {
         "description": name[:128],
         "quantity": "1.00",
         "amount": {
-            "value": f"{amount_rub:.2f}",
+            "value": amount_str,
             "currency": "RUB",
         },
         "vat_code": vat_code,

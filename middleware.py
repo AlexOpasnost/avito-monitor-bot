@@ -39,6 +39,13 @@ class PerUserThrottle(BaseMiddleware):
         self.label = label
         self._last: dict[int, float] = {}
 
+    # Commands that MUST never be throttled — they're the only escape
+    # hatches when a user gets stuck (FSM state, accidental flood,
+    # cooldown). Dropping /cancel silently leaves the user permanently
+    # in BuyStates / RenameStates / BlacklistStates with no way out
+    # and no log line to debug from. /start is the universal reset.
+    _NEVER_THROTTLE = ("/cancel", "/start")
+
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
@@ -49,6 +56,14 @@ class PerUserThrottle(BaseMiddleware):
         uid = getattr(user, "id", None) if user else None
         if uid is None:
             # Service messages, channel posts — no per-user gating.
+            return await handler(event, data)
+
+        text = getattr(event, "text", None) or ""
+        if text.startswith(self._NEVER_THROTTLE):
+            # Reset the per-user clock when the user explicitly tries
+            # to escape — otherwise /cancel followed by another command
+            # 100 ms later would re-throttle the next command.
+            self._last[uid] = time.monotonic()
             return await handler(event, data)
 
         now = time.monotonic()

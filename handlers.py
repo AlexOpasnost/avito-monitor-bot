@@ -330,10 +330,19 @@ async def _warn_if_url_during_fsm(
     if (_extract_marketplace_url(message) is None
             and not _GENERIC_URL_RE.search(text)):
         return False
-    await message.answer(
-        f"Сейчас я жду {expected}, а ты прислал ссылку. Если хочешь "
-        f"добавить новый поиск — отправь /cancel и пришли ссылку ещё раз.",
-    )
+    try:
+        await message.answer(
+            f"Сейчас я жду {expected}, а ты прислал ссылку. Если хочешь "
+            f"добавить новый поиск — отправь /cancel и пришли ссылку ещё раз.",
+        )
+    except Exception:
+        # Same silent-fail family as ROUND 14 incident — without the
+        # try/except a TelegramForbidden / network blip vanishes here
+        # and the user is stuck in an FSM with no visible warning.
+        logger.exception(
+            "[fsm-warn] answer failed tg_id=%s expected=%r",
+            message.from_user.id, expected,
+        )
     return True
 
 
@@ -1064,6 +1073,15 @@ async def callback_buy_tariff(callback: CallbackQuery, state: FSMContext):
         callback.from_user.id, callback.from_user.username,
     )
 
+    # Re-consent gate: a stale «buy:trial» button URL or a queued
+    # callback from before R14 must not let the user activate trial
+    # without accepting the current ToS version. Same logic as
+    # cmd_start — admins are bypassed inside _reconsent_passes.
+    prefs = await db.get_user_prefs(user_id)
+    if not await _reconsent_passes(callback, prefs):
+        await callback.answer()
+        return
+
     # Trial — free, one-shot, no Telegram-Payments invoice.
     if tariff_id == "trial":
         # The atomic UPDATE inside activate_tariff returns None when
@@ -1278,6 +1296,12 @@ async def _start_yookassa_payment(
         )
     except yk.YooKassaError:
         logger.exception("[payment] create_payment failed for tariff=%s", tariff_id)
+        # Clear the cooldown on failure so the user can hit «Попробовать
+        # снова» immediately. Without this, the cooldown stamp set
+        # earlier in _payment_cooldown_remaining would lock them out
+        # for 60 s right after a YooKassa flake — a confusing
+        # dead-end on the money path.
+        _LAST_PAYMENT_AT.pop(target.from_user.id, None)
         await _present(
             target,
             "❌ Не получилось открыть оплату.\n\n"
@@ -1292,6 +1316,9 @@ async def _start_yookassa_payment(
     confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
     if not confirmation_url:
         logger.error("[payment] no confirmation_url in YooKassa response: %s", payment)
+        # Same cooldown-clear logic as the YooKassaError branch — a
+        # malformed YooKassa response shouldn't lock the user out.
+        _LAST_PAYMENT_AT.pop(target.from_user.id, None)
         await _present(
             target,
             "❌ ЮKassa не вернула ссылку на оплату.\n\n"
@@ -1741,7 +1768,7 @@ async def callback_gdpr_confirm_delete(callback: CallbackQuery):
         callback.from_user.id, callback.from_user.username,
     )
     try:
-        stats = await db.delete_user_data(user_id)
+        stats = await db.delete_user_data(user_id, telegram_id=erasing_tg_id)
     except Exception:
         logger.exception("[gdpr] delete_user_data failed for user_id=%d", user_id)
         await callback.answer(

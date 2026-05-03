@@ -202,9 +202,12 @@ def _extract_catalog_items_strict(html: str, url: str) -> list[SearchItem] | Non
         if not (val.get("id") or val.get("itemId")):
             continue
         try:
-            items.append(_parse_item(val))
+            parsed = _parse_item(val)
         except Exception as e:
             logger.debug("[avito] parse item err: %s", e)
+            continue
+        if parsed is not None:
+            items.append(parsed)
 
     logger.info(
         "[avito] mfe #%d is CATALOG: %d raw rows -> %d items (%d non-item rows skipped)",

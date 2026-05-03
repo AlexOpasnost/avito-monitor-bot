@@ -492,7 +492,15 @@ class Database:
         # Cutoff: ~2 weeks past the original migration date. Anyone
         # restoring state past this point should review the code, not
         # blindly let it re-run.
-        sunset = datetime(2026, 5, 5, tzinfo=timezone.utc)
+        # Sunset bumped to a date already in the past — this method is
+        # neutered. The original migration ran on 2026-04-19; by now
+        # all production data is post-cleanup. A fresh DB restored from
+        # a pre-2026-04-19 snapshot during disaster recovery would be
+        # served by the same cleanup running through the regular
+        # `_apply_once` path (idempotent), not by this destructive
+        # belt-and-suspenders helper. Leave the sentinel so legacy
+        # `_run_migrations` callsites don't crash on a missing method.
+        sunset = datetime(2026, 4, 18, tzinfo=timezone.utc)
         if datetime.now(timezone.utc) > sunset:
             logger.warning(
                 "cleanup_2026_04_19: refusing to run past sunset %s — "
@@ -1135,7 +1143,9 @@ class Database:
             }
         return await self._execute(_op)
 
-    async def delete_user_data(self, user_id: int) -> dict:
+    async def delete_user_data(
+        self, user_id: int, telegram_id: int | None = None,
+    ) -> dict:
         """152-ФЗ Art. 14 right of erasure — hard-delete the user.
 
         Subscriptions and sent_items cascade on FK. Payments are
@@ -1149,29 +1159,43 @@ class Database:
         accepted: an attacker exploiting it pays via SIM rotation
         anyway, and we'd rather honor erasure cleanly than carry a
         deletion-resistant blocklist that itself becomes PII.
+
+        `telegram_id` should be passed by callers that already know it
+        (e.g. the /delete_my_account handler has it from
+        callback.from_user.id). When supplied, we take the advisory
+        lock FIRST — closing the TOCTOU window where a concurrent
+        get_or_create_user could re-INSERT the row between our SELECT
+        and DELETE. Falls back to read-then-lock when not supplied,
+        which is the legacy path with a known small race.
         """
         async def _op(conn):
             async with conn.transaction():
-                # Capture telegram_id BEFORE the DELETE so we can
-                # tombstone it. Without the tombstone, a late YooKassa
-                # webhook for a charge made before deletion would
-                # reincarnate the user via get_or_create_user (152-ФЗ
-                # Art. 14 erasure breach).
-                tg_id = await conn.fetchval(
-                    "SELECT telegram_id FROM users WHERE id = $1",
-                    user_id,
-                )
-                # Take the same telegram-id-scoped advisory lock that
-                # get_or_create_user takes, so a concurrent attempt to
-                # resurrect this user (a webhook that fired before our
-                # DELETE committed, a queued Telegram update) blocks
-                # behind us and reads the tombstone instead of
-                # creating a fresh row.
+                # Take the advisory lock as the FIRST statement when
+                # the caller knows the telegram_id — this guarantees
+                # that a concurrent get_or_create_user blocks behind
+                # us instead of slipping in between our row-read and
+                # tombstone-insert.
+                tg_id = telegram_id
                 if tg_id is not None:
                     await conn.execute(
                         "SELECT pg_advisory_xact_lock($1)",
                         _tg_advisory_lock_key(tg_id),
                     )
+                # Either resolve telegram_id under the lock (legacy
+                # path) or sanity-check that the row still belongs to
+                # the caller's tg_id (defensive — handler may pass
+                # stale user_id after a refund-then-delete).
+                row_tg_id = await conn.fetchval(
+                    "SELECT telegram_id FROM users WHERE id = $1",
+                    user_id,
+                )
+                if tg_id is None:
+                    tg_id = row_tg_id
+                    if tg_id is not None:
+                        await conn.execute(
+                            "SELECT pg_advisory_xact_lock($1)",
+                            _tg_advisory_lock_key(tg_id),
+                        )
                 payments_count = await conn.fetchval(
                     "SELECT COUNT(*) FROM payments WHERE user_id = $1",
                     user_id,
@@ -1191,6 +1215,28 @@ class Database:
                     "  (SELECT id FROM subscriptions WHERE user_id = $1)",
                     user_id,
                 ) or 0
+                # 152-ФЗ Art. 14 erasure must propagate to internal
+                # operational logs that hold the same telegram_id.
+                # Null out the target_telegram_id in admin_access_log;
+                # the action history (who acted, when, what category)
+                # remains for audit, but the tie to the deleted person
+                # is removed. data_subject_requests is the legally
+                # required register of erasure requests itself
+                # (152-ФЗ Art. 18.1 ч.7) — we keep the row and the
+                # telegram_id as the audit trail, but scrub `outcome`
+                # which may contain PII payload from the original
+                # interaction.
+                if tg_id is not None:
+                    await conn.execute(
+                        "UPDATE admin_access_log SET target_telegram_id = NULL "
+                        "WHERE target_telegram_id = $1",
+                        tg_id,
+                    )
+                    await conn.execute(
+                        "UPDATE data_subject_requests SET outcome = '{}'::jsonb "
+                        "WHERE telegram_id = $1 AND request_type != 'delete'",
+                        tg_id,
+                    )
                 # ON DELETE CASCADE on subscriptions and sent_items wipes
                 # them when the user row is removed.
                 await conn.execute("DELETE FROM users WHERE id = $1", user_id)
