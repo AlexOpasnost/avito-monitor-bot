@@ -608,10 +608,18 @@ async def cmd_ping(message: Message):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    tg_id = message.from_user.id
+    logger.info("[start] entered tg_id=%s admin=%s", tg_id, is_admin(tg_id))
     user_id = await db.get_or_create_user(
-        message.from_user.id, message.from_user.username,
+        tg_id, message.from_user.username,
     )
     prefs = await db.get_user_prefs(user_id)
+    logger.info(
+        "[start] prefs tg_id=%s onboarded=%s consent=%r required_channel=%r",
+        tg_id, prefs.get("onboarded"),
+        prefs.get("consent_policy_version"),
+        config.required_channel,
+    )
 
     # Re-consent gate: existing users on an older policy version must
     # explicitly accept the current one before continuing. New users
@@ -623,6 +631,7 @@ async def cmd_start(message: Message):
     # shouldn't be funnelled into the channel-subscribe condition
     # (which is itself one of the new ToS items).
     if not await _reconsent_passes(message, prefs):
+        logger.info("[start] bailed at reconsent gate tg_id=%s", tg_id)
         return
 
     # Reactivate paused subs ONLY if the user still has the tariff to
@@ -631,18 +640,24 @@ async def cmd_start(message: Message):
     # which kept the scheduler fetching marketplace pages for users
     # who couldn't actually receive the notifications (gated by
     # has_active_tariff in the scheduler) — pure proxy/CPU waste.
-    if is_admin(message.from_user.id) or await db.has_active_tariff(message.from_user.id):
+    if is_admin(tg_id) or await db.has_active_tariff(tg_id):
         await db.reactivate_all(user_id)
 
     # Channel-subscribe gate (REQUIRED_CHANNEL env var). No-op when
     # disabled or when the bot can't introspect the channel.
     if not await _channel_gate_passes(message):
+        logger.info("[start] bailed at channel gate tg_id=%s", tg_id)
         return
 
+    logger.info(
+        "[start] rendering %s tg_id=%s",
+        "main_menu" if prefs.get("onboarded") else "hero", tg_id,
+    )
     if prefs.get("onboarded"):
         await _show_main_menu(message, prefs)
     else:
         await _show_hero(message)
+    logger.info("[start] rendered ok tg_id=%s", tg_id)
 
 
 @router.callback_query(F.data == "reconsent:accept")
