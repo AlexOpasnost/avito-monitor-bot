@@ -81,7 +81,17 @@ router.message.filter(F.chat.type == "private")
 # "account deleted" response the privacy policy promises.
 @router.errors()
 async def on_user_tombstoned(event: ErrorEvent):
-    if not isinstance(event.exception, UserTombstonedError):
+    exc = event.exception
+    if not isinstance(exc, UserTombstonedError):
+        # Surface the exception type/message into the log so we don't
+        # have a black hole when something OTHER than tombstone raises
+        # inside a handler. aiogram's default logger prints it too,
+        # but only at ERROR — making this our second canary if Sentry
+        # routing changes.
+        logger.error(
+            "[errors] non-tombstone exception in handler: %s: %s",
+            type(exc).__name__, exc, exc_info=exc,
+        )
         return False
     update = event.update
     target = None
@@ -105,12 +115,19 @@ async def on_user_tombstoned(event: ErrorEvent):
     )
     if config.support_handle:
         text += f"\n\n💬 Поддержка: {config.support_handle}"
+    tg_id = getattr(getattr(target, "from_user", None), "id", None)
+    logger.info("[tombstone] showing screen to tg_id=%s", tg_id)
     try:
         await target.answer(text, parse_mode="HTML")
-    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.info("[tombstone] reply sent ok to tg_id=%s", tg_id)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
         # User blocked the bot or the message is somehow malformed —
         # nothing else we can do. Don't re-raise.
-        pass
+        logger.warning(
+            "[tombstone] reply failed for tg_id=%s: %s", tg_id, e,
+        )
+    except Exception:
+        logger.exception("[tombstone] reply unexpected fail tg_id=%s", tg_id)
     return True
 
 
