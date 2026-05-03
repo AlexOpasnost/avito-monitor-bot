@@ -18,6 +18,19 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from aiogram.types import BufferedInputFile
 
+# Hard-import the exception classes we catch below. The previous
+# `try/except ImportError: TelegramRetryAfter = Exception` fallback
+# was the same family of silent-fail that produced the asyncpg
+# OverflowError → cmd_start silently dies bug: if the import ever
+# breaks (lib upgrade, refactor), every `except TelegramRetryAfter:`
+# clause downgrades to `except Exception:`, swallowing every error
+# in the bot's send path as a 429 retry-after — masking real bugs.
+# Fail-fast at boot is far better than fail-silent at runtime.
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+
 from config import config
 from database import db
 from parser import (
@@ -83,10 +96,7 @@ async def _notify_user_sub_deactivated(bot: Bot, sub: dict) -> None:
     tg_id = sub.get("telegram_id")
     if not tg_id:
         return
-    try:
-        from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-    except ImportError:
-        TelegramForbiddenError = TelegramRetryAfter = Exception
+    # Aiogram exception types now imported at module top.
     try:
         await bot.send_message(
             tg_id,
@@ -145,10 +155,7 @@ async def _tariff_renewal_funnel(bot: Bot, stop_event: asyncio.Event):
     except asyncio.TimeoutError:
         pass
 
-    try:
-        from aiogram.exceptions import TelegramForbiddenError
-    except ImportError:
-        TelegramForbiddenError = Exception
+    # Aiogram exception types now imported at module top.
 
     while not stop_event.is_set():
         try:
@@ -592,15 +599,7 @@ async def _process_items(sub: dict, items: list[SearchItem], bot: Bot):
             sub["id"], tg_id, len(to_send),
         )
 
-    # Telegram-specific exception types for cleaner classification.
-    # Imported lazily to avoid coupling tests to aiogram internals.
-    try:
-        from aiogram.exceptions import (
-            TelegramForbiddenError,
-            TelegramRetryAfter,
-        )
-    except ImportError:
-        TelegramForbiddenError = TelegramRetryAfter = Exception
+    # Telegram-specific exception types now imported at module top.
 
     sent_keys: set[tuple[str, str]] = set()
     user_blocked_us = False

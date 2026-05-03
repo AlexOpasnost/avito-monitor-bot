@@ -11,6 +11,10 @@ only public surface.
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # ISO-4217 → USD value of 1 unit. Add new currencies here.
 USD_RATES: dict[str, float] = {
@@ -69,6 +73,15 @@ def convert(value: float | int, src: str, dst: str) -> float | None:
     sr = USD_RATES.get(s)
     dr = USD_RATES.get(d)
     if not sr or not dr:
+        # Surface the unknown pair once so a misconfigured user-prefs
+        # row (currency code we don't have a rate for, or a marketplace
+        # returning a brand-new currency) is visible in logs instead
+        # of silently rendering as "no estimate".
+        if s != d:
+            logger.warning(
+                "[currency] unknown pair src=%r dst=%r — sr=%r dr=%r",
+                s, d, sr, dr,
+            )
         return None
     usd = float(value) * sr
     return usd / dr

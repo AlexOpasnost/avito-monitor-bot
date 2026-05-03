@@ -749,11 +749,18 @@ async def callback_gate_check(callback: CallbackQuery):
             show_alert=True,
         )
         return
-    await callback.answer("✅ Спасибо! Доступ открыт.")
     user_id = await db.get_or_create_user(
         callback.from_user.id, callback.from_user.username,
     )
     prefs = await db.get_user_prefs(user_id)
+    # Defensive: a stale gate-screen click from a queued callback
+    # could otherwise let a user past the channel gate without first
+    # accepting the current ToS version. cmd_start enforces this in
+    # the normal flow; backstop it here too.
+    if not await _reconsent_passes(callback, prefs):
+        await callback.answer()
+        return
+    await callback.answer("✅ Спасибо! Доступ открыт.")
     if prefs.get("onboarded"):
         await _show_main_menu(callback, prefs)
     else:
@@ -1364,7 +1371,11 @@ async def cmd_cancel_buy(message: Message, state: FSMContext):
 async def handle_email_input(message: Message, state: FSMContext):
     if await _warn_if_url_during_fsm(message, "email для чека"):
         return
-    raw = (message.text or "").strip()
+    # Lowercase the email so YooKassa fiscal receipts match across
+    # repeat purchases by the same user typing different cases on
+    # different devices (`Foo@bar.co` vs `foo@bar.co` would otherwise
+    # produce two distinct customer records and split fiscal history).
+    raw = (message.text or "").strip().lower()
     if not _EMAIL_RE.match(raw):
         await message.answer(
             "Это не похоже на email. Пришли в формате <code>name@example.com</code> "
@@ -1702,6 +1713,20 @@ async def cmd_export_my_data(message: Message):
         return
     payload = json.dumps(_serialize_for_export(data), ensure_ascii=False, indent=2)
     blob = payload.encode("utf-8")
+    # Defensive cap: a user with a freak amount of data (or a future
+    # bug bloating the export shape) shouldn't be able to OOM the
+    # bot or hit Telegram's 50 MB document limit. 20 MB is well above
+    # any realistic export and well under the 50 MB API ceiling.
+    if len(blob) > 20 * 1024 * 1024:
+        logger.warning(
+            "[export] payload too large for tg_id=%s (%d bytes)",
+            message.from_user.id, len(blob),
+        )
+        await message.answer(
+            "Слишком большой объём данных для пересылки в чат — "
+            "напиши в поддержку, выгрузим вручную и пришлём ссылкой."
+        )
+        return
     file = BufferedInputFile(blob, filename=f"autosearch_export_{user_id}.json")
     await message.answer_document(
         file,
@@ -1855,6 +1880,12 @@ async def cmd_admin(message: Message):
             target_tg = int(raw[2])
         except ValueError:
             await message.answer("Использование: /admin user &lt;telegram_id&gt;")
+            return
+        # Bound the value to signed int64 so a 50-digit typo doesn't
+        # crash on asyncpg int8 OverflowError downstream — same family
+        # as the R10 advisory-lock overflow that hid /start for days.
+        if not (-(1 << 63) <= target_tg < (1 << 63)):
+            await message.answer("Telegram ID вне допустимого диапазона.")
             return
         await _audit("admin:user", target_tg)
         await _admin_user_detail(message, target_tg)

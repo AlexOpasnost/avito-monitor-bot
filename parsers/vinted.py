@@ -95,8 +95,12 @@ _LD_JSON_RE = re.compile(
 # Vinted code paths emits them in either order. Both groups capture
 # the city,country string; whichever group matched, we consume.
 _LOCATION_RE = re.compile(
-    r'\\"text\\":\\"([^"]+?)\\",\\"key\\":\\"location\\"'
-    r'|\\"key\\":\\"location\\",\\"text\\":\\"([^"]+?)\\"'
+    # Length-bounded char class (`{1,200}`) makes backtracking bounded
+    # per starting position — a real city,country string is well
+    # under 100 chars, and the search window is already capped at
+    # 500 KB for a second-line ReDoS defence.
+    r'\\"text\\":\\"([^"]{1,200}?)\\",\\"key\\":\\"location\\"'
+    r'|\\"key\\":\\"location\\",\\"text\\":\\"([^"]{1,200}?)\\"'
 )
 
 # Fallback patterns — some items omit the user_info "location" entry

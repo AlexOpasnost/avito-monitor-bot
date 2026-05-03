@@ -30,34 +30,76 @@ from services.yookassa import YooKassaError, get_payment, get_refund
 logger = logging.getLogger(__name__)
 
 
+# Networks from which we trust X-Real-IP / X-Forwarded-For headers.
+# Railway routes inbound traffic through its edge proxy on a private
+# network (10.0.0.0/8 on Railway, 100.64.0.0/10 in Fly-style CGNAT,
+# loopback for local dev). If the connection's PEER address is NOT
+# inside one of these ranges, the headers are attacker-set and must
+# be ignored — otherwise anyone who finds the public aiohttp listener
+# directly (Railway co-tenant, future infra without edge proxy,
+# port-forwarded local) can spoof `X-Real-IP: 185.71.76.5` and walk
+# straight past the YooKassa IP gate.
+_TRUSTED_PROXY_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),     # loopback
+    ipaddress.ip_network("::1/128"),         # IPv6 loopback
+    ipaddress.ip_network("10.0.0.0/8"),      # RFC1918 (Railway internal)
+    ipaddress.ip_network("172.16.0.0/12"),   # RFC1918
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC1918
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT (some PaaS)
+    ipaddress.ip_network("fc00::/7"),        # IPv6 ULA
+    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
+]
+
+
+def _peer_is_trusted_proxy(request: web.Request) -> bool:
+    """True iff the immediate TCP peer is on a network where we trust
+    forwarding headers. The `request.remote` aiohttp field already
+    reflects the peer (when no upstream proxy at all is in use it's
+    the actual client IP — but in that case headers are absent, so
+    `_client_ip` short-circuits to `request.remote` anyway)."""
+    peer = request.remote
+    if not peer:
+        return False
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    for net in _TRUSTED_PROXY_NETS:
+        try:
+            if peer_ip in net:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _client_ip(request: web.Request) -> str | None:
     """Resolve the real client IP behind Railway's edge proxy.
 
-    Security note: the **leftmost** entry of `X-Forwarded-For` is fully
-    attacker-controlled — any HTTP client can set
-    `X-Forwarded-For: 185.71.76.5, real-attacker-ip` and the leftmost
-    value will look like a YooKassa CIDR even though the connection
-    came from somewhere else. The previous code did exactly that and
-    was bypassable by anyone who could reach the aiohttp listener
-    directly (Railway internal network co-tenants, future re-deploys
-    without an edge proxy, or local dev).
+    Security note: forwarding headers (`X-Real-IP`, `X-Forwarded-For`)
+    are entirely attacker-controlled when the connection arrives
+    directly from the public internet. Trust them only when the
+    immediate peer is on a private/loopback network — i.e. an
+    upstream proxy *we* control. From the public internet, fall back
+    to `request.remote` (the actual TCP source) and let the YooKassa
+    CIDR check naturally reject it.
 
-    Correct trust model: trust the **rightmost** hop that *we*
-    appended (the one closest to our server). Railway's edge sets
-    `X-Real-IP` to the canonical client address after stripping the
-    untrusted leftmost entries, so prefer that when present. Fall back
-    to the rightmost X-Forwarded-For entry, then to the peer remote.
+    The previous code did exactly the wrong thing and was bypassable
+    by anyone who could reach the aiohttp listener directly (Railway
+    internal network co-tenants, future re-deploys without an edge
+    proxy, or local dev).
     """
-    real_ip = request.headers.get("X-Real-IP", "").strip()
-    if real_ip:
-        return real_ip
-    fwd = request.headers.get("X-Forwarded-For", "").strip()
-    if fwd:
-        # Rightmost = the IP the upstream proxy *we* trust observed.
-        # Leftmost is whatever the client typed and is forgeable.
-        parts = [p.strip() for p in fwd.split(",") if p.strip()]
-        if parts:
-            return parts[-1]
+    if _peer_is_trusted_proxy(request):
+        real_ip = request.headers.get("X-Real-IP", "").strip()
+        if real_ip:
+            return real_ip
+        fwd = request.headers.get("X-Forwarded-For", "").strip()
+        if fwd:
+            # Rightmost = the IP the upstream proxy *we* trust observed.
+            # Leftmost is whatever the client typed and is forgeable.
+            parts = [p.strip() for p in fwd.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
     return request.remote
 
 
