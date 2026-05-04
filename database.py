@@ -1874,6 +1874,89 @@ class Database:
             }
         return await self._execute(_op)
 
+    async def get_health_snapshot(self) -> dict:
+        """Fast pulse-check for the /admin health command.
+
+        Returns a flat dict the handler can render line-by-line. All
+        windows are «right now» — designed for a sub-second response
+        even at thousands of subs / payments. Heavier admin analytics
+        live in `get_admin_stats`."""
+        async def _op(conn):
+            # — Subs: per-source last_checked_at + per-status counts
+            #   so the handler can flag "kufar last fetch was 30 min
+            #   ago" without computing it client-side.
+            per_source_rows = await conn.fetch(
+                "SELECT source, "
+                "       COUNT(*) FILTER (WHERE is_active AND NOT deleted) AS active, "
+                "       COUNT(*) FILTER (WHERE NOT is_active AND NOT deleted) AS paused, "
+                "       MAX(last_checked_at) FILTER (WHERE is_active AND NOT deleted) AS last_checked "
+                "FROM subscriptions "
+                "GROUP BY source "
+                "ORDER BY source"
+            )
+            sub_totals = await conn.fetchrow(
+                "SELECT "
+                "  COUNT(*) FILTER (WHERE is_active AND NOT deleted) AS active, "
+                "  COUNT(*) FILTER (WHERE NOT is_active AND NOT deleted) AS paused, "
+                "  COUNT(*) FILTER (WHERE deleted) AS deleted, "
+                "  COUNT(*) FILTER (WHERE is_active AND NOT deleted "
+                "                       AND error_count >= 3) AS errored "
+                "FROM subscriptions"
+            )
+            # — Users: paid-active right now + tombstones for erasure
+            #   ledger sanity.
+            user_counts = await conn.fetchrow(
+                "SELECT "
+                "  COUNT(*) AS total, "
+                "  COUNT(*) FILTER (WHERE tariff IN ('basic','advanced','pro') "
+                "                       AND tariff_expires_at > NOW()) AS paid_active, "
+                "  COUNT(*) FILTER (WHERE tariff = 'trial' "
+                "                       AND tariff_expires_at > NOW()) AS trial_active, "
+                "  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS new_24h "
+                "FROM users"
+            )
+            tombstones = await conn.fetchval(
+                "SELECT COUNT(*) FROM tombstoned_users"
+            )
+            # — Payments: success / refund counters in 1h and 24h.
+            pay_1h = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt, "
+                "       COALESCE(SUM(amount_minor), 0) AS sum_minor "
+                "FROM payments WHERE created_at > NOW() - INTERVAL '1 hour'"
+            )
+            pay_24h = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt, "
+                "       COALESCE(SUM(amount_minor), 0) AS sum_minor "
+                "FROM payments WHERE created_at > NOW() - INTERVAL '24 hours'"
+            )
+            refund_24h = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt, "
+                "       COALESCE(SUM(amount_minor), 0) AS sum_minor "
+                "FROM refunds WHERE created_at > NOW() - INTERVAL '24 hours'"
+            )
+            last_payment_at = await conn.fetchval(
+                "SELECT MAX(created_at) FROM payments"
+            )
+            # — НПД ceiling: rolling 365-day revenue (matches the
+            #   soft-block logic in handlers._npd_ceiling_hit).
+            npd_minor = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount_minor), 0) FROM payments "
+                "WHERE created_at > NOW() - INTERVAL '365 days' "
+                "  AND user_id != -1"
+            ) or 0
+            return {
+                "per_source": [dict(r) for r in per_source_rows],
+                "sub_totals": dict(sub_totals) if sub_totals else {},
+                "user_counts": dict(user_counts) if user_counts else {},
+                "tombstones": tombstones or 0,
+                "pay_1h": dict(pay_1h) if pay_1h else {"cnt": 0, "sum_minor": 0},
+                "pay_24h": dict(pay_24h) if pay_24h else {"cnt": 0, "sum_minor": 0},
+                "refund_24h": dict(refund_24h) if refund_24h else {"cnt": 0, "sum_minor": 0},
+                "last_payment_at": last_payment_at,
+                "npd_minor": int(npd_minor),
+            }
+        return await self._execute(_op)
+
     async def get_admin_user_list(self, limit: int = 30) -> list[dict]:
         """Latest paid users, newest first. Each row carries enough
         info to render a one-line summary in the admin panel."""

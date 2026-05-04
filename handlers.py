@@ -40,7 +40,7 @@ from aiogram.types import (
     Message,
 )
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from services import yookassa as yk
 
@@ -1871,6 +1871,10 @@ async def cmd_admin(message: Message):
                 admin_tg, action, target,
             )
 
+    if len(raw) >= 2 and raw[1] == "health":
+        await _audit("admin:health", None)
+        await _admin_health(message)
+        return
     if len(raw) >= 2 and raw[1] == "users":
         await _audit("admin:users", None)
         await _admin_users_list(message)
@@ -1949,9 +1953,161 @@ async def _admin_dashboard(message: Message):
         f"  За 24ч: <b>{stats['sent_24h']:,}</b>\n"
         f"  Последняя проверка: <b>{last_checked_str}</b>\n\n"
         f"<i>/admin users — список платящих\n"
-        f"/admin user &lt;tg_id&gt; — детали юзера</i>",
+        f"/admin user &lt;tg_id&gt; — детали юзера\n"
+        f"/admin health — pulse-check инфраструктуры</i>",
         parse_mode="HTML",
     )
+
+
+def _fmt_age(ts) -> str:
+    """«5 мин назад» / «2 ч назад» / «3 дн назад» — short relative
+    age renderer for the health screen. Returns «—» when ts is None."""
+    if ts is None:
+        return "—"
+    now = datetime.now(timezone.utc)
+    if getattr(ts, "tzinfo", None) is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    delta = now - ts
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "только что"
+    if seconds < 60:
+        return f"{seconds} сек назад"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч назад"
+    days = hours // 24
+    return f"{days} дн назад"
+
+
+def _health_source_marker(last_checked, expected_interval_sec: int = 180) -> str:
+    """Pick a green/yellow/red marker for a per-source row based on
+    how long since the last successful fetch. The default 180s is 3×
+    the 60s scheduler interval — anything older than that is
+    suspicious for a source that has at least one active sub."""
+    if last_checked is None:
+        return "⚪"
+    now = datetime.now(timezone.utc)
+    if getattr(last_checked, "tzinfo", None) is None:
+        last_checked = last_checked.replace(tzinfo=timezone.utc)
+    age = (now - last_checked).total_seconds()
+    if age < expected_interval_sec:
+        return "✅"
+    if age < expected_interval_sec * 3:
+        return "🟡"
+    return "🔴"
+
+
+async def _admin_health(message: Message):
+    """One-shot pulse-check of the bot's infrastructure for the
+    operator. Designed for «something feels off, what's broken?»
+    diagnostics — green/yellow/red markers per source, money in the
+    last hour and 24 hours, NPD ceiling progress, tombstone count.
+    Heavier per-user analytics live in /admin and /admin users."""
+    try:
+        snap = await db.get_health_snapshot()
+    except Exception:
+        logger.exception("[admin:health] snapshot failed")
+        await message.answer(
+            "❌ Не удалось собрать health-snapshot — проверь логи.",
+        )
+        return
+
+    now_msk = datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=3))
+    )
+    lines: list[str] = [
+        f"🩺 <b>Health</b> ({now_msk.strftime('%H:%M:%S %d.%m')} МСК)",
+    ]
+
+    # — Sources
+    src_rows = snap.get("per_source") or []
+    if src_rows:
+        lines.append("\n📡 <b>Парсеры</b> (последний успешный fetch)")
+        for row in src_rows:
+            src = row["source"]
+            active = int(row.get("active") or 0)
+            paused = int(row.get("paused") or 0)
+            last_checked = row.get("last_checked")
+            marker = (
+                _health_source_marker(last_checked) if active > 0 else "⚪"
+            )
+            tail = ""
+            if paused:
+                tail = f"  <i>({paused} paused)</i>"
+            lines.append(
+                f"{marker} {source_display_name(src)} — "
+                f"{_fmt_age(last_checked)}, активных: {active}{tail}"
+            )
+    else:
+        lines.append("\n📡 <b>Парсеры:</b> подписок ещё нет")
+
+    # — Subs aggregate
+    s = snap.get("sub_totals") or {}
+    lines.append(
+        "\n📋 <b>Подписки</b>\n"
+        f"  Активных: {int(s.get('active') or 0)}\n"
+        f"  На паузе: {int(s.get('paused') or 0)}\n"
+        f"  Удалённых (soft): {int(s.get('deleted') or 0)}\n"
+        f"  С ошибками (≥3): {int(s.get('errored') or 0)}"
+    )
+
+    # — Users
+    u = snap.get("user_counts") or {}
+    lines.append(
+        "\n👥 <b>Юзеры</b>\n"
+        f"  Всего: {int(u.get('total') or 0)} "
+        f"(новых за 24ч: {int(u.get('new_24h') or 0)})\n"
+        f"  Платных активных: {int(u.get('paid_active') or 0)}\n"
+        f"  На пробном: {int(u.get('trial_active') or 0)}\n"
+        f"  Удалённых (tombstone): {int(snap.get('tombstones') or 0)}"
+    )
+
+    # — Money
+    p1 = snap.get("pay_1h") or {}
+    p24 = snap.get("pay_24h") or {}
+    r24 = snap.get("refund_24h") or {}
+    last_pay = snap.get("last_payment_at")
+    lines.append(
+        "\n💰 <b>Платежи</b>\n"
+        f"  За 1ч: {int(p1.get('cnt') or 0)} "
+        f"({(int(p1.get('sum_minor') or 0)) // 100} ₽)\n"
+        f"  За 24ч: {int(p24.get('cnt') or 0)} "
+        f"({(int(p24.get('sum_minor') or 0)) // 100} ₽)\n"
+        f"  Возвраты за 24ч: {int(r24.get('cnt') or 0)} "
+        f"({(int(r24.get('sum_minor') or 0)) // 100} ₽)\n"
+        f"  Последний платёж: {_fmt_age(last_pay)}"
+    )
+
+    # — НПД ceiling. Format thousands with thin spaces so the operator
+    # can read "2 400 000" at a glance instead of "2400000".
+    def _rub(n: int) -> str:
+        return f"{n:_}".replace("_", " ")
+
+    npd_minor = int(snap.get("npd_minor") or 0)
+    npd_limit_minor = max(1, config.npd_annual_limit_rub * 100)
+    npd_pct = round(npd_minor * 100 / npd_limit_minor, 1)
+    npd_marker = "✅" if npd_pct < 80 else ("🟡" if npd_pct < 100 else "🔴")
+    lines.append(
+        "\n🪙 <b>НПД (за 365 дней)</b>\n"
+        f"  {npd_marker} {_rub(npd_minor // 100)} ₽ / "
+        f"{_rub(config.npd_annual_limit_rub)} ₽ ({npd_pct}%)"
+    )
+
+    # — Config gates
+    lines.append(
+        "\n⚙️ <b>Конфиг</b>\n"
+        f"  REQUIRED_CHANNEL: {config.required_channel or '—'}\n"
+        f"  Disabled sources: "
+        f"{', '.join(config.disabled_sources) if config.disabled_sources else '—'}\n"
+        f"  Sentry: {'✅' if config.sentry_dsn else '⚪'}\n"
+        f"  Policy ver.: {config.consent_policy_version}"
+    )
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 async def _admin_users_list(message: Message):
