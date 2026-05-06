@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
@@ -745,13 +746,142 @@ _TRANSLATE_CACHE: dict[tuple[int, str], str] = {}
 _TRANSLATE_CACHE_MAX = 4000
 
 
+# Brand names that must NOT be machine-translated. Google Translate
+# happily turns "Stone Island" into "Каменный остров" and "Polo Ralph
+# Lauren" into "Поло Ральф Лорен" — both nonsense to a buyer who's
+# searching for the actual brand. We freeze each match into a neutral
+# placeholder before translation and restore the original casing
+# afterwards.
+#
+# Order matters: longer multi-word brands MUST appear before their
+# shorter substrings (e.g. "Polo Ralph Lauren" before "Polo" /
+# "Ralph Lauren") so the regex alternation matches the longest variant
+# first. The list below is sorted by length when the regex is built.
+#
+# Add new brands here as they come up in user complaints. Editing one
+# constant is intentional vs. an env var — we want every operator to
+# get the same brand list and a code review to see new entries.
+_PROTECTED_BRANDS_RAW: list[str] = [
+    # Luxury
+    "Stone Island", "Louis Vuitton", "Gucci", "Prada", "Balenciaga",
+    "Christian Dior", "Dior", "Chanel", "Hermès", "Hermes",
+    "Burberry", "Versace", "Givenchy",
+    "Yves Saint Laurent", "Saint Laurent", "YSL",
+    "Fendi", "Valentino", "Bottega Veneta", "Bvlgari", "Cartier",
+    "Tiffany & Co", "Tiffany",
+    "Maison Margiela", "Margiela", "MM6",
+    "Comme des Garçons", "Comme des Garcons", "CDG",
+    "Off-White", "Off White",
+    "Vetements", "Yeezy", "Supreme", "Palace", "Bape", "A Bathing Ape",
+    "Kith", "Aimé Leon Dore", "Aime Leon Dore", "ALD",
+    "Fear of God", "Essentials",
+    "Acne Studios", "Acne",
+    "Rick Owens", "Raf Simons", "Jacquemus",
+    "Yohji Yamamoto", "JW Anderson", "Lemaire",
+    "Loro Piana", "Brunello Cucinelli",
+    "Loewe", "Kenzo", "Marni",
+    "Dolce & Gabbana", "Dolce&Gabbana", "D&G",
+    "Tom Ford", "Brioni", "Etro",
+    "Ermenegildo Zegna", "Zegna",
+    "Moncler", "Canada Goose",
+    "Maison Kitsuné", "Maison Kitsune",
+    "C.P. Company", "CP Company",
+    "Paul & Shark", "Paul Shark",
+    "Chrome Hearts",
+    # Sportswear / Streetwear
+    "Air Jordan", "Jordan", "Air Force",
+    "Nike", "Adidas", "Puma", "Reebok",
+    "New Balance", "Converse", "Vans",
+    "Asics", "Salomon", "Patagonia",
+    "The North Face", "North Face",
+    "Arc'teryx", "Arcteryx", "Columbia", "Marmot", "Mammut",
+    "Carhartt", "Dickies",
+    "Levi's", "Levis", "Wrangler",
+    "Diesel", "Replay", "G-Star", "G Star",
+    # Premium / Premium-mass
+    "Polo Ralph Lauren", "Ralph Lauren",
+    "Tommy Hilfiger", "Lacoste",
+    "Hugo Boss",
+    "Calvin Klein",
+    "Emporio Armani", "Giorgio Armani", "Armani",
+    "Fred Perry",
+    # Watches
+    "Patek Philippe", "Audemars Piguet",
+    "Vacheron Constantin",
+    "Tag Heuer", "Rolex", "Omega",
+    "IWC", "Breitling", "Seiko", "Casio", "G-Shock", "Hublot",
+    # Tech (avito sells everything)
+    "MacBook", "AirPods", "iPad", "iPhone",
+    "Apple", "Samsung Galaxy", "Galaxy",
+    "Samsung", "Sony", "Bose", "Beats",
+    "Xiaomi", "Redmi", "Google Pixel", "Pixel",
+    "PlayStation", "Xbox", "Nintendo",
+]
+
+# Build the matcher once. Sort by length descending so multi-word
+# brands win over their substrings under regex alternation.
+_PROTECTED_BRANDS_SORTED = sorted(
+    {b for b in _PROTECTED_BRANDS_RAW if b.strip()},
+    key=len, reverse=True,
+)
+_BRAND_RE = re.compile(
+    r"(?<![\w])(" + "|".join(re.escape(b) for b in _PROTECTED_BRANDS_SORTED) + r")(?![\w])",
+    flags=re.IGNORECASE,
+)
+# Placeholder pattern: ASCII word characters + digit, surrounded by
+# underscores. Google Translate consistently preserves this shape
+# (we tested the alternatives — `{0}`, `[[B0]]`, emoji — and saw
+# Google occasionally translate or strip them; this token shape
+# survives every language tested).
+_BRAND_PLACEHOLDER_RE = re.compile(r"_BRZ(\d+)_")
+
+
+def _freeze_brands(text: str) -> tuple[str, list[str]]:
+    """Replace every brand match with `_BRZ{i}_` placeholders. Returns
+    `(modified_text, original_matches_in_order)` so the caller can
+    restore them after translation. Empty match list means the text
+    had no protected brands and translation can proceed unchanged."""
+    if not text:
+        return text, []
+    matches: list[str] = []
+    def _sub(m: re.Match) -> str:
+        idx = len(matches)
+        matches.append(m.group(0))
+        return f"_BRZ{idx}_"
+    return _BRAND_RE.sub(_sub, text), matches
+
+
+def _unfreeze_brands(text: str, matches: list[str]) -> str | None:
+    """Substitute `_BRZ{i}_` placeholders back to the original brand
+    matches. Returns None if any placeholder went missing in the
+    translated string — this signals "translator ate the placeholder"
+    and the caller should fall back to the un-translated original
+    rather than serve a notification with a half-stripped brand."""
+    if not matches:
+        return text
+    found_indexes = {int(m.group(1)) for m in _BRAND_PLACEHOLDER_RE.finditer(text)}
+    expected = set(range(len(matches)))
+    if not expected.issubset(found_indexes):
+        return None
+    def _sub(m: re.Match) -> str:
+        i = int(m.group(1))
+        return matches[i] if 0 <= i < len(matches) else m.group(0)
+    return _BRAND_PLACEHOLDER_RE.sub(_sub, text)
+
+
 async def _translate(text: str, target_lang: str) -> str:
     """Translate `text` into `target_lang` (ISO-639-1). Returns the
     original text unchanged on empty input or any library error.
 
+    Brand names from `_PROTECTED_BRANDS_RAW` are frozen into neutral
+    placeholders before translation and restored afterwards, so
+    "Polo Ralph Lauren" never becomes "Поло Ральф Лорен" in a Russian
+    user's notification.
+
     Result is memoised by (hash(text), target_lang) so different items
     quoting the same condition string ("Nuevo con etiquetas") only call
-    Google once per language.
+    Google once per language. The cache stores the post-unfreeze text,
+    so cache hits are already brand-safe.
     """
     if not text or not text.strip() or not target_lang:
         return text or ""
@@ -765,10 +895,12 @@ async def _translate(text: str, target_lang: str) -> str:
         logger.debug("[translate] deep_translator not installed")
         return text
 
+    frozen_text, brand_matches = _freeze_brands(text)
+
     def _sync_translate() -> str | None:
         try:
             return GoogleTranslator(source="auto", target=target_lang).translate(
-                text[:2500],
+                frozen_text[:2500],
             )
         except Exception as e:
             logger.debug("[translate] google err: %s", str(e)[:120])
@@ -788,6 +920,18 @@ async def _translate(text: str, target_lang: str) -> str:
             return text
     if not isinstance(result, str) or not result.strip():
         return text
+    # Restore brand placeholders. If Google Translate stripped or
+    # mangled them, fall back to the un-translated original — better
+    # to ship "Stone Island sweater original" untranslated than
+    # "Каменный остров свитер original" with a butchered brand name.
+    if brand_matches:
+        restored = _unfreeze_brands(result, brand_matches)
+        if restored is None:
+            logger.debug(
+                "[translate] brand placeholders lost — keeping original text"
+            )
+            return text
+        result = restored
     if len(_TRANSLATE_CACHE) > _TRANSLATE_CACHE_MAX:
         # Crude eviction: drop the oldest half. Order is insertion order
         # in CPython 3.7+, which is good enough for an LRU approximation.
