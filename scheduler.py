@@ -835,20 +835,74 @@ _BRAND_RE = re.compile(
 # survives every language tested).
 _BRAND_PLACEHOLDER_RE = re.compile(r"_BRZ(\d+)_")
 
+# Auto-detection pattern for brand-like tokens that aren't in the
+# explicit whitelist above. Catches things like:
+#   - ALL-CAPS acronyms (BMW, YSL, IWC, NBA, USB)
+#   - mixedCase (iPhone, eBay, MacBook)
+#   - alphanumeric model names (Galaxy S22, X100, M4, RTX3080)
+#   - TitleCase words containing punct (Off-White, Tiffany&Co)
+# Common English/Russian words ("sweater", "новый") are NOT matched.
+# A pure TitleCase single word ("Original", "Куртка") is NOT matched
+# either — too risky to auto-protect since the word may be a regular
+# capitalised noun at the start of a sentence.
+_AUTO_BRAND_TOKEN_RE = re.compile(
+    r"(?<![\w])"
+    r"("
+    # ALL-CAPS ≥ 2 chars (with optional internal digits/punct)
+    r"[A-Z]{2,}[A-Z0-9\-&'\.]*"
+    r"|"
+    # MixedCase: lowercase followed by uppercase (iPhone, eBay)
+    r"[a-z][a-zA-Z]*[A-Z][a-zA-Z0-9]*"
+    r"|"
+    # Alphanumeric model: letter+digit OR digit+letter inside one
+    # token (X100, S22, RTX3080, M4)
+    r"[A-Za-z]+\d+[A-Za-z0-9]*"
+    r"|"
+    r"\d+[A-Za-z]+[A-Za-z0-9]*"
+    r"|"
+    # TitleCase + internal hyphen / ampersand / apostrophe (Off-White,
+    # G-Shock, Tiffany&Co, Levi's-style possessive)
+    r"[A-Z][a-zA-Z]*[\-&][A-Za-z][a-zA-Z0-9\-&'\.]*"
+    r")"
+    r"(?![\w])"
+)
+
 
 def _freeze_brands(text: str) -> tuple[str, list[str]]:
     """Replace every brand match with `_BRZ{i}_` placeholders. Returns
     `(modified_text, original_matches_in_order)` so the caller can
     restore them after translation. Empty match list means the text
-    had no protected brands and translation can proceed unchanged."""
+    had no protected brands and translation can proceed unchanged.
+
+    Two-pass match: first the explicit whitelist
+    (`_PROTECTED_BRANDS_RAW`, longest-first so multi-word matches win),
+    then `_AUTO_BRAND_TOKEN_RE` for tokens that look like brands /
+    model identifiers but aren't in the whitelist (iPhone, BMW, S22,
+    Off-White, etc.). The auto-detector covers brands the operator
+    hasn't seen yet without bloating the whitelist."""
     if not text:
         return text, []
     matches: list[str] = []
+
     def _sub(m: re.Match) -> str:
         idx = len(matches)
         matches.append(m.group(0))
         return f"_BRZ{idx}_"
-    return _BRAND_RE.sub(_sub, text), matches
+
+    # Pass 1: explicit whitelist (longest-first via _PROTECTED_BRANDS_SORTED)
+    text = _BRAND_RE.sub(_sub, text)
+    # Pass 2: auto-detected brand-like tokens. Skip our own placeholders
+    # (they look like alphanumeric model names — `_BRZ0_` would
+    # otherwise re-match here and cause cross-talk).
+    def _auto_sub(m: re.Match) -> str:
+        token = m.group(0)
+        if _BRAND_PLACEHOLDER_RE.fullmatch(token):
+            return token
+        idx = len(matches)
+        matches.append(token)
+        return f"_BRZ{idx}_"
+    text = _AUTO_BRAND_TOKEN_RE.sub(_auto_sub, text)
+    return text, matches
 
 
 def _unfreeze_brands(text: str, matches: list[str]) -> str | None:
