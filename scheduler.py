@@ -1013,9 +1013,17 @@ async def _localise_item(
     if item.source not in _TRANSLATED_SOURCES:
         return item.title, item.description, item.condition, item.location
 
+    # Title is intentionally NEVER translated. Marketplace titles are
+    # near-universally a mash of brand name + a few Russian/English
+    # keywords ("Stone Island заархивировать сам", "Cp company зип
+    # худи"), and Google Translate turns the keyword half into
+    # nonsense ("копать", "заархивируйте"). The brand-protection
+    # placeholder approach helps but can't save a title that's 80%
+    # noise to begin with — leaving the title as-is is far better
+    # UX than a butchered re-rendering. Description / condition still
+    # translate (they're full sentences with real signal).
     pending: list[tuple[str, str]] = []
     for name, value in (
-        ("title", item.title),
         ("desc", item.description),
         ("cond", item.condition),
         ("location", item.location),
