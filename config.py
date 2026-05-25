@@ -104,6 +104,12 @@ class Config:
     # (production / staging / dev). Defaults to "production" because
     # that's where bugs that matter actually fire.
     sentry_environment: str = "production"
+    # Freshness window in hours: an item is only pushed to a user if
+    # it was published within this many hours. Default 6. Lower =
+    # only the freshest listings (deal-hunters chasing underpriced
+    # lots); higher = more lenient but risks forwarding re-bumped
+    # day-old listings. Override with MAX_AGE_HOURS env var.
+    max_age_hours: int = 6
     # Channel-subscribe gate shown on /start. Either a public username
     # ("@autoserch") or a numeric chat id ("-100…"). Empty = gate
     # disabled. The bot MUST be an administrator in the channel —
@@ -196,6 +202,7 @@ class Config:
             sentry_dsn=os.getenv("SENTRY_DSN", "").strip(),
             sentry_environment=os.getenv("SENTRY_ENVIRONMENT", "production").strip(),
             required_channel=os.getenv("REQUIRED_CHANNEL", "").strip(),
+            max_age_hours=int(os.getenv("MAX_AGE_HOURS", "6")),
         )
 
 

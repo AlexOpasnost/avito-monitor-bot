@@ -49,7 +49,19 @@ logger = logging.getLogger(__name__)
 
 MSK = timezone(timedelta(hours=3))
 MAX_ITEMS_PER_CYCLE = 10
-MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
+# Freshness window: an item is only pushed if it was published within
+# this many hours. Default 6h (was 48h — too wide: a seller re-bumping
+# a day-old listing pushed it back into the top-50 search page, the
+# bot saw a "new" external_id and forwarded yesterday's listing as if
+# it were fresh — a power user flagged this as "объявления второй
+# свежести"). 6h keeps genuine new listings (the scheduler catches
+# them within ~1 min of publication, so their timestamp is always
+# well inside the window) while cutting re-bumped stale ones.
+#
+# Override per-deployment with MAX_AGE_HOURS env var. Lower = more
+# aggressive "only the freshest" (good for deal-hunting users chasing
+# underpriced lots); higher = more lenient.
+MAX_AGE_SECONDS = config.max_age_hours * 3600
 
 
 def _parse_blacklist(raw) -> list[str]:
