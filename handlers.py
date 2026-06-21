@@ -282,7 +282,7 @@ def _extract_marketplace_url(message_or_text) -> tuple[str, str] | None:
 
     # Strip invisible unicode that iOS/Android Telegram sometimes injects
     for ch in ("​", "‌", "‍", "⁠", "­",
-               "﻿", " ", " ", " "):
+               "﻿", " ", "", ""):
         text = text.replace(ch, "")
     text = text.strip()
     # NOTE: do NOT replace ~ with - here — Avito's f= alphabet treats
@@ -633,47 +633,46 @@ async def cmd_ping(message: Message):
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     logger.info("[start] entered tg_id=%s admin=%s", tg_id, is_admin(tg_id))
+    # Hard reset on every /start: a user typing /start to escape a
+    # broken FSM state (mid-purchase email prompt, mid-rename input,
+    # mid-blacklist edit) must ALWAYS land back at the main menu —
+    # not get re-funnelled into the FSM step they were stuck in.
+    # `state.clear()` drops any current state + payload before we do
+    # anything else. Cheap (in-memory by default) and always-safe.
+    await state.clear()
     user_id = await db.get_or_create_user(
         tg_id, message.from_user.username,
     )
     prefs = await db.get_user_prefs(user_id)
     logger.info(
-        "[start] prefs tg_id=%s onboarded=%s consent=%r required_channel=%r",
+        "[start] prefs tg_id=%s onboarded=%s consent=%r",
         tg_id, prefs.get("onboarded"),
         prefs.get("consent_policy_version"),
-        config.required_channel,
     )
 
     # Re-consent gate: existing users on an older policy version must
     # explicitly accept the current one before continuing. New users
     # (onboarded=False) skip this — the onboarding wizard stamps them
-    # with the current version on completion. Runs BEFORE both
-    # reactivate_all and the channel gate: a user who hasn't accepted
-    # the new ToS shouldn't have their searches reactivated (would
-    # keep delivering notifications without a fresh consent) and
-    # shouldn't be funnelled into the channel-subscribe condition
-    # (which is itself one of the new ToS items).
+    # with the current version on completion.
     if not await _reconsent_passes(message, prefs):
         logger.info("[start] bailed at reconsent gate tg_id=%s", tg_id)
         return
 
     # Reactivate paused subs ONLY if the user still has the tariff to
     # back them. Admins also bypass — they always have access.
-    # Previously /start blanket-reactivated subs even after a refund,
-    # which kept the scheduler fetching marketplace pages for users
-    # who couldn't actually receive the notifications (gated by
-    # has_active_tariff in the scheduler) — pure proxy/CPU waste.
     if is_admin(tg_id) or await db.has_active_tariff(tg_id):
         await db.reactivate_all(user_id)
 
-    # Channel-subscribe gate (REQUIRED_CHANNEL env var). No-op when
-    # disabled or when the bot can't introspect the channel.
-    if not await _channel_gate_passes(message):
-        logger.info("[start] bailed at channel gate tg_id=%s", tg_id)
-        return
+    # Channel-subscribe gate was removed from cmd_start by operator
+    # request (2026-06-19): forcing every user through a channel-join
+    # screen hurt onboarding more than it helped distribution. The
+    # gate plumbing (_channel_gate_passes, callback_gate_check,
+    # config.required_channel) stays in place — if the operator
+    # later wants to bring it back, setting REQUIRED_CHANNEL in env
+    # and re-adding the guard here is a single-line revert.
 
     logger.info(
         "[start] rendering %s tg_id=%s",
