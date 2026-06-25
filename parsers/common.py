@@ -223,20 +223,61 @@ def proxies_dict(proxy: str | None) -> dict | None:
 _session_pool: dict[str, tuple[object, float]] = {}  # host -> (session, created_at)
 
 
+def _close_session_quietly(s) -> None:
+    """Best-effort cloudscraper/requests session close. Swallows
+    everything because we're often closing on a "session has stuck
+    sockets" path where the close itself might raise — but we still
+    want the underlying urllib3 connection pool drained so the
+    ephemeral ports can return to the OS."""
+    try:
+        s.close()
+    except Exception as e:
+        logger.debug("[session-close] swallowed: %s", str(e)[:100])
+
+
 def get_cloudscraper(host: str, warmup_urls: list[str] | None = None,
                     proxy: str | None = None) -> object:
     """Get-or-create cloudscraper session for the given host, with warmup.
-    Each host has its own session so cookies don't leak across sites."""
+    Each host has its own session so cookies don't leak across sites.
+
+    When a session ages past the 300s TTL we explicitly `s.close()`
+    the previous instance before creating a new one. Without that,
+    every TTL expiry leaked the prior session's urllib3 connection
+    pool (up to pool_maxsize=10 keep-alive TCP sockets per session) —
+    on Railway with a 60s scheduler interval and a hot proxy, this
+    surfaced as "high ephemeral port usage detected" warnings within
+    hours and eventually broke the proxy connect entirely.
+    """
     global _session_pool
     now = time.time()
     existing = _session_pool.get(host)
     if existing and (now - existing[1]) < 300:
         return existing[0]
+    # Either expired or never existed. If expired — close the stale
+    # one to release its sockets BEFORE we make a new one.
+    if existing:
+        _close_session_quietly(existing[0])
 
     import cloudscraper
     s = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
+    # Cap the urllib3 connection pool so a leaky path can't accumulate
+    # 10 keep-alive sockets per host. We only ever talk to 2-3 hosts
+    # per session (target + ipify + 1-2 warmup URLs); pool_maxsize=4
+    # is plenty and bounds the worst-case socket footprint per session
+    # at a predictable number. Without this, even with explicit close,
+    # a single session could briefly hold 10× more sockets than needed
+    # during warmup-storm scenarios.
+    try:
+        from requests.adapters import HTTPAdapter
+        adapter = HTTPAdapter(
+            pool_connections=4, pool_maxsize=4, pool_block=False,
+        )
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+    except Exception:
+        logger.debug("[%s] could not tighten adapter pool", host)
     ua = pick_user_agent()
     s.headers["User-Agent"] = ua
     logger.info("[%s] session created, UA=%s, id=%s", host, ua, id(s))
@@ -271,8 +312,25 @@ def get_cloudscraper(host: str, warmup_urls: list[str] | None = None,
 
 
 def invalidate_session(host: str) -> None:
-    """Drop cached session for host (use after IP rotation)."""
-    _session_pool.pop(host, None)
+    """Drop cached session for host (use after IP rotation). Closes the
+    underlying urllib3 connection pool so its keep-alive sockets release
+    immediately — previously they sat in TIME_WAIT for 60-120s and on a
+    busy bot caused Railway ephemeral-port exhaustion."""
+    existing = _session_pool.pop(host, None)
+    if existing:
+        _close_session_quietly(existing[0])
+
+
+def close_all_sessions() -> None:
+    """Close every cached cloudscraper session. Called from bot.py
+    shutdown so the urllib3 connection pools drain cleanly. On Railway
+    the container is killed anyway, but explicit cleanup helps for
+    local dev runs and prevents `ResourceWarning: unclosed socket`
+    noise during pytest tear-down."""
+    while _session_pool:
+        host, (s, _) = _session_pool.popitem()
+        _close_session_quietly(s)
+        logger.debug("[session-close] closed cached session for %s", host)
 
 
 # ---------------------------------------------------------------------------

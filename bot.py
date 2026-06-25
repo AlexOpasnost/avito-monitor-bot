@@ -269,6 +269,15 @@ async def main():
             await bot.session.close()
         except Exception:
             pass
+        # Drain cached cloudscraper sessions so their urllib3 pools
+        # release sockets cleanly (prevents ResourceWarning spam on
+        # local dev shutdown and helps if Railway gives us a graceful
+        # SIGTERM window before SIGKILL).
+        try:
+            from parsers.common import close_all_sessions
+            close_all_sessions()
+        except Exception:
+            logger.debug("[shutdown] close_all_sessions raised", exc_info=True)
         await db.close()
         logger.info("Bot stopped")
 
