@@ -83,10 +83,21 @@ async def _fetch_hydration_json(url: str, proxy: str | None):
         logger.warning("[avito] BLOCKED %d for %s — headers: %s", status, url[:80], resp_headers)
         return None, True
     if status in (301, 302, 303, 307, 308):
-        logger.warning("[avito] REDIRECT %d (block) for %s", status, url[:80])
+        # Log the redirect Location so we can tell apart legit avito
+        # internal redirects from anti-bot challenge / login pages.
+        # Without this, a 302 → /login captcha looks identical to a
+        # 302 → /correct-canonical-url in the log.
+        location = resp_headers.get("Location") or resp_headers.get("location") or ""
+        logger.warning(
+            "[avito] REDIRECT %d (block) for %s → %s",
+            status, url[:80], location[:200],
+        )
         return None, True
     if status != 200:
-        logger.debug("[avito] HTTP %d for %s", status, url[:80])
+        # Promoted from DEBUG → INFO. A 4xx or 5xx response burns the
+        # sub's error budget (10 in a row → auto-pause); the operator
+        # needs to see the status without enabling DEBUG logging.
+        logger.info("[avito] HTTP %d for %s", status, url[:80])
         return None, False
     if "проблема с ip" in html.lower() or "доступ ограничен" in html.lower():
         logger.warning("[avito] BLOCKED (IP problem page) for %s", url[:80])
@@ -95,7 +106,18 @@ async def _fetch_hydration_json(url: str, proxy: str | None):
 
     items = _extract_catalog_items_strict(html, url)
     if items is None:
-        logger.warning("[avito] no catalog MFE on page (size=%d)", len(html))
+        # When the catalog MFE goes missing the page is usually one of
+        # three things: an anti-bot challenge (DataDome / Qrator
+        # captcha shell), an Avito "ничего не найдено" page, or a
+        # frontend redesign that renamed the state.data shape.
+        # Logging the first 300 chars after the <title> + the HTML
+        # head gives the operator enough signal to tell them apart
+        # without enabling DEBUG and re-running.
+        head_excerpt = html[:300].replace("\n", " ").replace("\r", "")
+        logger.warning(
+            "[avito] no catalog MFE on page (size=%d) head=%r",
+            len(html), head_excerpt,
+        )
         return None, False
     logger.info("[avito] parsed %d catalog items (strict)", len(items))
     return items, False
@@ -110,7 +132,16 @@ def _fetch_html_sync(url: str, proxy: str | None):
         logger.info("[avito] response final_url=%r, status=%d", str(resp.url), resp.status_code)
         return resp.status_code, resp.text, dict(resp.headers)
     except Exception as e:
-        logger.debug("[avito] sync fetch error: %s", e)
+        # Promoted from DEBUG → WARNING with exception type. When the
+        # parser silently returns None, the scheduler bumps the sub's
+        # error counter (10 in a row → auto-pause). Knowing the actual
+        # cause (ProxyError, SSLError, TimeoutError, etc.) is the
+        # difference between a 30-second fix (rotate proxy) and a
+        # day of guessing.
+        logger.warning(
+            "[avito] sync fetch error: %s: %s",
+            type(e).__name__, str(e)[:200],
+        )
         return None
 
 
