@@ -1932,7 +1932,7 @@ class Database:
             refund_24h = await conn.fetchrow(
                 "SELECT COUNT(*) AS cnt, "
                 "       COALESCE(SUM(amount_minor), 0) AS sum_minor "
-                "FROM refunds WHERE created_at > NOW() - INTERVAL '24 hours'"
+                "FROM refunds WHERE processed_at > NOW() - INTERVAL '24 hours'"
             )
             last_payment_at = await conn.fetchval(
                 "SELECT MAX(created_at) FROM payments"
